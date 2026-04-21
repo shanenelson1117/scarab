@@ -557,6 +557,16 @@ static inline void exec_stage_bp_resolve(Op* op) {
     bp_resolve_op(g_bp_data, op);
   }
 
+  // Track cycle
+    if (!op->off_path && op->bp_pred_info->mispred) {
+      // Total mispredicted branches resolved at exec
+      STAT_EVENT(op->proc_id, BR_EXEC_RESOLVE_COUNT);
+      // Total cycles wasted in exec on mispredicted branchs
+      INC_STAT_EVENT(op->proc_id, BR_EXEC_RESOLVE_TOTAL, op->exec_cycle - op->issue_cycle);
+      // Total cycles waiting on branch operands
+      INC_STAT_EVENT(op->proc_id, BR_EXEC_OPERAND_WAIT,  op->rdy_cycle  - op->issue_cycle);
+    }
+
   if (op->bp_pred_info->recover_at_exec) {
     DEBUG(exec->proc_id, "Exec schedules recovery for op_num:%llu at cycle:%llu\n", (unsigned long long)op->op_num,
           (unsigned long long)op->exec_cycle);
