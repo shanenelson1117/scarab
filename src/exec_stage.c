@@ -558,7 +558,8 @@ static inline void exec_stage_bp_resolve(Op* op) {
   }
 
   // Track cycle
-    if (!op->off_path && op->bp_pred_info->mispred) {
+    if(!op->off_path && op->bp_pred_info->recover_at_exec &&
+    (op->bp_pred_info->mispred || op->bp_pred_info->misfetch)) {
       // Total mispredicted branches resolved at exec
       STAT_EVENT(op->proc_id, BR_EXEC_RESOLVE_COUNT);
       // Total cycles wasted in exec on mispredicted branchs
