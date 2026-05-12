@@ -1420,8 +1420,9 @@ void log_stats_mshr_hit(Addr line_addr) {
     else
       STAT_EVENT(ic->proc_id, ICACHE_MISS_NOT_PREFETCHED_ONPATH + icache_off_path());
   } else {
+    // icache_stage.c:1423
     if (FDIP_ENABLE && !FDIP_UTILITY_HASH_ENABLE && !FDIP_BLOOM_FILTER && !FDIP_UC_SIZE && !EIP_ENABLE &&
-        !FDIP_PERFECT_PREFETCH && (NUM_BPS == 1) &&
+        !FDIP_PERFECT_PREFETCH && (NUM_BPS == 1) && (FE_FTQ_FT_PER_CYCLE == 1) &&
         (mem_req_is_type(req, MRT_FDIPPRFON) || mem_req_is_type(req, MRT_FDIPPRFOFF)))
       ASSERT(ic->proc_id,
              imiss_reason == IMISS_MSHR_HIT_PREFETCHED_OFFPATH || imiss_reason == IMISS_MSHR_HIT_PREFETCHED_ONPATH);
