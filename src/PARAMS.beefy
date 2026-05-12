@@ -24,7 +24,7 @@
 
 ### Uop Cache
 # inclusive w/ L1i
---uop_cache_enable              1
+--uop_cache_enable              0
 --uop_cache_width               8
 --uop_cache_lines               512      # 8 x 512 = 4096 uops in total (~4K)
 --uop_cache_assoc               8
