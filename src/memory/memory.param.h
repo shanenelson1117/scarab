@@ -33,6 +33,7 @@
 
 /**************************************************************************************/
 /* extern all of the variables defined in memory.param.def */
+extern Flag DCACHE_REG;
 
 #define DEF_PARAM(name, variable, type, func, def, const) extern const type variable;
 #include "memory.param.def"
