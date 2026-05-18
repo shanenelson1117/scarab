@@ -322,6 +322,7 @@ void* cache_insert_replpos(Cache* cache, uns8 proc_id, Addr addr, Addr* line_add
   new_line->base = *line_addr;
   new_line->last_access_time = sim_time;  // FIXME: this fixes valgrind warnings in update_prf_
   new_line->pref = isPrefetch;
+  new_line->feeds_branch = FALSE;
 
   new_line->pw_start_addr = addr;  // only means anything for uop cache
 
@@ -488,37 +489,50 @@ Cache_Entry* find_repl_entry(Cache* cache, uns8 proc_id, uns set, uns* way) {
     case REPL_RESTEER:
     case REPL_SHADOW_IDEAL:
     case REPL_TRUE_LRU: {
-      uns lru_ind = 0;
-      Counter lru_time = MAX_CTR;
-      Flag found_non_feeds_branch = FALSE;
+      /* Find the LRU candidate among non-feeder lines and feeder lines separately. */
+      uns  nfb_way = 0;        Counter nfb_time = MAX_CTR;  Flag has_nfb = FALSE;
+      uns  fb_way  = 0;        Counter fb_time  = MAX_CTR;  Flag has_fb  = FALSE;
+
       for (ii = 0; ii < cache->assoc; ii++) {
         Cache_Entry* entry = &cache->entries[set][ii];
         if (!entry->valid) {
-          lru_ind = ii;
-          found_non_feeds_branch = TRUE;
-          break;
+          /* Free slot — take it immediately, no eviction needed. */
+          *way = ii;
+          return entry;
         }
         if (!entry->feeds_branch) {
-          if (!found_non_feeds_branch || entry->last_access_time < lru_time) {
-            lru_ind = ii;
-            lru_time = entry->last_access_time;
-            found_non_feeds_branch = TRUE;
+          if (!has_nfb || entry->last_access_time < nfb_time) {
+            nfb_way = ii; nfb_time = entry->last_access_time; has_nfb = TRUE;
+          }
+        } else {
+          if (!has_fb || entry->last_access_time < fb_time) {
+            fb_way = ii; fb_time = entry->last_access_time; has_fb = TRUE;
           }
         }
       }
-      /* fall back to LRU among feeds_branch lines if all lines are protected */
-      if (!found_non_feeds_branch) {
-        lru_time = MAX_CTR;
-        for (ii = 0; ii < cache->assoc; ii++) {
-          Cache_Entry* entry = &cache->entries[set][ii];
-          if (entry->last_access_time < lru_time) {
-            lru_ind = ii;
-            lru_time = entry->last_access_time;
-          }
+
+      /* All ways valid. Decide which to evict. */
+      uns evict_way;
+      if (!has_nfb) {
+        /* Every line is a branch feeder — fall back to plain LRU. */
+        evict_way = fb_way;
+      } else if (!has_fb) {
+        /* No feeder lines — plain LRU among non-feeders. */
+        evict_way = nfb_way;
+      } else {
+        /* Both exist. Check multiplicative age threshold:
+           evict the feeder if its age exceeds the non-feeder's age by the threshold. */
+        double threshold = BRANCH_LOAD_DEP_REPL_THRESHOLD;
+        if (threshold > 0.0 &&
+            (double)(sim_time - fb_time) > (double)(sim_time - nfb_time) * threshold) {
+          evict_way = fb_way;
+        } else {
+          evict_way = nfb_way;
         }
       }
-      *way = lru_ind;
-      return &cache->entries[set][lru_ind];
+
+      *way = evict_way;
+      return &cache->entries[set][evict_way];
     } break;
     case REPL_RANDOM:
     case REPL_NOT_MRU:
