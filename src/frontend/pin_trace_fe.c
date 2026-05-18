@@ -95,36 +95,6 @@ void trace_init() {
     trace_files[proc_id] = tmp_trace_files[proc_id];
   }
 
-  if (BRANCH_LOAD_DEP) {
-    for (uns proc_id = 0; proc_id < NUM_CORES; proc_id++) {
-      const char* in = trace_files[proc_id];
-      ASSERTM(proc_id, in, "BRANCH_LOAD_DEP requires cbp_trace_r%u to be set\n", proc_id);
-
-      /* build output name: strip trailing .bz2 if present, append .bld.bz2 */
-      char out[1024];
-      size_t len = strlen(in);
-      if (len > 4 && strcmp(in + len - 4, ".bz2") == 0)
-        snprintf(out, sizeof(out), "%.*s.bld.bz2", (int)(len - 4), in);
-      else
-        snprintf(out, sizeof(out), "%s.bld.bz2", in);
-
-      /* skip conversion if output already exists */
-      FILE* test = fopen(out, "r");
-      if (test) {
-        fclose(test);
-        printf("branch_load_dep: using cached %s\n", out);
-      } else {
-        char cmd[2048];
-        snprintf(cmd, sizeof(cmd), "branch_load_dep %s %s", in, out);
-        printf("branch_load_dep: running %s\n", cmd);
-        int ret = system(cmd);
-        ASSERTM(proc_id, ret == 0, "branch_load_dep failed for core %u\n", proc_id);
-      }
-
-      trace_files[proc_id] = strdup(out);
-    }
-  }
-
   for (uns proc_id = 0; proc_id < NUM_CORES; proc_id++) {
     trace_setup(proc_id);
   }

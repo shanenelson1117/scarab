@@ -141,8 +141,6 @@ typedef struct ctype_pin_inst_struct {
   uint8_t scarab_marker_roi_begin : 1;
   // used to flag scarab marker roi begin
   uint8_t scarab_marker_roi_end : 1;
-  // set by branch_load_dep: this load directly or transitively (through ALU) feeds a branch
-  uint8_t feeds_branch : 1;
 } __attribute__((packed)) ctype_pin_inst;
 
 typedef ctype_pin_inst compressed_op;

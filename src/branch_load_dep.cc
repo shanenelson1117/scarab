@@ -1,196 +1,189 @@
-// Standalone tool: mark loads that feed branches through ALU chains.
-// Compile: g++ -std=c++17 branch_load_dep.cc -o branch_load_dep
-// Usage:   ./branch_load_dep input.bz2 output.bz2
+/* Copyright 2020 HPS/SAFARI Research Groups
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
 
-#include <cassert>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <inttypes.h>
+/***************************************************************************************
+ * File         : branch_load_dep.cc
+ * Description  : Inline def-use analysis identifying loads whose values transitively
+ *                feed branch instructions through ALU chains (not load-to-load).
+ *
+ * Algorithm:
+ *   Maintain per-proc:
+ *     reg_map   : logical reg id → unique_num of last writer
+ *     records   : unique_num → InstRecord (is_load, va, op_ptr, src_writer_uids)
+ *
+ *   On each decoded op:
+ *     1. Build an InstRecord from the op's logical src/dst registers.
+ *     2. Update reg_map with this op's dest regs.
+ *     3. If the op is a branch, walk backward through records:
+ *          - Skip already-visited nodes.
+ *          - If a predecessor is a load → mark it (set op->feeds_branch and call
+ *            cache_set_feeds_branch for the case where the line is already in cache).
+ *          - If a predecessor is an ALU op → continue traversal.
+ *          - Loads act as traversal boundaries (no load-to-load chaining).
+ *
+ *   Record lifetime: a sliding window of BLD_WINDOW_SIZE entries per proc keeps
+ *   memory bounded; old records are evicted before they can form stale Op* pointers
+ *   because the window comfortably covers any realistic load-to-branch distance.
+ ***************************************************************************************/
+
+#include "branch_load_dep.h"
+
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
-// ---------------------------------------------------------------------------
-// Minimal redefinition of ctype_pin_inst — must stay in sync with
-// ctype_pin_inst.h. The static_assert below catches drift.
-// ---------------------------------------------------------------------------
+extern "C" {
+#include "core.param.h"
+#include "dcache_stage.h"
+#include "inst_info.h"
+#include "libs/cache_lib.h"
+#include "op.h"
+#include "table_info.h"
+}
 
-#define MAX_SRC_REGS_NUM      8
-#define MAX_DST_REGS_NUM      8
-#define MAX_MEM_ADDR_REGS_NUM 2
-#define MAX_LD_NUM            8
-#define MAX_ST_NUM            8
-
-typedef uint8_t compressed_reg_t;
-
-typedef enum {
-    WPNM_NOT_IN_WPNM = 0,
-    WPNM_REASON_REDIRECT_TO_NOT_INSTRUMENTED,
-    WPNM_REASON_RETURN_TO_NOT_INSTRUMENTED,
-    WPNM_REASON_NONRET_CF_TO_NOT_INSTRUMENTED,
-    WPNM_REASON_NOT_TAKEN_TO_NOT_INSTRUMENTED,
-    WPNM_REASON_WRONG_PATH_STORE_TO_NEW_REGION,
-    WPNM_NUM_REASONS
-} Wrongpath_Nop_Mode_Reason;
-
-typedef struct {
-    uint64_t inst_uid;
-    uint64_t instruction_addr;
-    uint8_t  size;
-    uint64_t inst_binary_msb;
-    uint64_t inst_binary_lsb;
-    uint8_t  op_type;
-    uint8_t  cf_type;
-    uint8_t  is_fp;
-    uint16_t true_op_type;
-    uint8_t  num_src_regs;
-    uint8_t  num_dst_regs;
-    uint8_t  num_ld1_addr_regs;
-    uint8_t  num_ld2_addr_regs;
-    uint8_t  num_st_addr_regs;
-    compressed_reg_t src_regs[MAX_SRC_REGS_NUM];
-    compressed_reg_t dst_regs[MAX_DST_REGS_NUM];
-    compressed_reg_t ld1_addr_regs[MAX_MEM_ADDR_REGS_NUM];
-    compressed_reg_t ld2_addr_regs[MAX_MEM_ADDR_REGS_NUM];
-    compressed_reg_t st_addr_regs[MAX_MEM_ADDR_REGS_NUM];
-    uint8_t  num_simd_lanes;
-    uint8_t  lane_width_bytes;
-    uint8_t  num_ld;
-    uint8_t  num_st;
-    uint8_t  has_immediate;
-    uint64_t ld_vaddr[MAX_LD_NUM];
-    uint64_t st_vaddr[MAX_ST_NUM];
-    uint8_t  ld_size;
-    uint8_t  st_size;
-    uint64_t branch_target;
-    uint8_t  actually_taken    : 1;
-    uint8_t  is_string         : 1;
-    uint8_t  is_call           : 1;
-    uint8_t  is_move           : 1;
-    uint8_t  is_prefetch       : 1;
-    uint8_t  has_push          : 1;
-    uint8_t  has_pop           : 1;
-    uint8_t  is_ifetch_barrier : 1;
-    uint8_t  is_lock           : 1;
-    uint8_t  is_repeat         : 1;
-    uint8_t  is_simd           : 1;
-    uint8_t  is_gather_scatter : 1;
-    uint8_t  is_sentinel       : 1;
-    uint8_t  fake_inst         : 1;
-    uint8_t  exit              : 1;
-    uint8_t  encoding_is_new   : 1;
-    Wrongpath_Nop_Mode_Reason fake_inst_reason;
-    uint64_t instruction_next_addr;
-    char     pin_iclass[16];
-    uint8_t  last_inst_from_trace    : 1;
-    uint8_t  fetched_instruction     : 1;
-    uint8_t  scarab_marker_roi_begin : 1;
-    uint8_t  scarab_marker_roi_end   : 1;
-    uint8_t  feeds_branch            : 1;
-} __attribute__((packed)) ctype_pin_inst;
-
-static_assert(sizeof(ctype_pin_inst) == 239, "ctype_pin_inst layout mismatch — re-check struct definition");
-
-// ---------------------------------------------------------------------------
-// Analysis state
-// ---------------------------------------------------------------------------
+/* Maximum number of InstRecords retained per core.  A value of 4096 covers
+ * any realistic load-to-branch ALU chain while bounding memory use. */
+static constexpr unsigned BLD_WINDOW_SIZE = 4096;
 
 struct InstRecord {
-    uint64_t inst_uid;
-    bool     is_load;
-    uint8_t  num_src_regs;
-    uint64_t src_writer_uids[MAX_SRC_REGS_NUM];
+  bool is_load;
+  Addr va;          /* virtual address (meaningful only when is_load) */
+  Op*  op_ptr;      /* raw pointer valid while op is in the ROB */
+  std::vector<Counter> src_writer_uids;
+  Counter uid;      /* copy for ordered eviction */
 };
 
-static std::unordered_map<uint8_t,  uint64_t>   reg_map;
-static std::unordered_map<uint64_t, InstRecord> inst_records;
-static std::unordered_set<uint64_t>             marked_loads;
+struct BldState {
+  /* reg_id (flattened logical reg) → unique_num of last writer seen */
+  std::unordered_map<uns16, Counter> reg_map;
 
-static void find_loads(uint64_t uid, std::unordered_set<uint64_t>& visited) {
-    if (uid == 0 || visited.count(uid))
-        return;
-    visited.insert(uid);
+  /* unique_num → record; bounded to BLD_WINDOW_SIZE entries */
+  std::unordered_map<Counter, InstRecord> records;
 
-    auto it = inst_records.find(uid);
-    if (it == inst_records.end())
-        return;
+  /* monotone min uid present, used to evict oldest entry */
+  Counter min_uid = 0;
+};
 
-    const InstRecord& rec = it->second;
-    if (rec.is_load) {
-        marked_loads.insert(uid);
-        return;
-    }
+static std::vector<BldState> g_states;
 
-    for (int i = 0; i < rec.num_src_regs; i++)
-        find_loads(rec.src_writer_uids[i], visited);
+void bld_init(uns8 num_cores) {
+  g_states.resize(num_cores);
 }
 
-// ---------------------------------------------------------------------------
-// Trace I/O
-// ---------------------------------------------------------------------------
-
-static FILE* open_read(const char* path) {
-    char cmd[1024];
-    snprintf(cmd, sizeof(cmd), "bzip2 -dc %s", path);
-    FILE* f = popen(cmd, "r");
-    if (!f) { fprintf(stderr, "cannot open %s\n", path); exit(1); }
-    return f;
+/* Evict the oldest record from records to keep the map within BLD_WINDOW_SIZE. */
+static void evict_oldest(BldState& s) {
+  /* Find the entry with the smallest uid and erase it. */
+  Counter oldest = UINT64_MAX;
+  for (auto& kv : s.records) {
+    if (kv.first < oldest)
+      oldest = kv.first;
+  }
+  if (oldest != UINT64_MAX)
+    s.records.erase(oldest);
 }
 
-static FILE* open_write(const char* path) {
-    char cmd[1024];
-    snprintf(cmd, sizeof(cmd), "bzip2 > %s", path);
-    FILE* f = popen(cmd, "w");
-    if (!f) { fprintf(stderr, "cannot open %s\n", path); exit(1); }
-    return f;
-}
+void bld_process_op(uns8 proc_id, Op* op) {
+  if (!BRANCH_LOAD_DEP)
+    return;
 
-// ---------------------------------------------------------------------------
-// Main
-// ---------------------------------------------------------------------------
+  /* Skip off-path ops; their records could leave stale pointers after recovery. */
+  if (op->off_path)
+    return;
 
-int main(int argc, char** argv) {
-    if (argc != 3) {
-        fprintf(stderr, "usage: %s input.bz2 output.bz2\n", argv[0]);
-        return 1;
+  BldState& state = g_states[proc_id];
+
+  bool is_load   = (op->inst_info->table_info.mem_type == MEM_LD);
+  bool is_branch = (op->inst_info->table_info.cf_type  != NOT_CF);
+
+  /* Build InstRecord for this op. */
+  InstRecord rec;
+  rec.uid     = op->unique_num;
+  rec.is_load = is_load;
+  rec.va      = is_load ? op->oracle_info.va : static_cast<Addr>(0);
+  rec.op_ptr  = op;
+
+  /* Collect unique_nums of ops that wrote this op's source regs. */
+  uns num_srcs = op->inst_info->table_info.num_src_regs;
+  for (uns i = 0; i < num_srcs; i++) {
+    uns16 reg_id = op->inst_info->srcs[i].id;
+    if (reg_id == OP_REG_ID_INVALID)
+      continue;
+    auto it = state.reg_map.find(reg_id);
+    if (it != state.reg_map.end())
+      rec.src_writer_uids.push_back(it->second);
+  }
+
+  /* Insert into records, evicting the oldest if we've hit the window limit. */
+  if (state.records.size() >= BLD_WINDOW_SIZE)
+    evict_oldest(state);
+  state.records[op->unique_num] = std::move(rec);
+
+  /* Update reg_map: this op becomes the last writer for each of its dest regs. */
+  uns num_dests = op->inst_info->table_info.num_dest_regs;
+  for (uns i = 0; i < num_dests; i++) {
+    uns16 reg_id = op->inst_info->dests[i].id;
+    if (reg_id == OP_REG_ID_INVALID)
+      continue;
+    state.reg_map[reg_id] = op->unique_num;
+  }
+
+  if (!is_branch)
+    return;
+
+  /* === Branch: traverse backward through ALU chain to find feeding loads === */
+  std::unordered_set<Counter> visited;
+  std::vector<Counter> worklist;
+
+  /* Seed the worklist with this branch's direct register sources. */
+  const InstRecord& branch_rec = state.records[op->unique_num];
+  for (Counter uid : branch_rec.src_writer_uids)
+    worklist.push_back(uid);
+
+  while (!worklist.empty()) {
+    Counter uid = worklist.back();
+    worklist.pop_back();
+
+    if (!visited.insert(uid).second)
+      continue;  /* already processed */
+
+    auto it = state.records.find(uid);
+    if (it == state.records.end())
+      continue;  /* outside our window, treat as chain endpoint */
+
+    InstRecord& dep = it->second;
+
+    if (dep.is_load) {
+      /* Found a load that feeds the branch.
+       * (a) Mark the Op so the dcache fill path protects the line on an L1D miss. */
+      dep.op_ptr->feeds_branch = TRUE;
+
+      /* (b) If the line already hit and is currently in cache, protect it now. */
+      if (dep.va != 0)
+        cache_set_feeds_branch(&dc->dcache, proc_id, dep.va);
+
+      /* Do not traverse through the load (no load-to-load chaining). */
+    } else {
+      /* ALU op: continue backward traversal. */
+      for (Counter src_uid : dep.src_writer_uids)
+        worklist.push_back(src_uid);
     }
-
-    // --- pass 1: collect marked loads ---
-    FILE* in = open_read(argv[1]);
-    ctype_pin_inst pi;
-    while (fread(&pi, sizeof(pi), 1, in) == 1) {
-        InstRecord rec;
-        rec.inst_uid     = pi.inst_uid;
-        rec.is_load      = (pi.num_ld > 0);
-        rec.num_src_regs = pi.num_src_regs;
-        for (int i = 0; i < pi.num_src_regs; i++) {
-            auto it = reg_map.find(pi.src_regs[i]);
-            rec.src_writer_uids[i] = (it != reg_map.end()) ? it->second : 0;
-        }
-        inst_records[pi.inst_uid] = rec;
-
-        if (pi.cf_type != 0 /* NOT_CF */) {
-            std::unordered_set<uint64_t> visited;
-            for (int i = 0; i < rec.num_src_regs; i++)
-                find_loads(rec.src_writer_uids[i], visited);
-        }
-
-        for (int i = 0; i < pi.num_dst_regs; i++)
-            reg_map[pi.dst_regs[i]] = pi.inst_uid;
-    }
-    pclose(in);
-
-    fprintf(stderr, "marked %zu loads\n", marked_loads.size());
-
-    // --- pass 2: rewrite trace with feeds_branch set ---
-    in = open_read(argv[1]);
-    FILE* out = open_write(argv[2]);
-    while (fread(&pi, sizeof(pi), 1, in) == 1) {
-        pi.feeds_branch = marked_loads.count(pi.inst_uid) ? 1 : 0;
-        fwrite(&pi, sizeof(pi), 1, out);
-    }
-    pclose(in);
-    pclose(out);
-
-    return 0;
+  }
 }
