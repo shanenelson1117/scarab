@@ -448,6 +448,17 @@ void cache_set_feeds_branch(Cache* cache, uns8 proc_id, Addr addr) {
   }
 }
 
+Flag cache_line_feeds_branch(Cache* cache, Addr addr) {
+  Addr tag, line_addr;
+  uns set = cache_index(cache, addr, &tag, &line_addr);
+  for (uns ii = 0; ii < cache->assoc; ii++) {
+    Cache_Entry* line = &cache->entries[set][ii];
+    if (line->valid && line->tag == tag)
+      return line->feeds_branch;
+  }
+  return FALSE;
+}
+
 /**
  * @brief Return a pointer to the lru item in the cache set
  *

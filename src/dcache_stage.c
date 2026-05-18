@@ -285,6 +285,8 @@ void update_dcache_stage(Stage_Data* src_sd) {
     }
 
     if (line) {
+      if (BRANCH_LOAD_DEP && cache_line_feeds_branch(&dc->dcache, op->oracle_info.va))
+        STAT_EVENT(op->proc_id, DCACHE_HIT_FEEDS_BRANCH);
       dcache_cacheline_hit(op, line_addr, line);
       continue;
     }
