@@ -262,6 +262,7 @@ DEF_PARAM(obey_reg_dep, OBEY_REG_DEP, Flag, Flag, TRUE, )
 
 DEF_PARAM(track_l1_miss_deps, TRACK_L1_MISS_DEPS, Flag, Flag, FALSE, )
 
+DEF_PARAM(branch_load_dep, BRANCH_LOAD_DEP, Flag, Flag, FALSE, )
 DEF_PARAM(cbp_trace_r0, CBP_TRACE_R0, char*, string, NULL, )
 DEF_PARAM(cbp_trace_r1, CBP_TRACE_R1, char*, string, NULL, )
 DEF_PARAM(cbp_trace_r2, CBP_TRACE_R2, char*, string, NULL, )

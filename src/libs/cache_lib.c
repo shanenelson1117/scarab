@@ -435,6 +435,18 @@ void cache_invalidate(Cache* cache, Addr addr, Addr* line_addr) {
     invalidate_unsure_line(cache, set, tag);
 }
 
+void cache_set_feeds_branch(Cache* cache, uns8 proc_id, Addr addr) {
+  Addr tag, line_addr;
+  uns set = cache_index(cache, addr, &tag, &line_addr);
+  for (uns ii = 0; ii < cache->assoc; ii++) {
+    Cache_Entry* line = &cache->entries[set][ii];
+    if (line->valid && line->tag == tag) {
+      line->feeds_branch = TRUE;
+      return;
+    }
+  }
+}
+
 /**
  * @brief Return a pointer to the lru item in the cache set
  *
@@ -478,15 +490,31 @@ Cache_Entry* find_repl_entry(Cache* cache, uns8 proc_id, uns set, uns* way) {
     case REPL_TRUE_LRU: {
       uns lru_ind = 0;
       Counter lru_time = MAX_CTR;
+      Flag found_non_feeds_branch = FALSE;
       for (ii = 0; ii < cache->assoc; ii++) {
         Cache_Entry* entry = &cache->entries[set][ii];
         if (!entry->valid) {
           lru_ind = ii;
+          found_non_feeds_branch = TRUE;
           break;
         }
-        if (entry->last_access_time < lru_time) {
-          lru_ind = ii;
-          lru_time = cache->entries[set][ii].last_access_time;
+        if (!entry->feeds_branch) {
+          if (!found_non_feeds_branch || entry->last_access_time < lru_time) {
+            lru_ind = ii;
+            lru_time = entry->last_access_time;
+            found_non_feeds_branch = TRUE;
+          }
+        }
+      }
+      /* fall back to LRU among feeds_branch lines if all lines are protected */
+      if (!found_non_feeds_branch) {
+        lru_time = MAX_CTR;
+        for (ii = 0; ii < cache->assoc; ii++) {
+          Cache_Entry* entry = &cache->entries[set][ii];
+          if (entry->last_access_time < lru_time) {
+            lru_ind = ii;
+            lru_time = entry->last_access_time;
+          }
         }
       }
       *way = lru_ind;

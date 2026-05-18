@@ -229,6 +229,8 @@ struct Op_struct {
   // {{{ uop cache
   Flag fetched_from_uop_cache;
   // }}}
+
+  Flag feeds_branch;  // load whose value reaches a branch through ALU ops (set by branch_load_dep tool)
   int bp_confidence;
 
   // {{{ register renaming

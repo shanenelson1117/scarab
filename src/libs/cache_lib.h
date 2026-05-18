@@ -91,6 +91,7 @@ typedef struct Cache_Entry_struct {
 
   uns8 reference_val; /* for re-reference replacement policy */
   Flag outcome;       /* for replacement policy */
+  Flag feeds_branch;  /* line brought in by a load that feeds a branch; evict last */
 } Cache_Entry;
 
 // DO NOT CHANGE THIS ORDER
@@ -187,6 +188,7 @@ void* cache_insert_lru(Cache*, uns8, Addr, Addr*, Addr*);
 void cache_invalidate(Cache*, Addr, Addr*);
 void cache_flush(Cache*);
 void* get_next_repl_line(Cache*, uns8, Addr, Addr*, Flag*);
+void  cache_set_feeds_branch(Cache*, uns8, Addr);
 void* get_next_valid_repl_line(Cache* cache, uns8 proc_id, Addr addr);
 uns ext_cache_index(Cache*, Addr, Addr*, Addr*);
 Addr get_cache_line_addr(Cache*, Addr);
