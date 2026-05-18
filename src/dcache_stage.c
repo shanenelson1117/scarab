@@ -276,7 +276,10 @@ void update_dcache_stage(Stage_Data* src_sd) {
         STAT_EVENT(op->proc_id, DCACHE_HIT_OFFPATH);
       }
 
-      op->done_cycle = cycle_count + DCACHE_CYCLES + op->inst_info->extra_ld_latency;
+      op->done_cycle = (DCACHE_HIT_ONE_CYCLE ||
+                        (BRANCH_LOAD_DEP_ZERO_LATENCY && op->feeds_branch))
+                           ? cycle_count + 1
+                           : cycle_count + DCACHE_CYCLES + op->inst_info->extra_ld_latency;
       if (op->inst_info->table_info.mem_type != MEM_ST) {
         op->wake_cycle = op->done_cycle;
         wake_up_ops(op, REG_DATA_DEP, model->wake_hook);
