@@ -148,42 +148,44 @@ void bld_process_op(uns8 proc_id, Op* op) {
   if (!is_branch)
     return;
 
-  /* === Branch: traverse backward through ALU chain to find feeding loads === */
+  /* === Branch: traverse backward to find feeding loads ===
+   * Each worklist entry carries the uid and how many loads have been crossed
+   * to reach it.  When BRANCH_LOAD_DEP_CROSS_LOAD is set, the DFS continues
+   * through a load's sources (treating the load as a passthrough) up to one
+   * load boundary deep.  Without the flag the original behaviour is preserved:
+   * loads are marked but not traversed. */
   std::unordered_set<Counter> visited;
-  std::vector<Counter> worklist;
+  std::vector<std::pair<Counter, int>> worklist;  /* (uid, loads_crossed) */
 
-  /* Seed the worklist with this branch's direct register sources. */
   const InstRecord& branch_rec = state.records[op->unique_num];
   for (Counter uid : branch_rec.src_writer_uids)
-    worklist.push_back(uid);
+    worklist.push_back({uid, 0});
 
   while (!worklist.empty()) {
-    Counter uid = worklist.back();
+    auto [uid, loads_crossed] = worklist.back();
     worklist.pop_back();
 
     if (!visited.insert(uid).second)
-      continue;  /* already processed */
+      continue;
 
     auto it = state.records.find(uid);
     if (it == state.records.end())
-      continue;  /* outside our window, treat as chain endpoint */
+      continue;
 
     InstRecord& dep = it->second;
 
     if (dep.is_load) {
-      /* Found a load that feeds the branch.
-       * (a) Mark the Op so the dcache fill path protects the line on an L1D miss. */
       dep.op_ptr->feeds_branch = TRUE;
-
-      /* (b) If the line already hit and is currently in cache, protect it now. */
       if (dep.va != 0)
         cache_set_feeds_branch(&dc->dcache, proc_id, dep.va);
 
-      /* Do not traverse through the load (no load-to-load chaining). */
+      if (BRANCH_LOAD_DEP_CROSS_LOAD && loads_crossed < 1) {
+        for (Counter src_uid : dep.src_writer_uids)
+          worklist.push_back({src_uid, loads_crossed + 1});
+      }
     } else {
-      /* ALU op: continue backward traversal. */
       for (Counter src_uid : dep.src_writer_uids)
-        worklist.push_back(src_uid);
+        worklist.push_back({src_uid, loads_crossed});
     }
   }
 }
