@@ -46,6 +46,7 @@
 
 #include "branch_load_dep.h"
 
+#include <deque>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -78,8 +79,8 @@ struct BldState {
   /* unique_num → record; bounded to BLD_WINDOW_SIZE entries */
   std::unordered_map<Counter, InstRecord> records;
 
-  /* monotone min uid present, used to evict oldest entry */
-  Counter min_uid = 0;
+  /* UIDs in insertion order for O(1) eviction of the oldest entry */
+  std::deque<Counter> insertion_order;
 };
 
 static std::vector<BldState> g_states;
@@ -88,16 +89,14 @@ void bld_init(uns8 num_cores) {
   g_states.resize(num_cores);
 }
 
-/* Evict the oldest record from records to keep the map within BLD_WINDOW_SIZE. */
+/* Evict the oldest record from records to keep the map within BLD_WINDOW_SIZE.
+ * O(1) amortized: insertion_order tracks UIDs in FIFO order. */
 static void evict_oldest(BldState& s) {
-  /* Find the entry with the smallest uid and erase it. */
-  Counter oldest = UINT64_MAX;
-  for (auto& kv : s.records) {
-    if (kv.first < oldest)
-      oldest = kv.first;
-  }
-  if (oldest != UINT64_MAX)
-    s.records.erase(oldest);
+  if (s.insertion_order.empty())
+    return;
+  Counter oldest = s.insertion_order.front();
+  s.insertion_order.pop_front();
+  s.records.erase(oldest);
 }
 
 void bld_process_op(uns8 proc_id, Op* op) {
@@ -135,6 +134,7 @@ void bld_process_op(uns8 proc_id, Op* op) {
   if (state.records.size() >= BLD_WINDOW_SIZE)
     evict_oldest(state);
   state.records[op->unique_num] = std::move(rec);
+  state.insertion_order.push_back(op->unique_num);
 
   /* Update reg_map: this op becomes the last writer for each of its dest regs. */
   uns num_dests = op->inst_info->table_info.num_dest_regs;
