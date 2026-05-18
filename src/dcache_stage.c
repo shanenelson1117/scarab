@@ -570,7 +570,8 @@ static inline void dcache_cacheline_hit(Op* op, Addr line_addr, Dcache_Data* lin
   }
 
   /* update cacheline state */
-  op->done_cycle = (BRANCH_LOAD_DEP_ZERO_LATENCY && op->feeds_branch)
+  op->done_cycle = (DCACHE_HIT_ONE_CYCLE ||
+                    (BRANCH_LOAD_DEP_ZERO_LATENCY && op->feeds_branch))
                        ? cycle_count + 1
                        : cycle_count + DCACHE_CYCLES + op->inst_info->extra_ld_latency;
   line->read_count[op->off_path] = line->read_count[op->off_path] + (op->inst_info->table_info.mem_type == MEM_LD);
