@@ -267,7 +267,7 @@ DEF_PARAM(branch_load_dep, BRANCH_LOAD_DEP, Flag, Flag, FALSE, )
    Evict the feeder instead of the LRU non-feeder when:
      (sim_time - feeder_lru_time) > (sim_time - nonfeeder_lru_time) * threshold
    0.0 = strict protection (feeder never evicted while a non-feeder exists). */
-DEF_PARAM(branch_load_dep_repl_threshold, BRANCH_LOAD_DEP_REPL_THRESHOLD, double, double, 0.0, )
+DEF_PARAM(branch_load_dep_repl_threshold, BRANCH_LOAD_DEP_REPL_THRESHOLD, float, float, 0.0, )
 DEF_PARAM(cbp_trace_r0, CBP_TRACE_R0, char*, string, NULL, )
 DEF_PARAM(cbp_trace_r1, CBP_TRACE_R1, char*, string, NULL, )
 DEF_PARAM(cbp_trace_r2, CBP_TRACE_R2, char*, string, NULL, )

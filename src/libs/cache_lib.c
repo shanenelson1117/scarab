@@ -522,8 +522,8 @@ Cache_Entry* find_repl_entry(Cache* cache, uns8 proc_id, uns set, uns* way) {
       } else {
         /* Both exist. Check multiplicative age threshold:
            evict the feeder if its age exceeds the non-feeder's age by the threshold. */
-        double threshold = BRANCH_LOAD_DEP_REPL_THRESHOLD;
-        if (threshold > 0.0 &&
+        float threshold = BRANCH_LOAD_DEP_REPL_THRESHOLD;
+        if (threshold > 0.0f &&
             (double)(sim_time - fb_time) > (double)(sim_time - nfb_time) * threshold) {
           evict_way = fb_way;
         } else {
