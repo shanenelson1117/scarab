@@ -288,8 +288,14 @@ void update_dcache_stage(Stage_Data* src_sd) {
     }
 
     if (line) {
-      if (BRANCH_LOAD_DEP && cache_line_feeds_branch(&dc->dcache, op->oracle_info.va))
+      if (BRANCH_LOAD_DEP && cache_line_feeds_branch(&dc->dcache, op->oracle_info.va)) {
         STAT_EVENT(op->proc_id, DCACHE_HIT_FEEDS_BRANCH);
+        if (cache_feeder_mark_first_reuse(&dc->dcache, op->oracle_info.va)) {
+          STAT_EVENT(op->proc_id, DCACHE_FEEDER_LINE_REUSED);
+          INC_STAT_EVENT(op->proc_id, DCACHE_FEEDER_REUSE_DISTANCE,
+                         sim_time - cache_line_insertion_time(&dc->dcache, op->oracle_info.va));
+        }
+      }
       dcache_cacheline_hit(op, line_addr, line);
       continue;
     }
@@ -848,8 +854,8 @@ static inline void dcache_fill_process_cacheline(Mem_Req* req, Dcache_Data* data
     data->read_count[op->off_path] += (op->inst_info->table_info.mem_type == MEM_LD);
     data->write_count[op->off_path] += (op->inst_info->table_info.mem_type == MEM_ST);
 
-    if (op->feeds_branch)
-      cache_set_feeds_branch(&dc->dcache, dc->proc_id, req->addr);
+    if (op->feeds_branch && cache_set_feeds_branch(&dc->dcache, dc->proc_id, req->addr))
+      STAT_EVENT(op->proc_id, DCACHE_FEEDER_LINES_MARKED);
 
     DEBUG(dc->proc_id, "%s: %s line addr:0x%s: %7d\n", unsstr64(op->op_num), disasm_op(op, FALSE), hexstr64s(req->addr),
           (int)(req->addr >> LOG2(DCACHE_LINE_SIZE)));

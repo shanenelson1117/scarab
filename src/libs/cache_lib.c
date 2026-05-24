@@ -320,9 +320,11 @@ void* cache_insert_replpos(Cache* cache, uns8 proc_id, Addr addr, Addr* line_add
   new_line->valid = TRUE;
   new_line->tag = tag;
   new_line->base = *line_addr;
-  new_line->last_access_time = sim_time;  // FIXME: this fixes valgrind warnings in update_prf_
-  new_line->pref = isPrefetch;
-  new_line->feeds_branch = FALSE;
+  new_line->last_access_time    = sim_time;  // FIXME: this fixes valgrind warnings in update_prf_
+  new_line->insertion_time      = sim_time;
+  new_line->pref                = isPrefetch;
+  new_line->feeds_branch        = FALSE;
+  new_line->feeder_reuse_counted = FALSE;
 
   new_line->pw_start_addr = addr;  // only means anything for uop cache
 
@@ -436,16 +438,18 @@ void cache_invalidate(Cache* cache, Addr addr, Addr* line_addr) {
     invalidate_unsure_line(cache, set, tag);
 }
 
-void cache_set_feeds_branch(Cache* cache, uns8 proc_id, Addr addr) {
+Flag cache_set_feeds_branch(Cache* cache, uns8 proc_id, Addr addr) {
   Addr tag, line_addr;
   uns set = cache_index(cache, addr, &tag, &line_addr);
   for (uns ii = 0; ii < cache->assoc; ii++) {
     Cache_Entry* line = &cache->entries[set][ii];
     if (line->valid && line->tag == tag) {
-      line->feeds_branch = TRUE;
-      return;
+      line->feeds_branch         = TRUE;
+      line->feeder_reuse_counted = FALSE;
+      return TRUE;
     }
   }
+  return FALSE;
 }
 
 Flag cache_line_feeds_branch(Cache* cache, Addr addr) {
@@ -457,6 +461,30 @@ Flag cache_line_feeds_branch(Cache* cache, Addr addr) {
       return line->feeds_branch;
   }
   return FALSE;
+}
+
+Flag cache_feeder_mark_first_reuse(Cache* cache, Addr addr) {
+  Addr tag, line_addr;
+  uns set = cache_index(cache, addr, &tag, &line_addr);
+  for (uns ii = 0; ii < cache->assoc; ii++) {
+    Cache_Entry* line = &cache->entries[set][ii];
+    if (line->valid && line->tag == tag && line->feeds_branch && !line->feeder_reuse_counted) {
+      line->feeder_reuse_counted = TRUE;
+      return TRUE;
+    }
+  }
+  return FALSE;
+}
+
+Counter cache_line_insertion_time(Cache* cache, Addr addr) {
+  Addr tag, line_addr;
+  uns set = cache_index(cache, addr, &tag, &line_addr);
+  for (uns ii = 0; ii < cache->assoc; ii++) {
+    Cache_Entry* line = &cache->entries[set][ii];
+    if (line->valid && line->tag == tag)
+      return line->insertion_time;
+  }
+  return 0;
 }
 
 /**
@@ -1317,6 +1345,9 @@ void* cache_insert_strategy(Cache* cache, uns8 proc_id, Addr addr, Addr* line_ad
   // update_evict -> action_repl -> update_insert
   // External func also directly call it
   new_line = repl_policy_func_table[policy].update_evict(cache, proc_id, set, &repl_index, NULL, FALSE);
+  new_line->feeds_branch         = FALSE;
+  new_line->feeder_reuse_counted = FALSE;
+  new_line->insertion_time       = sim_time;
 
   if (new_line->valid)
     *repl_line_addr = new_line->base;
