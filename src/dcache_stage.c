@@ -293,7 +293,7 @@ void update_dcache_stage(Stage_Data* src_sd) {
         if (cache_feeder_mark_first_reuse(&dc->dcache, op->oracle_info.va)) {
           STAT_EVENT(op->proc_id, DCACHE_FEEDER_LINE_REUSED);
           INC_STAT_EVENT(op->proc_id, DCACHE_FEEDER_REUSE_DISTANCE,
-                         sim_time - cache_line_insertion_time(&dc->dcache, op->oracle_info.va));
+                         cycle_count - cache_line_insertion_time(&dc->dcache, op->oracle_info.va));
         }
       }
       dcache_cacheline_hit(op, line_addr, line);

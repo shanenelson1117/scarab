@@ -321,7 +321,7 @@ void* cache_insert_replpos(Cache* cache, uns8 proc_id, Addr addr, Addr* line_add
   new_line->tag = tag;
   new_line->base = *line_addr;
   new_line->last_access_time    = sim_time;  // FIXME: this fixes valgrind warnings in update_prf_
-  new_line->insertion_time      = sim_time;
+  new_line->insertion_time      = cycle_count;
   new_line->pref                = isPrefetch;
   new_line->feeds_branch        = FALSE;
   new_line->feeder_reuse_counted = FALSE;
@@ -1347,7 +1347,7 @@ void* cache_insert_strategy(Cache* cache, uns8 proc_id, Addr addr, Addr* line_ad
   new_line = repl_policy_func_table[policy].update_evict(cache, proc_id, set, &repl_index, NULL, FALSE);
   new_line->feeds_branch         = FALSE;
   new_line->feeder_reuse_counted = FALSE;
-  new_line->insertion_time       = sim_time;
+  new_line->insertion_time       = cycle_count;
 
   if (new_line->valid)
     *repl_line_addr = new_line->base;
