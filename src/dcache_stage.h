@@ -85,7 +85,8 @@ extern Dcache_Stage* dc;
 /**************************************************************************************/
 /* Prototypes */
 
-void set_dcache_stage(Dcache_Stage*);
+void   set_dcache_stage(Dcache_Stage*);
+Cache* get_dcache_for_proc(uns8 proc_id);
 void init_dcache_stage(uns8, const char*);
 void reset_dcache_stage(void);
 void recover_dcache_stage(void);

@@ -92,6 +92,10 @@ void set_dcache_stage(Dcache_Stage* new_dc) {
   dc = new_dc;
 }
 
+Cache* get_dcache_for_proc(uns8 proc_id) {
+  return &cmp_model.dcache_stage[proc_id].dcache;
+}
+
 void init_dcache_stage(uns8 proc_id, const char* name) {
   DEBUG(proc_id, "Initializing %s stage\n", name);
 

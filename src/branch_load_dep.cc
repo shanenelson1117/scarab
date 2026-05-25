@@ -51,8 +51,6 @@
 #include <unordered_set>
 #include <vector>
 
-#include "cmp_model.h"
-
 extern "C" {
 #include "core.param.h"
 #include "dcache_stage.h"
@@ -182,7 +180,7 @@ void bld_process_op(uns8 proc_id, Op* op) {
 
     if (dep.is_load) {
       dep.op_ptr->feeds_branch = TRUE;
-      Cache* dcache = &cmp_model.dcache_stage[proc_id].dcache;
+      Cache* dcache = get_dcache_for_proc(proc_id);
       if (dep.va != 0 && cache_set_feeds_branch(dcache, proc_id, dep.va))
         STAT_EVENT(proc_id, DCACHE_FEEDER_LINES_MARKED);
 
