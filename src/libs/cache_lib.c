@@ -151,6 +151,7 @@ void init_cache(Cache* cache, const char* name, uns cache_size, uns assoc, uns l
     }
   }
   cache->num_demand_access = 0;
+  cache->access_seq_num    = 0;
   cache->last_update = 0;
 
   /* For cache partitioning */
@@ -241,6 +242,9 @@ void* cache_access(Cache* cache, Addr addr, Addr* line_addr, Flag update_repl) {
     }
   }
 
+  if (update_repl)
+    cache->access_seq_num++;
+
   if (line_data)
     return line_data;
 
@@ -322,6 +326,7 @@ void* cache_insert_replpos(Cache* cache, uns8 proc_id, Addr addr, Addr* line_add
   new_line->base = *line_addr;
   new_line->last_access_time    = sim_time;  // FIXME: this fixes valgrind warnings in update_prf_
   new_line->insertion_time      = cycle_count;
+  new_line->insertion_access    = cache->access_seq_num;
   new_line->pref                = isPrefetch;
   new_line->feeds_branch        = FALSE;
   new_line->feeder_reuse_counted = FALSE;
@@ -483,6 +488,17 @@ Counter cache_line_insertion_time(Cache* cache, Addr addr) {
     Cache_Entry* line = &cache->entries[set][ii];
     if (line->valid && line->tag == tag)
       return line->insertion_time;
+  }
+  return 0;
+}
+
+Counter cache_line_insertion_access(Cache* cache, Addr addr) {
+  Addr tag, line_addr;
+  uns set = cache_index(cache, addr, &tag, &line_addr);
+  for (uns ii = 0; ii < cache->assoc; ii++) {
+    Cache_Entry* line = &cache->entries[set][ii];
+    if (line->valid && line->tag == tag)
+      return line->insertion_access;
   }
   return 0;
 }
@@ -1357,6 +1373,7 @@ void* cache_insert_strategy(Cache* cache, uns8 proc_id, Addr addr, Addr* line_ad
   new_line->feeds_branch         = FALSE;
   new_line->feeder_reuse_counted = FALSE;
   new_line->insertion_time       = cycle_count;
+  new_line->insertion_access     = cache->access_seq_num;
 
   if (new_line->valid)
     *repl_line_addr = new_line->base;

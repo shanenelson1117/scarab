@@ -91,8 +91,9 @@ typedef struct Cache_Entry_struct {
 
   uns8 reference_val; /* for re-reference replacement policy */
   Flag outcome;       /* for replacement policy */
-  Flag feeds_branch;        /* line brought in by a load that feeds a branch; evict last */
-  Flag feeder_reuse_counted; /* first reuse of this feeder residency has been recorded */
+  Flag    feeds_branch;         /* line brought in by a load that feeds a branch; evict last */
+  Flag    feeder_reuse_counted; /* first reuse of this feeder residency has been recorded */
+  Counter insertion_access;     /* cache->access_seq_num when this line was inserted */
 } Cache_Entry;
 
 // DO NOT CHANGE THIS ORDER
@@ -135,6 +136,7 @@ typedef struct Cache_struct {
   uns* queue_end;               /* queue pointer for ideal storage */
 
   Counter num_demand_access;
+  Counter access_seq_num; /* incremented on every demand access (hit or miss) */
   Counter last_update; /* last update cycle */
 
   uns* num_ways_allocted_core; /* For cache partitioning */
@@ -193,6 +195,7 @@ Flag     cache_set_feeds_branch(Cache*, uns8, Addr);
 Flag     cache_line_feeds_branch(Cache*, Addr);
 Flag     cache_feeder_mark_first_reuse(Cache*, Addr);
 Counter  cache_line_insertion_time(Cache*, Addr);
+Counter  cache_line_insertion_access(Cache*, Addr);
 void* get_next_valid_repl_line(Cache* cache, uns8 proc_id, Addr addr);
 uns ext_cache_index(Cache*, Addr, Addr*, Addr*);
 Addr get_cache_line_addr(Cache*, Addr);

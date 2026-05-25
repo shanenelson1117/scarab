@@ -296,10 +296,10 @@ void update_dcache_stage(Stage_Data* src_sd) {
         STAT_EVENT(op->proc_id, DCACHE_HIT_FEEDS_BRANCH);
         if (cache_feeder_mark_first_reuse(&dc->dcache, op->oracle_info.va)) {
           STAT_EVENT(op->proc_id, DCACHE_FEEDER_LINE_REUSED);
-          Counter dist = cycle_count - cache_line_insertion_time(&dc->dcache, op->oracle_info.va);
+          Counter dist = dc->dcache.access_seq_num - cache_line_insertion_access(&dc->dcache, op->oracle_info.va);
           INC_STAT_EVENT(op->proc_id, DCACHE_FEEDER_REUSE_DISTANCE, dist);
           int bucket = (dist < 256) ? 0
-                       : MIN2((int)(63 - __builtin_clzll(dist)) - 7, 13);
+                       : MIN2((int)(63 - __builtin_clzll(dist)) - 7, 18);
           STAT_EVENT(op->proc_id, DCACHE_FEEDER_REUSE_DIST_LT256 + bucket);
         }
       }
