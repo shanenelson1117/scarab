@@ -294,7 +294,8 @@ void update_dcache_stage(Stage_Data* src_sd) {
     if (line) {
       if (BRANCH_LOAD_DEP && cache_line_feeds_branch(&dc->dcache, op->oracle_info.va)) {
         STAT_EVENT(op->proc_id, DCACHE_HIT_FEEDS_BRANCH);
-        if (cache_feeder_mark_first_reuse(&dc->dcache, op->oracle_info.va)) {
+        if (op->inst_info->table_info.mem_type != MEM_ST &&
+            cache_feeder_mark_first_reuse(&dc->dcache, op->oracle_info.va)) {
           STAT_EVENT(op->proc_id, DCACHE_FEEDER_LINE_REUSED);
           Counter dist = dc->dcache.access_seq_num - cache_line_insertion_access(&dc->dcache, op->oracle_info.va);
           INC_STAT_EVENT(op->proc_id, DCACHE_FEEDER_REUSE_DISTANCE, dist);
