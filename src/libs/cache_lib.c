@@ -528,14 +528,28 @@ Cache_Entry* find_repl_entry(Cache* cache, uns8 proc_id, uns set, uns* way) {
     case REPL_RESTEER:
     case REPL_SHADOW_IDEAL:
     case REPL_TRUE_LRU: {
-      /* Find the LRU candidate among non-feeder lines and feeder lines separately. */
+      if (!BRANCH_LOAD_DEP_REPL) {
+        /* Plain LRU — find the least-recently-used valid way. */
+        uns  lru_way = 0;
+        Counter lru_time = MAX_CTR;
+        for (ii = 0; ii < cache->assoc; ii++) {
+          Cache_Entry* entry = &cache->entries[set][ii];
+          if (!entry->valid) { *way = ii; return entry; }
+          if (entry->last_access_time < lru_time) {
+            lru_way = ii; lru_time = entry->last_access_time;
+          }
+        }
+        *way = lru_way;
+        return &cache->entries[set][lru_way];
+      }
+
+      /* Feeder-aware LRU: protect branch-feeder lines from eviction. */
       uns  nfb_way = 0;        Counter nfb_time = MAX_CTR;  Flag has_nfb = FALSE;
       uns  fb_way  = 0;        Counter fb_time  = MAX_CTR;  Flag has_fb  = FALSE;
 
       for (ii = 0; ii < cache->assoc; ii++) {
         Cache_Entry* entry = &cache->entries[set][ii];
         if (!entry->valid) {
-          /* Free slot — take it immediately, no eviction needed. */
           *way = ii;
           return entry;
         }
@@ -550,17 +564,12 @@ Cache_Entry* find_repl_entry(Cache* cache, uns8 proc_id, uns set, uns* way) {
         }
       }
 
-      /* All ways valid. Decide which to evict. */
       uns evict_way;
       if (!has_nfb) {
-        /* Every line is a branch feeder — fall back to plain LRU. */
         evict_way = fb_way;
       } else if (!has_fb) {
-        /* No feeder lines — plain LRU among non-feeders. */
         evict_way = nfb_way;
       } else {
-        /* Both exist. Check multiplicative age threshold:
-           evict the feeder if its age exceeds the non-feeder's age by the threshold. */
         float threshold = BRANCH_LOAD_DEP_REPL_THRESHOLD;
         if (threshold > 0.0f &&
             (double)(sim_time - fb_time) > (double)(sim_time - nfb_time) * threshold) {

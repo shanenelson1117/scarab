@@ -56,6 +56,8 @@ extern "C" {
 #include "dcache_stage.h"
 #include "inst_info.h"
 #include "libs/cache_lib.h"
+#include "memory/memory.h"
+#include "model.h"
 #include "op.h"
 #include "statistics.h"
 #include "table_info.h"
@@ -179,6 +181,13 @@ void bld_process_op(uns8 proc_id, Op* op) {
       dep.op_ptr->feeds_branch = TRUE;
       if (dep.va != 0 && cache_set_feeds_branch(&dc->dcache, proc_id, dep.va))
         STAT_EVENT(proc_id, DCACHE_FEEDER_LINES_MARKED);
+
+      if (BRANCH_LOAD_DEP_PREFETCH && dep.va != 0 && model->mem == MODEL_MEM) {
+        Addr line_addr;
+        if (!cache_access(&dc->dcache, dep.va, &line_addr, FALSE))
+          new_mem_req(MRT_DPRF, proc_id, line_addr, DCACHE_LINE_SIZE, 0, NULL,
+                      dcache_fill_line, 0, NULL);
+      }
 
       if (BRANCH_LOAD_DEP_CROSS_LOAD && loads_crossed < 1) {
         for (Counter src_uid : dep.src_writer_uids)
