@@ -54,6 +54,7 @@
 extern "C" {
 #include "core.param.h"
 #include "dcache_stage.h"
+#include "memory/memory.param.h"
 #include "inst_info.h"
 #include "libs/cache_lib.h"
 #include "memory/memory.h"
