@@ -51,8 +51,9 @@
 #include <unordered_set>
 #include <vector>
 
-extern "C" {
 #include "cmp_model.h"
+
+extern "C" {
 #include "core.param.h"
 #include "dcache_stage.h"
 #include "memory/memory.param.h"
