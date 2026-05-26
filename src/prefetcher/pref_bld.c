@@ -20,32 +20,29 @@
  */
 
 /***************************************************************************************
- * File         : branch_load_dep.h
- * Description  : Inline def-use analysis: marks loads whose values transitively
- *                feed branch instructions (through ALU chains, not load-to-load),
- *                and protects their L1D cache lines from premature eviction.
+ * File         : prefetcher/pref_bld.c
+ * Description  : Branch-load-dep trace-replay prefetcher.
  ***************************************************************************************/
 
-#ifndef __BRANCH_LOAD_DEP_H__
-#define __BRANCH_LOAD_DEP_H__
+#include "prefetcher/pref_bld.h"
 
+#include "globals/global_defs.h"
 #include "globals/global_types.h"
+#include "globals/utils.h"
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+#include "core.param.h"
+#include "memory/memory.param.h"
 
-/* Called once at simulator init with the number of cores. */
-void bld_init(uns8 num_cores);
+static HWP_Info* g_bld_hwp_info = NULL;
 
-/* Called for every op that exits the decode stage. */
-void bld_process_op(uns8 proc_id, Op* op);
-
-/* Called at simulation end to flush and close any open trace file. */
-void bld_finish(void);
-
-#ifdef __cplusplus
+void pref_bld_init(HWP* hwp) {
+  hwp->hwp_info->enabled = BRANCH_LOAD_DEP_TRACE_REPLAY;
+  g_bld_hwp_info         = hwp->hwp_info;
 }
-#endif
 
-#endif /* #ifndef __BRANCH_LOAD_DEP_H__ */
+Flag pref_bld_send(uns8 proc_id, Addr va) {
+  if (!g_bld_hwp_info || !va)
+    return FALSE;
+  return pref_addto_dl0req_queue(proc_id, va >> LOG2(DCACHE_LINE_SIZE),
+                                 g_bld_hwp_info->id);
+}

@@ -20,32 +20,23 @@
  */
 
 /***************************************************************************************
- * File         : branch_load_dep.h
- * Description  : Inline def-use analysis: marks loads whose values transitively
- *                feed branch instructions (through ALU chains, not load-to-load),
- *                and protects their L1D cache lines from premature eviction.
+ * File         : prefetcher/pref_bld.h
+ * Description  : Branch-load-dep trace-replay prefetcher.
+ *                Proactively prefetches feeder-load cache lines into the L1
+ *                dcache a fixed number of instructions before the branch that
+ *                depends on them, using a pre-recorded CSV trace.
  ***************************************************************************************/
 
-#ifndef __BRANCH_LOAD_DEP_H__
-#define __BRANCH_LOAD_DEP_H__
+#ifndef __PREF_BLD_H__
+#define __PREF_BLD_H__
 
-#include "globals/global_types.h"
+#include "prefetcher/pref_common.h"
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+/* Called by pref_init() via pref_table.def. */
+void pref_bld_init(HWP* hwp);
 
-/* Called once at simulator init with the number of cores. */
-void bld_init(uns8 num_cores);
+/* Issue a prefetch for the cache line containing VA on behalf of proc_id.
+ * Returns FALSE if the prefetch queue is full. */
+Flag pref_bld_send(uns8 proc_id, Addr va);
 
-/* Called for every op that exits the decode stage. */
-void bld_process_op(uns8 proc_id, Op* op);
-
-/* Called at simulation end to flush and close any open trace file. */
-void bld_finish(void);
-
-#ifdef __cplusplus
-}
-#endif
-
-#endif /* #ifndef __BRANCH_LOAD_DEP_H__ */
+#endif /* __PREF_BLD_H__ */

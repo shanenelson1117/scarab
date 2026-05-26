@@ -272,6 +272,15 @@ DEF_PARAM(branch_load_dep_repl, BRANCH_LOAD_DEP_REPL, Flag, Flag, TRUE, )
 DEF_PARAM(branch_load_dep_prefetch, BRANCH_LOAD_DEP_PREFETCH, Flag, Flag, FALSE, )
 DEF_PARAM(branch_load_dep_zero_latency, BRANCH_LOAD_DEP_ZERO_LATENCY, Flag, Flag, FALSE, )
 DEF_PARAM(branch_load_dep_cross_load, BRANCH_LOAD_DEP_CROSS_LOAD, Flag, Flag, FALSE, )
+/* Record branch→feeder-load pairs to a CSV for offline analysis / replay. */
+DEF_PARAM(branch_load_dep_trace_record,    BRANCH_LOAD_DEP_TRACE_RECORD,    Flag,  Flag, FALSE, )
+/* Replay a previously recorded CSV: prefetch feeder lines LOOKAHEAD instrs ahead of each branch. */
+DEF_PARAM(branch_load_dep_trace_replay,    BRANCH_LOAD_DEP_TRACE_REPLAY,    Flag,  Flag, FALSE, )
+/* Directory where per-benchmark trace CSVs are written/read.
+   Filename is derived automatically from CBP_TRACE_R0 as <bench>_<simpoint>.csv.
+   Defaults to the current working directory (the per-simpoint output dir). */
+DEF_PARAM(branch_load_dep_trace_dir,       BRANCH_LOAD_DEP_TRACE_DIR,       char*, string, ".", )
+DEF_PARAM(branch_load_dep_trace_lookahead, BRANCH_LOAD_DEP_TRACE_LOOKAHEAD, uns,   uns,    100, )
 DEF_PARAM(dcache_hit_one_cycle, DCACHE_HIT_ONE_CYCLE, Flag, Flag, FALSE, )
 DEF_PARAM(cbp_trace_r0, CBP_TRACE_R0, char*, string, NULL, )
 DEF_PARAM(cbp_trace_r1, CBP_TRACE_R1, char*, string, NULL, )
