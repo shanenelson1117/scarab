@@ -318,9 +318,9 @@ void bld_process_op(uns8 proc_id, Op* op) {
                 ",0x%" PRIx64 "\n",
                 (unsigned)proc_id,
                 (uint64_t)op->unique_num,
-                (uint64_t)op->PC,
+                (uint64_t)op->inst_info->addr,
                 (uint64_t)dep.uid,
-                (uint64_t)dep.op_ptr->PC,
+                (uint64_t)dep.op_ptr->inst_info->addr,
                 (uint64_t)dep.va);
       }
 
