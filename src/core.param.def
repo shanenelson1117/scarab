@@ -271,6 +271,7 @@ DEF_PARAM(branch_load_dep_repl_threshold, BRANCH_LOAD_DEP_REPL_THRESHOLD, float,
 DEF_PARAM(branch_load_dep_repl, BRANCH_LOAD_DEP_REPL, Flag, Flag, TRUE, )
 DEF_PARAM(branch_load_dep_prefetch, BRANCH_LOAD_DEP_PREFETCH, Flag, Flag, FALSE, )
 DEF_PARAM(branch_load_dep_zero_latency, BRANCH_LOAD_DEP_ZERO_LATENCY, Flag, Flag, FALSE, )
+DEF_PARAM(branch_load_dep_hit_latency, BRANCH_LOAD_DEP_HIT_LATENCY, Flag, Flag, FALSE, )
 DEF_PARAM(branch_load_dep_cross_load, BRANCH_LOAD_DEP_CROSS_LOAD, Flag, Flag, FALSE, )
 DEF_PARAM(dcache_hit_one_cycle, DCACHE_HIT_ONE_CYCLE, Flag, Flag, FALSE, )
 DEF_PARAM(cbp_trace_r0, CBP_TRACE_R0, char*, string, NULL, )
