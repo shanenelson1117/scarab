@@ -660,7 +660,7 @@ static inline void dcache_cacheline_miss(Op* op, Addr line_addr) {
         STAT_EVENT(op->proc_id, DCACHE_MISS_LD_OFFPATH);
         wrongpath_dcmiss = FALSE;
       }
-      if (BRANCH_LOAD_DEP_HIT_LATENCY && op->feeds_branch) {
+      if (PERFECT_DCACHE_HIT_LATENCY || (BRANCH_LOAD_DEP_HIT_LATENCY && op->feeds_branch)) {
         op->done_cycle = cycle_count + DCACHE_CYCLES;
         op->wake_cycle = op->done_cycle;
         wake_up_ops(op, REG_DATA_DEP, model->wake_hook);
