@@ -141,6 +141,7 @@ static std::vector<std::deque<ReplayEntry>> g_replay_queues;
 struct InstRecord {
   bool is_load;
   Addr va;          /* virtual address (meaningful only when is_load) */
+  Addr pc;          /* instruction address, copied at decode time before op may be freed */
   Op*  op_ptr;      /* raw pointer valid while op is in the ROB */
   std::vector<Counter> src_writer_uids;
   Counter uid;      /* copy for ordered eviction */
@@ -249,6 +250,7 @@ void bld_process_op(uns8 proc_id, Op* op) {
   rec.uid     = op->unique_num;
   rec.is_load = is_load;
   rec.va      = is_load ? op->oracle_info.va : static_cast<Addr>(0);
+  rec.pc      = op->inst_info->addr;
   rec.op_ptr  = op;
 
   /* Collect unique_nums of ops that wrote this op's source regs. */
@@ -320,7 +322,7 @@ void bld_process_op(uns8 proc_id, Op* op) {
                 (uint64_t)op->unique_num,
                 (uint64_t)op->inst_info->addr,
                 (uint64_t)dep.uid,
-                (uint64_t)dep.op_ptr->inst_info->addr,
+                (uint64_t)dep.pc,
                 (uint64_t)dep.va);
       }
 
