@@ -229,7 +229,7 @@ void bld_process_op(uns8 proc_id, Op* op) {
     Counter lookahead = (Counter)BRANCH_LOAD_DEP_TRACE_LOOKAHEAD;
     Counter max_dist  = (Counter)BRANCH_LOAD_DEP_TRACE_MAX_DIST;
     while (!queue.empty() &&
-           queue.front().feeder_uid <= op->unique_num + lookahead) {
+           queue.front().branch_uid <= op->unique_num + lookahead) {
       const ReplayEntry& e = queue.front();
       bool dist_ok = (max_dist == 0) || (e.branch_uid - e.feeder_uid <= max_dist);
       if (dist_ok)
