@@ -133,7 +133,8 @@ static void bld_trace_path(char* out, size_t sz) {
 
 /* Replay: one entry per row from the recorded CSV. */
 struct ReplayEntry {
-  Counter branch_uid;
+  Counter feeder_uid; /* trigger point: fire LOOKAHEAD instrs before the feeder load */
+  Counter branch_uid; /* used for distance filter */
   Addr    feeder_va;
 };
 static std::vector<std::deque<ReplayEntry>> g_replay_queues;
@@ -195,7 +196,7 @@ void bld_init(uns8 num_cores) {
       std::getline(ss, tok, ','); pid = std::stoi(tok);
       std::getline(ss, tok, ','); e.branch_uid = (Counter)std::stoull(tok);
       std::getline(ss, tok, ','); /* branch_pc  — not needed at replay */
-      std::getline(ss, tok, ','); /* feeder_uid — not needed at replay */
+      std::getline(ss, tok, ','); e.feeder_uid = (Counter)std::stoull(tok);
       std::getline(ss, tok, ','); /* feeder_pc  — not needed at replay */
       std::getline(ss, tok, ','); e.feeder_va = (Addr)std::stoull(tok, nullptr, 16);
       if (pid >= 0 && (uns8)pid < num_cores)
@@ -204,7 +205,7 @@ void bld_init(uns8 num_cores) {
     for (auto& q : g_replay_queues)
       std::sort(q.begin(), q.end(),
                 [](const ReplayEntry& a, const ReplayEntry& b) {
-                  return a.branch_uid < b.branch_uid;
+                  return a.feeder_uid < b.feeder_uid;
                 });
   }
 }
@@ -226,9 +227,13 @@ void bld_process_op(uns8 proc_id, Op* op) {
   if (BRANCH_LOAD_DEP_TRACE_REPLAY && !op->off_path) {
     auto& queue = g_replay_queues[proc_id];
     Counter lookahead = (Counter)BRANCH_LOAD_DEP_TRACE_LOOKAHEAD;
+    Counter max_dist  = (Counter)BRANCH_LOAD_DEP_TRACE_MAX_DIST;
     while (!queue.empty() &&
-           queue.front().branch_uid <= op->unique_num + lookahead) {
-      pref_bld_send(proc_id, queue.front().feeder_va);
+           queue.front().feeder_uid <= op->unique_num + lookahead) {
+      const ReplayEntry& e = queue.front();
+      bool dist_ok = (max_dist == 0) || (e.branch_uid - e.feeder_uid <= max_dist);
+      if (dist_ok)
+        pref_bld_send(proc_id, e.feeder_va);
       queue.pop_front();
     }
   }

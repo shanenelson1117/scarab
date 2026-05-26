@@ -281,6 +281,9 @@ DEF_PARAM(branch_load_dep_trace_replay,    BRANCH_LOAD_DEP_TRACE_REPLAY,    Flag
    Defaults to the current working directory (the per-simpoint output dir). */
 DEF_PARAM(branch_load_dep_trace_dir,       BRANCH_LOAD_DEP_TRACE_DIR,       char*, string, ".", )
 DEF_PARAM(branch_load_dep_trace_lookahead, BRANCH_LOAD_DEP_TRACE_LOOKAHEAD, uns,   uns,    100, )
+/* Max allowed distance (in instructions) between feeder load and branch for replay to fire.
+   Filters out deep ALU chains where the load is too far upstream. 0 = no limit. */
+DEF_PARAM(branch_load_dep_trace_max_dist,  BRANCH_LOAD_DEP_TRACE_MAX_DIST,  uns,   uns,    0,   )
 DEF_PARAM(dcache_hit_one_cycle, DCACHE_HIT_ONE_CYCLE, Flag, Flag, FALSE, )
 DEF_PARAM(cbp_trace_r0, CBP_TRACE_R0, char*, string, NULL, )
 DEF_PARAM(cbp_trace_r1, CBP_TRACE_R1, char*, string, NULL, )

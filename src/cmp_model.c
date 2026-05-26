@@ -54,6 +54,7 @@
 #include "prefetcher/fdip.h"
 #include "prefetcher/pref_common.h"
 
+#include "branch_load_dep.h"
 #include "decoupled_frontend.h"
 #include "freq.h"
 #include "ft.h"
@@ -303,6 +304,7 @@ void cmp_debug() {
 /* cmp_done: */
 
 void cmp_done() {
+  bld_finish();
   if (PREF_FRAMEWORK_ON)
     pref_done();
   if (DVFS_ON)
