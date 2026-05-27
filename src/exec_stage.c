@@ -560,12 +560,29 @@ static inline void exec_stage_bp_resolve(Op* op) {
   // Track cycle
     if(!op->off_path && op->bp_pred_info->recover_at_exec &&
     (op->bp_pred_info->mispred || op->bp_pred_info->misfetch)) {
-      // Total mispredicted branches resolved at exec
+      Counter real_rdy_cycle = MAX2(op->rdy_cycle, op->issue_cycle);
+      Counter resolve_cycles = op->exec_cycle - op->issue_cycle;
+      Counter operand_wait   = real_rdy_cycle  - op->issue_cycle;
+
       STAT_EVENT(op->proc_id, BR_EXEC_RESOLVE_COUNT);
-      // Total cycles wasted in exec on mispredicted branchs
-      INC_STAT_EVENT(op->proc_id, BR_EXEC_RESOLVE_TOTAL, op->exec_cycle - op->issue_cycle);
-      // Total cycles waiting on branch operands
-      INC_STAT_EVENT(op->proc_id, BR_EXEC_OPERAND_WAIT,  op->rdy_cycle  - op->issue_cycle);
+      INC_STAT_EVENT(op->proc_id, BR_EXEC_RESOLVE_TOTAL, resolve_cycles);
+      INC_STAT_EVENT(op->proc_id, BR_EXEC_OPERAND_WAIT,  operand_wait);
+
+      if(op->bp_pred_info->mispred) {
+        STAT_EVENT(op->proc_id, BR_EXEC_RESOLVE_COUNT_MISPRED);
+        INC_STAT_EVENT(op->proc_id, BR_EXEC_RESOLVE_TOTAL_MISPRED, resolve_cycles);
+        INC_STAT_EVENT(op->proc_id, BR_EXEC_OPERAND_WAIT_MISPRED,  operand_wait);
+      } else {
+        STAT_EVENT(op->proc_id, BR_EXEC_RESOLVE_COUNT_MISFETCH);
+        INC_STAT_EVENT(op->proc_id, BR_EXEC_RESOLVE_TOTAL_MISFETCH, resolve_cycles);
+        INC_STAT_EVENT(op->proc_id, BR_EXEC_OPERAND_WAIT_MISFETCH,  operand_wait);
+      }
+
+      if(op->bp_pred_info->mispred && op->bp_pred_info->misfetch) {
+        STAT_EVENT(op->proc_id, BR_EXEC_RESOLVE_COUNT_BOTH);
+        INC_STAT_EVENT(op->proc_id, BR_EXEC_RESOLVE_TOTAL_BOTH, resolve_cycles);
+        INC_STAT_EVENT(op->proc_id, BR_EXEC_OPERAND_WAIT_BOTH,  operand_wait);
+      }
     }
 
   if (op->bp_pred_info->recover_at_exec) {
