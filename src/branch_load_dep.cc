@@ -273,11 +273,10 @@ void bld_process_op(uns8 proc_id, Op* op) {
     return;
 
   /* === Branch: traverse backward to find feeding loads ===
-   * Each worklist entry carries the uid and the hop depth from the branch
-   * (direct branch sources = depth 1).  When BRANCH_LOAD_DEP_MAX_DEPTH > 0
-   * nodes beyond that depth are skipped entirely.  When BRANCH_LOAD_DEP_CROSS_LOAD
-   * is set the DFS continues through a marked load's sources; without it loads
-   * act as traversal boundaries. */
+   * Each worklist entry carries the uid and load-boundary depth (0 = direct
+   * feeder through any ALU chain, 1 = feeder of a feeder, etc.).  Depth
+   * increments only when crossing a load boundary.  When BRANCH_LOAD_DEP_MAX_DEPTH
+   * > 0, nodes beyond that depth are skipped. */
   uns max_depth = BRANCH_LOAD_DEP_MAX_DEPTH;
   std::unordered_set<Counter> visited;
   std::vector<std::pair<Counter, uns>> worklist;  /* (uid, load-boundary depth) */
@@ -320,10 +319,8 @@ void bld_process_op(uns8 proc_id, Op* op) {
                       dcache_fill_line, 0, NULL);
       }
 
-      if (BRANCH_LOAD_DEP_CROSS_LOAD) {
-        for (Counter src_uid : dep.src_writer_uids)
-          worklist.push_back({src_uid, depth + 1});
-      }
+      for (Counter src_uid : dep.src_writer_uids)
+        worklist.push_back({src_uid, depth + 1});
     } else {
       for (Counter src_uid : dep.src_writer_uids)
         worklist.push_back({src_uid, depth});
