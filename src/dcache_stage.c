@@ -882,7 +882,8 @@ static inline void dcache_fill_process_cacheline(Mem_Req* req, Dcache_Data* data
     op->done_cycle = cycle_count + 1;
     op->state = OS_SCHEDULED;
 
-    if (op->inst_info->table_info.mem_type != MEM_ST) {
+    if (op->inst_info->table_info.mem_type != MEM_ST &&
+        !(BRANCH_LOAD_DEP_HIT_LATENCY && op->feeds_branch)) {
       op->wake_cycle = op->done_cycle;
       wake_up_ops(op, REG_DATA_DEP, model->wake_hook);
     }
