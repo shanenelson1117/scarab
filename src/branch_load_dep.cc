@@ -131,12 +131,8 @@ static void bld_trace_path(char* out, size_t sz) {
   snprintf(out, sz, "%s/%s_%s.csv", dir, bench, simpt);
 }
 
-/* Replay: one entry per row from the recorded CSV. */
-struct ReplayEntry {
-  Counter feeder_uid;
-  uns     depth;
-};
-static std::vector<std::deque<ReplayEntry>> g_replay_queues;
+/* feeder_pc → minimum recorded depth, per proc.  Populated at init from the CSV. */
+static std::vector<std::unordered_map<Addr, uns>> g_replay_maps;
 
 struct InstRecord {
   bool is_load;
@@ -162,7 +158,7 @@ static std::vector<BldState> g_states;
 
 void bld_init(uns8 num_cores) {
   g_states.resize(num_cores);
-  g_replay_queues.resize(num_cores);
+  g_replay_maps.resize(num_cores);
 
   char trace_path[MAX_STR_LENGTH + 1];
   bld_trace_path(trace_path, sizeof(trace_path));
@@ -174,7 +170,7 @@ void bld_init(uns8 num_cores) {
               trace_path);
       exit(1);
     }
-    fprintf(g_trace_out, "proc_id,feeder_uid,depth\n");
+    fprintf(g_trace_out, "proc_id,feeder_pc,depth\n");
   }
 
   if (BRANCH_LOAD_DEP_TRACE_REPLAY) {
@@ -189,19 +185,17 @@ void bld_init(uns8 num_cores) {
     while (std::getline(f, row)) {
       std::istringstream ss(row);
       std::string tok;
-      ReplayEntry e;
       int pid;
       std::getline(ss, tok, ','); pid = std::stoi(tok);
-      std::getline(ss, tok, ','); e.feeder_uid = (Counter)std::stoull(tok);
-      std::getline(ss, tok, ','); e.depth      = (uns)std::stoul(tok);
-      if (pid >= 0 && (uns8)pid < num_cores)
-        g_replay_queues[(uns8)pid].push_back(e);
+      std::getline(ss, tok, ','); Addr pc = (Addr)std::stoull(tok, nullptr, 16);
+      std::getline(ss, tok, ','); uns  d  = (uns)std::stoul(tok);
+      if (pid >= 0 && (uns8)pid < num_cores) {
+        auto& m = g_replay_maps[(uns8)pid];
+        auto it = m.find(pc);
+        if (it == m.end() || d < it->second)
+          m[pc] = d;  /* keep the shallowest depth seen for this PC */
+      }
     }
-    for (auto& q : g_replay_queues)
-      std::sort(q.begin(), q.end(),
-                [](const ReplayEntry& a, const ReplayEntry& b) {
-                  return a.feeder_uid < b.feeder_uid;
-                });
   }
 }
 
@@ -216,22 +210,16 @@ static void evict_oldest(BldState& s) {
 }
 
 void bld_process_op(uns8 proc_id, Op* op) {
-  /* Replay: mark feeder loads as feeds_branch when their uid is reached so the
-   * dcache gives them hit latency (BRANCH_LOAD_DEP_HIT_LATENCY).  Runs
-   * independently of BRANCH_LOAD_DEP.  Off-path ops are skipped. */
+  /* Replay: mark feeder loads by PC so the dcache gives them hit latency
+   * (BRANCH_LOAD_DEP_HIT_LATENCY).  Runs independently of BRANCH_LOAD_DEP.
+   * Off-path ops are skipped. */
   if (BRANCH_LOAD_DEP_TRACE_REPLAY && !op->off_path) {
-    auto& queue = g_replay_queues[proc_id];
-    /* Pop all entries whose feeder has already been reached or passed.
-     * On an exact uid match, mark feeds_branch if the recorded depth is within
-     * the current BRANCH_LOAD_DEP_MAX_DEPTH limit (0 = unlimited). */
-    uns replay_max_depth = BRANCH_LOAD_DEP_MAX_DEPTH;
-    while (!queue.empty() && queue.front().feeder_uid <= op->unique_num) {
-      const ReplayEntry& e = queue.front();
-      if (e.feeder_uid == op->unique_num) {
-        if (replay_max_depth == 0 || e.depth <= replay_max_depth)
-          op->feeds_branch = TRUE;
-      }
-      queue.pop_front();
+    const auto& m = g_replay_maps[proc_id];
+    auto it = m.find(op->inst_info->addr);
+    if (it != m.end()) {
+      uns replay_max_depth = BRANCH_LOAD_DEP_MAX_DEPTH;
+      if (replay_max_depth == 0 || it->second <= replay_max_depth)
+        op->feeds_branch = TRUE;
     }
   }
 
@@ -321,8 +309,8 @@ void bld_process_op(uns8 proc_id, Op* op) {
         STAT_EVENT(proc_id, DCACHE_FEEDER_LINES_MARKED);
 
       if (BRANCH_LOAD_DEP_TRACE_RECORD && g_trace_out) {
-        fprintf(g_trace_out, "%u,%" PRIu64 ",%u\n",
-                (unsigned)proc_id, (uint64_t)dep.uid, (unsigned)depth);
+        fprintf(g_trace_out, "%u,0x%" PRIx64 ",%u\n",
+                (unsigned)proc_id, (uint64_t)dep.pc, (unsigned)depth);
       }
 
       if (BRANCH_LOAD_DEP_PREFETCH && dep.va != 0 && model->mem == MODEL_MEM) {
