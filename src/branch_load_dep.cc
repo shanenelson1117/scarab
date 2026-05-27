@@ -131,13 +131,13 @@ static void bld_trace_path(char* out, size_t sz) {
   snprintf(out, sz, "%s/%s_%s.csv", dir, bench, simpt);
 }
 
-/* feeder_pc → minimum recorded depth, per proc.  Populated at init from the CSV. */
-static std::vector<std::unordered_map<Addr, uns>> g_replay_maps;
+/* feeder inst_uid → minimum recorded depth, per proc.  Populated at init from the CSV. */
+static std::vector<std::unordered_map<uns64, uns>> g_replay_maps;
 
 struct InstRecord {
   bool is_load;
   Addr va;          /* virtual address (meaningful only when is_load) */
-  Addr pc;          /* instruction address, copied at decode time before op may be freed */
+  uns64 inst_uid;   /* stable per-static-instruction id from the trace frontend */
   Op*  op_ptr;      /* raw pointer valid while op is in the ROB */
   std::vector<Counter> src_writer_uids;
   Counter uid;      /* copy for ordered eviction */
@@ -170,7 +170,7 @@ void bld_init(uns8 num_cores) {
               trace_path);
       exit(1);
     }
-    fprintf(g_trace_out, "proc_id,feeder_pc,depth\n");
+    fprintf(g_trace_out, "proc_id,feeder_inst_uid,depth\n");
   }
 
   if (BRANCH_LOAD_DEP_TRACE_REPLAY) {
@@ -187,13 +187,13 @@ void bld_init(uns8 num_cores) {
       std::string tok;
       int pid;
       std::getline(ss, tok, ','); pid = std::stoi(tok);
-      std::getline(ss, tok, ','); Addr pc = (Addr)std::stoull(tok, nullptr, 16);
-      std::getline(ss, tok, ','); uns  d  = (uns)std::stoul(tok);
+      std::getline(ss, tok, ','); uns64 iuid = (uns64)std::stoull(tok);
+      std::getline(ss, tok, ','); uns   d    = (uns)std::stoul(tok);
       if (pid >= 0 && (uns8)pid < num_cores) {
         auto& m = g_replay_maps[(uns8)pid];
-        auto it = m.find(pc);
+        auto it = m.find(iuid);
         if (it == m.end() || d < it->second)
-          m[pc] = d;  /* keep the shallowest depth seen for this PC */
+          m[iuid] = d;  /* keep the shallowest depth seen for this inst_uid */
       }
     }
   }
@@ -215,7 +215,7 @@ void bld_process_op(uns8 proc_id, Op* op) {
    * Off-path ops are skipped. */
   if (BRANCH_LOAD_DEP_TRACE_REPLAY && !op->off_path) {
     const auto& m = g_replay_maps[proc_id];
-    auto it = m.find(op->inst_info->addr);
+    auto it = m.find(op->inst_uid);
     if (it != m.end()) {
       uns replay_max_depth = BRANCH_LOAD_DEP_MAX_DEPTH;
       if (replay_max_depth == 0 || it->second <= replay_max_depth)
@@ -240,7 +240,7 @@ void bld_process_op(uns8 proc_id, Op* op) {
   rec.uid     = op->unique_num;
   rec.is_load = is_load;
   rec.va      = is_load ? op->oracle_info.va : static_cast<Addr>(0);
-  rec.pc      = op->inst_info->addr;
+  rec.inst_uid = op->inst_uid;
   rec.op_ptr  = op;
 
   /* Collect unique_nums of ops that wrote this op's source regs. */
@@ -309,8 +309,8 @@ void bld_process_op(uns8 proc_id, Op* op) {
         STAT_EVENT(proc_id, DCACHE_FEEDER_LINES_MARKED);
 
       if (BRANCH_LOAD_DEP_TRACE_RECORD && g_trace_out) {
-        fprintf(g_trace_out, "%u,0x%" PRIx64 ",%u\n",
-                (unsigned)proc_id, (uint64_t)dep.pc, (unsigned)depth);
+        fprintf(g_trace_out, "%u,%" PRIu64 ",%u\n",
+                (unsigned)proc_id, (uint64_t)dep.inst_uid, (unsigned)depth);
       }
 
       if (BRANCH_LOAD_DEP_PREFETCH && dep.va != 0 && model->mem == MODEL_MEM) {
