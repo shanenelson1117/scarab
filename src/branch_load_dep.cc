@@ -133,9 +133,8 @@ static void bld_trace_path(char* out, size_t sz) {
 
 /* Replay: one entry per row from the recorded CSV. */
 struct ReplayEntry {
-  Counter feeder_uid; /* trigger point: fire LOOKAHEAD instrs before the feeder load */
-  Counter branch_uid; /* used for distance filter */
-  Addr    feeder_va;
+  Counter feeder_uid;
+  uns     depth;
 };
 static std::vector<std::deque<ReplayEntry>> g_replay_queues;
 
@@ -175,8 +174,7 @@ void bld_init(uns8 num_cores) {
               trace_path);
       exit(1);
     }
-    fprintf(g_trace_out,
-            "proc_id,branch_uid,branch_pc,feeder_uid,feeder_pc,feeder_va\n");
+    fprintf(g_trace_out, "proc_id,feeder_uid,depth\n");
   }
 
   if (BRANCH_LOAD_DEP_TRACE_REPLAY) {
@@ -194,11 +192,8 @@ void bld_init(uns8 num_cores) {
       ReplayEntry e;
       int pid;
       std::getline(ss, tok, ','); pid = std::stoi(tok);
-      std::getline(ss, tok, ','); e.branch_uid = (Counter)std::stoull(tok);
-      std::getline(ss, tok, ','); /* branch_pc  — not needed at replay */
       std::getline(ss, tok, ','); e.feeder_uid = (Counter)std::stoull(tok);
-      std::getline(ss, tok, ','); /* feeder_pc  — not needed at replay */
-      std::getline(ss, tok, ','); e.feeder_va = (Addr)std::stoull(tok, nullptr, 16);
+      std::getline(ss, tok, ','); e.depth      = (uns)std::stoul(tok);
       if (pid >= 0 && (uns8)pid < num_cores)
         g_replay_queues[(uns8)pid].push_back(e);
     }
@@ -221,19 +216,21 @@ static void evict_oldest(BldState& s) {
 }
 
 void bld_process_op(uns8 proc_id, Op* op) {
-  /* Replay: issue proactive prefetches for recorded branch→feeder pairs.
-   * Runs independently of BRANCH_LOAD_DEP so it can be used without live
-   * dep tracking.  Off-path ops are skipped to avoid spurious prefetches. */
+  /* Replay: mark feeder loads as feeds_branch when their uid is reached so the
+   * dcache gives them hit latency (BRANCH_LOAD_DEP_HIT_LATENCY).  Runs
+   * independently of BRANCH_LOAD_DEP.  Off-path ops are skipped. */
   if (BRANCH_LOAD_DEP_TRACE_REPLAY && !op->off_path) {
     auto& queue = g_replay_queues[proc_id];
-    Counter lookahead = (Counter)BRANCH_LOAD_DEP_TRACE_LOOKAHEAD;
-    Counter max_dist  = (Counter)BRANCH_LOAD_DEP_TRACE_MAX_DIST;
-    while (!queue.empty() &&
-           queue.front().branch_uid <= op->unique_num + lookahead) {
+    /* Pop all entries whose feeder has already been reached or passed.
+     * On an exact uid match, mark feeds_branch if the recorded depth is within
+     * the current BRANCH_LOAD_DEP_MAX_DEPTH limit (0 = unlimited). */
+    uns replay_max_depth = BRANCH_LOAD_DEP_MAX_DEPTH;
+    while (!queue.empty() && queue.front().feeder_uid <= op->unique_num) {
       const ReplayEntry& e = queue.front();
-      bool dist_ok = (max_dist == 0) || (e.branch_uid - e.feeder_uid <= max_dist);
-      if (dist_ok)
-        pref_bld_send(proc_id, e.feeder_va);
+      if (e.feeder_uid == op->unique_num) {
+        if (replay_max_depth == 0 || e.depth <= replay_max_depth)
+          op->feeds_branch = TRUE;
+      }
       queue.pop_front();
     }
   }
@@ -288,21 +285,25 @@ void bld_process_op(uns8 proc_id, Op* op) {
     return;
 
   /* === Branch: traverse backward to find feeding loads ===
-   * Each worklist entry carries the uid and how many loads have been crossed
-   * to reach it.  When BRANCH_LOAD_DEP_CROSS_LOAD is set, the DFS continues
-   * through a load's sources (treating the load as a passthrough) up to one
-   * load boundary deep.  Without the flag the original behaviour is preserved:
-   * loads are marked but not traversed. */
+   * Each worklist entry carries the uid and the hop depth from the branch
+   * (direct branch sources = depth 1).  When BRANCH_LOAD_DEP_MAX_DEPTH > 0
+   * nodes beyond that depth are skipped entirely.  When BRANCH_LOAD_DEP_CROSS_LOAD
+   * is set the DFS continues through a marked load's sources; without it loads
+   * act as traversal boundaries. */
+  uns max_depth = BRANCH_LOAD_DEP_MAX_DEPTH;
   std::unordered_set<Counter> visited;
-  std::vector<std::pair<Counter, int>> worklist;  /* (uid, loads_crossed) */
+  std::vector<std::pair<Counter, uns>> worklist;  /* (uid, depth) */
 
   const InstRecord& branch_rec = state.records[op->unique_num];
   for (Counter uid : branch_rec.src_writer_uids)
-    worklist.push_back({uid, 0});
+    worklist.push_back({uid, 1});
 
   while (!worklist.empty()) {
-    auto [uid, loads_crossed] = worklist.back();
+    auto [uid, depth] = worklist.back();
     worklist.pop_back();
+
+    if (max_depth > 0 && depth > max_depth)
+      continue;
 
     if (!visited.insert(uid).second)
       continue;
@@ -319,16 +320,9 @@ void bld_process_op(uns8 proc_id, Op* op) {
       if (dep.va != 0 && cache_set_feeds_branch(dcache, proc_id, dep.va))
         STAT_EVENT(proc_id, DCACHE_FEEDER_LINES_MARKED);
 
-      if (BRANCH_LOAD_DEP_TRACE_RECORD && dep.va != 0 && g_trace_out) {
-        fprintf(g_trace_out,
-                "%u,%" PRIu64 ",0x%" PRIx64 ",%" PRIu64 ",0x%" PRIx64
-                ",0x%" PRIx64 "\n",
-                (unsigned)proc_id,
-                (uint64_t)op->unique_num,
-                (uint64_t)op->inst_info->addr,
-                (uint64_t)dep.uid,
-                (uint64_t)dep.pc,
-                (uint64_t)dep.va);
+      if (BRANCH_LOAD_DEP_TRACE_RECORD && g_trace_out) {
+        fprintf(g_trace_out, "%u,%" PRIu64 ",%u\n",
+                (unsigned)proc_id, (uint64_t)dep.uid, (unsigned)depth);
       }
 
       if (BRANCH_LOAD_DEP_PREFETCH && dep.va != 0 && model->mem == MODEL_MEM) {
@@ -338,13 +332,13 @@ void bld_process_op(uns8 proc_id, Op* op) {
                       dcache_fill_line, 0, NULL);
       }
 
-      if (BRANCH_LOAD_DEP_CROSS_LOAD && loads_crossed < 1) {
+      if (BRANCH_LOAD_DEP_CROSS_LOAD) {
         for (Counter src_uid : dep.src_writer_uids)
-          worklist.push_back({src_uid, loads_crossed + 1});
+          worklist.push_back({src_uid, depth + 1});
       }
     } else {
       for (Counter src_uid : dep.src_writer_uids)
-        worklist.push_back({src_uid, loads_crossed});
+        worklist.push_back({src_uid, depth + 1});
     }
   }
 }

@@ -271,7 +271,13 @@ DEF_PARAM(branch_load_dep_repl_threshold, BRANCH_LOAD_DEP_REPL_THRESHOLD, float,
 DEF_PARAM(branch_load_dep_repl, BRANCH_LOAD_DEP_REPL, Flag, Flag, TRUE, )
 DEF_PARAM(branch_load_dep_prefetch, BRANCH_LOAD_DEP_PREFETCH, Flag, Flag, FALSE, )
 DEF_PARAM(branch_load_dep_zero_latency, BRANCH_LOAD_DEP_ZERO_LATENCY, Flag, Flag, FALSE, )
+/* On a D-cache miss, complete a feeder load at DCACHE_CYCLES (as if it hit) while
+   still issuing the memory request so the line fills and MSHRs are respected. */
+DEF_PARAM(branch_load_dep_hit_latency, BRANCH_LOAD_DEP_HIT_LATENCY, Flag, Flag, FALSE, )
 DEF_PARAM(branch_load_dep_cross_load, BRANCH_LOAD_DEP_CROSS_LOAD, Flag, Flag, FALSE, )
+/* Maximum hop depth for the backward DFS from a branch to feeder loads.
+   0 = unlimited (traverse the full def-use chain). */
+DEF_PARAM(branch_load_dep_max_depth, BRANCH_LOAD_DEP_MAX_DEPTH, uns, uns, 0, )
 /* Record branch→feeder-load pairs to a CSV for offline analysis / replay. */
 DEF_PARAM(branch_load_dep_trace_record,    BRANCH_LOAD_DEP_TRACE_RECORD,    Flag,  Flag, FALSE, )
 /* Replay a previously recorded CSV: prefetch feeder lines LOOKAHEAD instrs ahead of each branch. */
