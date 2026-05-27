@@ -879,11 +879,10 @@ static inline void dcache_fill_process_cacheline(Mem_Req* req, Dcache_Data* data
     DEBUG(dc->proc_id, "Awakening op_num:%lld %d %d\n", op->op_num, op->engine_info.l1_miss_satisfied, op->in_rdy_list);
     ASSERT(dc->proc_id, !op->in_rdy_list);
 
-    op->done_cycle = cycle_count + 1;
-    op->state = OS_SCHEDULED;
-
     if (op->inst_info->table_info.mem_type != MEM_ST &&
         !(BRANCH_LOAD_DEP_HIT_LATENCY && op->feeds_branch)) {
+      op->done_cycle = cycle_count + 1;
+      op->state = OS_SCHEDULED;
       op->wake_cycle = op->done_cycle;
       wake_up_ops(op, REG_DATA_DEP, model->wake_hook);
     }
