@@ -344,6 +344,7 @@ void uop_generator_get_uop(uns proc_id, Op* op, ctype_pin_inst* inst) {
   op->retire_cycle = MAX_CTR;
   op->replay = FALSE;
   op->exec_count = 0;
+  op->feeds_branch = FALSE;
   op->in_rdy_list = FALSE;
   op->in_node_list = FALSE;
   op->bp_pred_l0.recovery_sch = FALSE;
