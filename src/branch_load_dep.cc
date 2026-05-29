@@ -279,15 +279,15 @@ void bld_process_op(uns8 proc_id, Op* op) {
    * > 0, nodes beyond that depth are skipped. */
   uns max_depth = BRANCH_LOAD_DEP_MAX_DEPTH;
   std::unordered_set<Counter> visited;
-  std::vector<std::pair<Counter, uns>> worklist;  /* (uid, load-boundary depth) */
+  std::deque<std::pair<Counter, uns>> worklist;  /* (uid, load-boundary depth) */
 
   const InstRecord& branch_rec = state.records[op->unique_num];
   for (Counter uid : branch_rec.src_writer_uids)
     worklist.push_back({uid, 0});
 
   while (!worklist.empty()) {
-    auto [uid, depth] = worklist.back();
-    worklist.pop_back();
+    auto [uid, depth] = worklist.front();
+    worklist.pop_front();
 
     if (max_depth > 0 && depth > max_depth)
       continue;
