@@ -53,6 +53,7 @@
 #include "op_pool.h"
 #include "statistics.h"
 #include "thread.h"
+#include "branch_load_dep.h"
 
 /**************************************************************************************/
 /* Macros */
@@ -264,6 +265,8 @@ static inline void stage_process_op(Op* op) {
 
   /* setting wake up lists */
   add_to_wake_up_lists(op, model->wake_hook);
+
+  bld_process_op(map->proc_id, op);
 }
 
 static inline void map_stage_collect_stat(Flag stall, Flag starved) {

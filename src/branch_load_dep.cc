@@ -21,41 +21,27 @@
 
 /***************************************************************************************
  * File         : branch_load_dep.cc
- * Description  : Inline def-use analysis identifying loads whose values transitively
- *                feed branch instructions through ALU chains (not load-to-load).
+ * Description  : Identifies loads whose values directly feed branch instructions.
  *
- * Algorithm:
- *   Maintain per-proc:
- *     reg_map   : logical reg id → unique_num of last writer
- *     records   : unique_num → InstRecord (is_load, va, op_ptr, src_writer_uids)
+ * Algorithm (inline mode):
+ *   Called after map_op(), so src_info[] is fully populated.  For each branch,
+ *   iterate its REG_DATA_DEP sources; any source that is a load is marked
+ *   feeds_branch.
  *
- *   On each decoded op:
- *     1. Build an InstRecord from the op's logical src/dst registers.
- *     2. Update reg_map with this op's dest regs.
- *     3. If the op is a branch, walk backward through records:
- *          - Skip already-visited nodes.
- *          - If a predecessor is a load → mark it (set op->feeds_branch and call
- *            cache_set_feeds_branch for the case where the line is already in cache).
- *          - If a predecessor is an ALU op → continue traversal.
- *          - Loads act as traversal boundaries (no load-to-load chaining).
- *
- *   Record lifetime: a sliding window of BLD_WINDOW_SIZE entries per proc keeps
- *   memory bounded; old records are evicted before they can form stale Op* pointers
- *   because the window comfortably covers any realistic load-to-branch distance.
+ * Replay mode:
+ *   Loads a pre-recorded CSV of (proc_id, feeder_inst_uid, depth) pairs at
+ *   init time and marks ops by inst_uid lookup in bld_process_op().
  ***************************************************************************************/
 
 #include "branch_load_dep.h"
 
-#include <algorithm>
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
-#include <deque>
 #include <fstream>
 #include <sstream>
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 extern "C" {
@@ -67,24 +53,16 @@ extern "C" {
 #include "memory/memory.h"
 #include "model.h"
 #include "op.h"
+#include "op_info.h"
 #include "prefetcher/pref_bld.h"
 #include "statistics.h"
 #include "table_info.h"
 }
 
-/* Maximum number of InstRecords retained per core.  A value of 4096 covers
- * any realistic load-to-branch ALU chain while bounding memory use. */
-static constexpr unsigned BLD_WINDOW_SIZE = 4096;
-
 /* CSV trace: one row per branch→feeder-load pair discovered. */
 static FILE* g_trace_out = nullptr;
 
-/* Build the per-benchmark trace path from CBP_TRACE_R0.
- * CBP_TRACE_R0 is expected to follow the pattern:
- *   .../600.perlbench_s/traces/simp/3.zip
- * Extracts "600.perlbench_s" and "3" and constructs:
- *   <dir>/600.perlbench_s_3.csv
- * Falls back to <dir>/bld_trace.csv if CBP_TRACE_R0 is unset. */
+/* Build the per-benchmark trace path from CBP_TRACE_R0. */
 static void bld_trace_path(char* out, size_t sz) {
   const char* dir   = BRANCH_LOAD_DEP_TRACE_DIR;
   const char* trace = CBP_TRACE_R0;
@@ -94,7 +72,6 @@ static void bld_trace_path(char* out, size_t sz) {
     return;
   }
 
-  /* Extract simpoint id: basename of trace without extension. */
   char tmp[MAX_STR_LENGTH + 1];
   strncpy(tmp, trace, sizeof(tmp) - 1);
   tmp[sizeof(tmp) - 1] = '\0';
@@ -114,11 +91,9 @@ static void bld_trace_path(char* out, size_t sz) {
     simpt[sizeof(simpt) - 1] = '\0';
   }
 
-  /* Chop off the filename to get the directory portion. */
   if (slash)
     *slash = '\0';
 
-  /* Walk up two more levels: simp/ → traces/ → benchmark_dir */
   for (int lvl = 0; lvl < 2; lvl++) {
     char* p = strrchr(tmp, '/');
     if (p)
@@ -131,33 +106,10 @@ static void bld_trace_path(char* out, size_t sz) {
   snprintf(out, sz, "%s/%s_%s.csv", dir, bench, simpt);
 }
 
-/* feeder inst_uid → minimum recorded depth, per proc.  Populated at init from the CSV. */
+/* feeder inst_uid → minimum recorded depth, per proc. */
 static std::vector<std::unordered_map<uns64, uns>> g_replay_maps;
 
-struct InstRecord {
-  bool is_load;
-  Addr va;          /* virtual address (meaningful only when is_load) */
-  uns64 inst_uid;   /* stable per-static-instruction id from the trace frontend */
-  Op*  op_ptr;      /* raw pointer valid while op is in the ROB */
-  std::vector<Counter> src_writer_uids;
-  Counter uid;      /* copy for ordered eviction */
-};
-
-struct BldState {
-  /* reg_id (flattened logical reg) → unique_num of last writer seen */
-  std::unordered_map<uns16, Counter> reg_map;
-
-  /* unique_num → record; bounded to BLD_WINDOW_SIZE entries */
-  std::unordered_map<Counter, InstRecord> records;
-
-  /* UIDs in insertion order for O(1) eviction of the oldest entry */
-  std::deque<Counter> insertion_order;
-};
-
-static std::vector<BldState> g_states;
-
 void bld_init(uns8 num_cores) {
-  g_states.resize(num_cores);
   g_replay_maps.resize(num_cores);
 
   char trace_path[MAX_STR_LENGTH + 1];
@@ -193,26 +145,15 @@ void bld_init(uns8 num_cores) {
         auto& m = g_replay_maps[(uns8)pid];
         auto it = m.find(iuid);
         if (it == m.end() || d < it->second)
-          m[iuid] = d;  /* keep the shallowest depth seen for this inst_uid */
+          m[iuid] = d;
       }
     }
   }
 }
 
-/* Evict the oldest record from records to keep the map within BLD_WINDOW_SIZE.
- * O(1) amortized: insertion_order tracks UIDs in FIFO order. */
-static void evict_oldest(BldState& s) {
-  if (s.insertion_order.empty())
-    return;
-  Counter oldest = s.insertion_order.front();
-  s.insertion_order.pop_front();
-  s.records.erase(oldest);
-}
-
 void bld_process_op(uns8 proc_id, Op* op) {
-  /* Replay: mark feeder loads by PC so the dcache gives them hit latency
-   * (BRANCH_LOAD_DEP_HIT_LATENCY).  Runs independently of BRANCH_LOAD_DEP.
-   * Off-path ops are skipped. */
+  /* Replay: mark feeder loads by inst_uid so dcache gives them hit latency.
+   * Runs independently of BRANCH_LOAD_DEP.  Off-path ops are skipped. */
   if (BRANCH_LOAD_DEP_TRACE_REPLAY && !op->off_path) {
     const auto& m = g_replay_maps[proc_id];
     auto it = m.find(op->inst_uid);
@@ -226,104 +167,38 @@ void bld_process_op(uns8 proc_id, Op* op) {
   if (!BRANCH_LOAD_DEP)
     return;
 
-  /* Skip off-path ops; their records could leave stale pointers after recovery. */
   if (op->off_path)
     return;
 
-  BldState& state = g_states[proc_id];
-
-  bool is_load   = (op->inst_info->table_info.mem_type == MEM_LD);
-  bool is_branch = (op->inst_info->table_info.cf_type  != NOT_CF);
-
-  /* Build InstRecord for this op. */
-  InstRecord rec;
-  rec.uid     = op->unique_num;
-  rec.is_load = is_load;
-  rec.va      = is_load ? op->oracle_info.va : static_cast<Addr>(0);
-  rec.inst_uid = op->inst_uid;
-  rec.op_ptr  = op;
-
-  /* Collect unique_nums of ops that wrote this op's source regs. */
-  uns num_srcs = op->inst_info->table_info.num_src_regs;
-  for (uns i = 0; i < num_srcs; i++) {
-    uns16 reg_id = op->inst_info->srcs[i].id;
-    if (reg_id == OP_REG_ID_INVALID)
-      continue;
-    auto it = state.reg_map.find(reg_id);
-    if (it != state.reg_map.end())
-      rec.src_writer_uids.push_back(it->second);
-  }
-
-  /* Insert into records, evicting the oldest if we've hit the window limit. */
-  if (state.records.size() >= BLD_WINDOW_SIZE)
-    evict_oldest(state);
-  state.records[op->unique_num] = std::move(rec);
-  state.insertion_order.push_back(op->unique_num);
-
-  /* Update reg_map: this op becomes the last writer for each of its dest regs. */
-  uns num_dests = op->inst_info->table_info.num_dest_regs;
-  for (uns i = 0; i < num_dests; i++) {
-    uns16 reg_id = op->inst_info->dests[i].id;
-    if (reg_id == OP_REG_ID_INVALID)
-      continue;
-    state.reg_map[reg_id] = op->unique_num;
-  }
-
-  if (!is_branch)
+  if (op->inst_info->table_info.cf_type == NOT_CF)
     return;
 
-  /* === Branch: traverse backward to find feeding loads ===
-   * Each worklist entry carries the uid and load-boundary depth (0 = direct
-   * feeder through any ALU chain, 1 = feeder of a feeder, etc.).  Depth
-   * increments only when crossing a load boundary.  When BRANCH_LOAD_DEP_MAX_DEPTH
-   * > 0, nodes beyond that depth are skipped. */
-  uns max_depth = BRANCH_LOAD_DEP_MAX_DEPTH;
-  std::unordered_set<Counter> visited;
-  std::deque<std::pair<Counter, uns>> worklist;  /* (uid, load-boundary depth) */
-
-  const InstRecord& branch_rec = state.records[op->unique_num];
-  for (Counter uid : branch_rec.src_writer_uids)
-    worklist.push_back({uid, 0});
-
-  while (!worklist.empty()) {
-    auto [uid, depth] = worklist.front();
-    worklist.pop_front();
-
-    if (max_depth > 0 && depth > max_depth)
+  /* For each direct REG_DATA_DEP source of this branch, mark it if it is a load.
+   * src_info is populated by map_op(), so bld_process_op must be called after map. */
+  for (uns i = 0; i < op->num_srcs; i++) {
+    Src_Info* s = &op->src_info[i];
+    if (s->type != REG_DATA_DEP)
+      continue;
+    Op* src = s->op;
+    if (!src || !src->op_pool_valid || src->unique_num != s->unique_num)
+      continue;
+    if (src->inst_info->table_info.mem_type != MEM_LD)
       continue;
 
-    if (!visited.insert(uid).second)
-      continue;
+    src->feeds_branch = TRUE;
+    Cache* dcache = get_dcache_for_proc(proc_id);
+    if (src->oracle_info.va != 0 && cache_set_feeds_branch(dcache, proc_id, src->oracle_info.va))
+      STAT_EVENT(proc_id, DCACHE_FEEDER_LINES_MARKED);
 
-    auto it = state.records.find(uid);
-    if (it == state.records.end())
-      continue;
+    if (BRANCH_LOAD_DEP_TRACE_RECORD && g_trace_out)
+      fprintf(g_trace_out, "%u,%" PRIu64 ",%u\n",
+              (unsigned)proc_id, (uint64_t)src->inst_uid, 0u);
 
-    InstRecord& dep = it->second;
-
-    if (dep.is_load) {
-      dep.op_ptr->feeds_branch = TRUE;
-      Cache* dcache = get_dcache_for_proc(proc_id);
-      if (dep.va != 0 && cache_set_feeds_branch(dcache, proc_id, dep.va))
-        STAT_EVENT(proc_id, DCACHE_FEEDER_LINES_MARKED);
-
-      if (BRANCH_LOAD_DEP_TRACE_RECORD && g_trace_out) {
-        fprintf(g_trace_out, "%u,%" PRIu64 ",%u\n",
-                (unsigned)proc_id, (uint64_t)dep.inst_uid, (unsigned)depth);
-      }
-
-      if (BRANCH_LOAD_DEP_PREFETCH && dep.va != 0 && model->mem == MODEL_MEM) {
-        Addr line_addr;
-        if (!cache_access(dcache, dep.va, &line_addr, FALSE))
-          new_mem_req(MRT_DPRF, proc_id, line_addr, DCACHE_LINE_SIZE, 0, NULL,
-                      dcache_fill_line, 0, NULL);
-      }
-
-      for (Counter src_uid : dep.src_writer_uids)
-        worklist.push_back({src_uid, depth + 1});
-    } else {
-      for (Counter src_uid : dep.src_writer_uids)
-        worklist.push_back({src_uid, depth});
+    if (BRANCH_LOAD_DEP_PREFETCH && src->oracle_info.va != 0 && model->mem == MODEL_MEM) {
+      Addr line_addr;
+      if (!cache_access(dcache, src->oracle_info.va, &line_addr, FALSE))
+        new_mem_req(MRT_DPRF, proc_id, line_addr, DCACHE_LINE_SIZE, 0, NULL,
+                    dcache_fill_line, 0, NULL);
     }
   }
 }

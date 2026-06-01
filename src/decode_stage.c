@@ -292,7 +292,6 @@ void decode_stage_process_op(Op* op) {
       increment_branch_count(op->inst_info->addr);
   }
 
-  bld_process_op(dec->proc_id, op);
 }
 
 // UNUSED, and not kept up to date with uop cache changes.

@@ -268,7 +268,7 @@ DEF_PARAM(branch_load_dep, BRANCH_LOAD_DEP, Flag, Flag, FALSE, )
      (sim_time - feeder_lru_time) > (sim_time - nonfeeder_lru_time) * threshold
    0.0 = strict protection (feeder never evicted while a non-feeder exists). */
 DEF_PARAM(branch_load_dep_repl_threshold, BRANCH_LOAD_DEP_REPL_THRESHOLD, float, float, 0.0, )
-DEF_PARAM(branch_load_dep_repl, BRANCH_LOAD_DEP_REPL, Flag, Flag, TRUE, )
+DEF_PARAM(branch_load_dep_repl, BRANCH_LOAD_DEP_REPL, Flag, Flag, FALSE, )
 DEF_PARAM(branch_load_dep_prefetch, BRANCH_LOAD_DEP_PREFETCH, Flag, Flag, FALSE, )
 DEF_PARAM(branch_load_dep_zero_latency, BRANCH_LOAD_DEP_ZERO_LATENCY, Flag, Flag, FALSE, )
 /* On a D-cache miss, complete a feeder load at DCACHE_CYCLES (as if it hit) while
