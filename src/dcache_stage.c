@@ -660,7 +660,7 @@ static inline void dcache_cacheline_miss(Op* op, Addr line_addr) {
         STAT_EVENT(op->proc_id, DCACHE_MISS_LD_OFFPATH);
         wrongpath_dcmiss = FALSE;
       }
-      if (BRANCH_LOAD_DEP_HIT_LATENCY && op->feeds_branch) {
+      if ((BRANCH_LOAD_DEP_HIT_LATENCY && op->feeds_branch) || PERFECT_DCACHE_HIT_LATENCY) {
         op->done_cycle = cycle_count + DCACHE_CYCLES + op->inst_info->extra_ld_latency;
         op->state = OS_SCHEDULED;
         op->wake_cycle = op->done_cycle;
@@ -880,7 +880,8 @@ static inline void dcache_fill_process_cacheline(Mem_Req* req, Dcache_Data* data
     ASSERT(dc->proc_id, !op->in_rdy_list);
 
     if (op->inst_info->table_info.mem_type != MEM_ST &&
-        !(BRANCH_LOAD_DEP_HIT_LATENCY && op->feeds_branch)) {
+        !(BRANCH_LOAD_DEP_HIT_LATENCY && op->feeds_branch) &&
+        !PERFECT_DCACHE_HIT_LATENCY) {
       op->done_cycle = cycle_count + 1;
       op->state = OS_SCHEDULED;
       op->wake_cycle = op->done_cycle;
