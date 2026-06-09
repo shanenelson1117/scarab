@@ -40,8 +40,10 @@
 #include <cstdlib>
 #include <fstream>
 #include <sstream>
+#include <deque>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 extern "C" {
@@ -173,32 +175,61 @@ void bld_process_op(uns8 proc_id, Op* op) {
   if (op->inst_info->table_info.cf_type == NOT_CF)
     return;
 
-  /* For each direct REG_DATA_DEP source of this branch, mark it if it is a load.
+    
+  /* BFS backward through REG_DATA_DEP src_info edges.  Mark any load found;
+   * traverse through ALU ops to find loads beyond them.  Stop once
+   * BRANCH_LOAD_DEP_MAX_DEPTH loads have been marked (0 = unlimited).
    * src_info is populated by map_op(), so bld_process_op must be called after map. */
+  uns max_loads = BRANCH_LOAD_DEP_MAX_DEPTH;
+  uns loads_marked = 0;
+  std::unordered_set<Counter> visited;
+  std::deque<Op*> worklist;
+
   for (uns i = 0; i < op->num_srcs; i++) {
     Src_Info* s = &op->src_info[i];
-    if (s->type != REG_DATA_DEP)
-      continue;
+    if (s->type != REG_DATA_DEP) continue;
     Op* src = s->op;
-    if (!src || !src->op_pool_valid || src->unique_num != s->unique_num)
+    if (!src || !src->op_pool_valid || src->unique_num != s->unique_num) continue;
+    worklist.push_back(src);
+  }
+
+  while (!worklist.empty()) {
+    if (max_loads > 0 && loads_marked >= max_loads)
+      break;
+
+    Op* cur = worklist.front();
+    worklist.pop_front();
+
+    if (!visited.insert(cur->unique_num).second)
       continue;
-    if (src->inst_info->table_info.mem_type != MEM_LD)
-      continue;
 
-    src->feeds_branch = TRUE;
-    Cache* dcache = get_dcache_for_proc(proc_id);
-    if (src->oracle_info.va != 0 && cache_set_feeds_branch(dcache, proc_id, src->oracle_info.va))
-      STAT_EVENT(proc_id, DCACHE_FEEDER_LINES_MARKED);
+    if (cur->inst_info->table_info.mem_type == MEM_LD) {
+      cur->feeds_branch = TRUE;
+      loads_marked++;
 
-    if (BRANCH_LOAD_DEP_TRACE_RECORD && g_trace_out)
-      fprintf(g_trace_out, "%u,%" PRIu64 ",%u\n",
-              (unsigned)proc_id, (uint64_t)src->inst_uid, 0u);
+      Cache* dcache = get_dcache_for_proc(proc_id);
+      if (cur->oracle_info.va != 0 && cache_set_feeds_branch(dcache, proc_id, cur->oracle_info.va))
+        STAT_EVENT(proc_id, DCACHE_FEEDER_LINES_MARKED);
 
-    if (BRANCH_LOAD_DEP_PREFETCH && src->oracle_info.va != 0 && model->mem == MODEL_MEM) {
-      Addr line_addr;
-      if (!cache_access(dcache, src->oracle_info.va, &line_addr, FALSE))
-        new_mem_req(MRT_DPRF, proc_id, line_addr, DCACHE_LINE_SIZE, 0, NULL,
-                    dcache_fill_line, 0, NULL);
+      if (BRANCH_LOAD_DEP_TRACE_RECORD && g_trace_out)
+        fprintf(g_trace_out, "%u,%" PRIu64 ",%u\n",
+                (unsigned)proc_id, (uint64_t)cur->inst_uid, loads_marked - 1);
+
+      if (BRANCH_LOAD_DEP_PREFETCH && cur->oracle_info.va != 0 && model->mem == MODEL_MEM) {
+        Addr line_addr;
+        if (!cache_access(dcache, cur->oracle_info.va, &line_addr, FALSE))
+          new_mem_req(MRT_DPRF, proc_id, line_addr, DCACHE_LINE_SIZE, 0, NULL,
+                      dcache_fill_line, 0, NULL);
+      }
+    }
+
+    /* Continue BFS through this op's sources regardless of whether it was a load. */
+    for (uns i = 0; i < cur->num_srcs; i++) {
+      Src_Info* s = &cur->src_info[i];
+      if (s->type != REG_DATA_DEP) continue;
+      Op* src = s->op;
+      if (!src || !src->op_pool_valid || src->unique_num != s->unique_num) continue;
+      worklist.push_back(src);
     }
   }
 }
