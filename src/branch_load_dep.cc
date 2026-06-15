@@ -21,16 +21,16 @@
 
 /***************************************************************************************
  * File         : branch_load_dep.cc
- * Description  : Identifies loads whose values directly feed branch instructions.
+ * Description  : Identifies loads whose values feed branch instructions.
  *
  * Algorithm (inline mode):
  *   Called after map_op(), so src_info[] is fully populated.  For each branch,
- *   iterate its REG_DATA_DEP sources; any source that is a load is marked
- *   feeds_branch.
+ *   BFS backward through REG_DATA_DEP edges and mark feeder loads.
  *
  * Replay mode:
- *   Loads a pre-recorded CSV of (proc_id, feeder_inst_uid, depth) pairs at
- *   init time and marks ops by inst_uid lookup in bld_process_op().
+ *   Loads a CSV of (proc_id, branch_inst_uid, feeder_inst_uid, depth) tuples.
+ *   At load map time, mark feeds_branch if ANY pair for that feeder has
+ *   depth <= BRANCH_LOAD_DEP_MAX_DEPTH (0 = unlimited).
  ***************************************************************************************/
 
 #include "branch_load_dep.h"
@@ -38,10 +38,14 @@
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <sstream>
 #include <deque>
+#include <errno.h>
 #include <string>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -61,8 +65,22 @@ extern "C" {
 #include "table_info.h"
 }
 
+struct BldReplayPair {
+  uns64 branch_inst_uid;
+  uns64 feeder_inst_uid;
+  uns   depth;
+};
+
 /* CSV trace: one row per branch→feeder-load pair discovered. */
 static FILE* g_trace_out = nullptr;
+static uns64 g_trace_rows_written = 0;
+static char  g_trace_path[MAX_STR_LENGTH + 1];
+
+/* All recorded pairs, per proc (retained for debugging / future branch-aware replay). */
+static std::vector<std::vector<BldReplayPair>> g_replay_pairs;
+
+/* feeder_inst_uid → depths from every recorded pair (no min-depth collapse). */
+static std::vector<std::unordered_map<uns64, std::vector<uns>>> g_replay_feeder_depths;
 
 /* Build the per-benchmark trace path from CBP_TRACE_R0. */
 static void bld_trace_path(char* out, size_t sz) {
@@ -108,48 +126,155 @@ static void bld_trace_path(char* out, size_t sz) {
   snprintf(out, sz, "%s/%s_%s.csv", dir, bench, simpt);
 }
 
-/* feeder inst_uid → minimum recorded depth, per proc. */
-static std::vector<std::unordered_map<uns64, uns>> g_replay_maps;
+/* Create parent directories for path (mkdir -p semantics). */
+static Flag bld_mkdir_p(const char* path) {
+  char buf[MAX_STR_LENGTH + 1];
+  strncpy(buf, path, sizeof(buf) - 1);
+  buf[sizeof(buf) - 1] = '\0';
 
-void bld_init(uns8 num_cores) {
-  g_replay_maps.resize(num_cores);
+  for (char* p = buf + 1; *p; p++) {
+    if (*p != '/')
+      continue;
+    *p = '\0';
+    if (mkdir(buf, 0755) != 0 && errno != EEXIST)
+      return FALSE;
+    *p = '/';
+  }
+  if (mkdir(buf, 0755) != 0 && errno != EEXIST)
+    return FALSE;
+  return TRUE;
+}
 
-  char trace_path[MAX_STR_LENGTH + 1];
-  bld_trace_path(trace_path, sizeof(trace_path));
+/* Open the record CSV on first use (after params and CBP_TRACE_R0 are final). */
+static Flag bld_trace_open_for_record(void) {
+  if (g_trace_out)
+    return TRUE;
+  if (!BRANCH_LOAD_DEP_TRACE_RECORD)
+    return FALSE;
 
-  if (BRANCH_LOAD_DEP_TRACE_RECORD) {
-    g_trace_out = fopen(trace_path, "w");
-    if (!g_trace_out) {
-      fprintf(stderr, "[BLD] Cannot open trace file for writing: %s\n",
-              trace_path);
+  bld_trace_path(g_trace_path, sizeof(g_trace_path));
+
+  char dir[MAX_STR_LENGTH + 1];
+  strncpy(dir, g_trace_path, sizeof(dir) - 1);
+  dir[sizeof(dir) - 1] = '\0';
+  char* slash = strrchr(dir, '/');
+  if (slash) {
+    *slash = '\0';
+    if (dir[0] && !bld_mkdir_p(dir)) {
+      fprintf(stderr, "[BLD] Cannot create trace directory %s: %s\n", dir, strerror(errno));
       exit(1);
     }
-    fprintf(g_trace_out, "proc_id,feeder_inst_uid,depth\n");
   }
 
+  g_trace_out = fopen(g_trace_path, "w");
+  if (!g_trace_out) {
+    fprintf(stderr, "[BLD] Cannot open trace file for writing: %s (%s)\n",
+            g_trace_path, strerror(errno));
+    exit(1);
+  }
+  fprintf(g_trace_out, "proc_id,branch_inst_uid,feeder_inst_uid,depth\n");
+  fprintf(stderr, "[BLD] Recording branch→feeder trace to %s\n", g_trace_path);
+  return TRUE;
+}
+
+static void bld_trace_record_pair(uns8 proc_id, uns64 branch_inst_uid, uns64 feeder_inst_uid, uns depth) {
+  if (!BRANCH_LOAD_DEP_TRACE_RECORD)
+    return;
+  if (!bld_trace_open_for_record())
+    return;
+  fprintf(g_trace_out, "%u,%" PRIu64 ",%" PRIu64 ",%u\n",
+          (unsigned)proc_id, (uint64_t)branch_inst_uid,
+          (uint64_t)feeder_inst_uid, (unsigned)depth);
+  g_trace_rows_written++;
+}
+
+static void bld_replay_add_pair(uns8 proc_id, uns64 branch_inst_uid, uns64 feeder_inst_uid, uns depth) {
+  g_replay_pairs[proc_id].push_back({branch_inst_uid, feeder_inst_uid, depth});
+  g_replay_feeder_depths[proc_id][feeder_inst_uid].push_back(depth);
+}
+
+/* Return TRUE if this feeder load should receive replay hit-latency treatment. */
+static Flag bld_replay_feeder_included(uns8 proc_id, uns64 feeder_inst_uid, uns max_depth) {
+  const auto& depths_by_feeder = g_replay_feeder_depths[proc_id];
+  auto it = depths_by_feeder.find(feeder_inst_uid);
+  if (it == depths_by_feeder.end())
+    return FALSE;
+
+  for (uns depth : it->second) {
+    if (max_depth == 0 || depth <= max_depth)
+      return TRUE;
+  }
+  return FALSE;
+}
+
+static void bld_load_replay_csv(const char* trace_path, uns8 num_cores) {
+  std::ifstream f(trace_path);
+  if (!f.is_open()) {
+    fprintf(stderr, "[BLD] Cannot open trace file for reading: %s\n", trace_path);
+    exit(1);
+  }
+
+  std::string header;
+  if (!std::getline(f, header)) {
+    fprintf(stderr, "[BLD] Empty trace file: %s\n", trace_path);
+    exit(1);
+  }
+
+  const Flag legacy_format = (header.find("branch_inst_uid") == std::string::npos);
+
+  std::string row;
+  while (std::getline(f, row)) {
+    if (row.empty())
+      continue;
+
+    std::istringstream ss(row);
+    std::string tok;
+    int pid;
+    uns64 branch_inst_uid = 0;
+    uns64 feeder_inst_uid;
+    uns depth;
+
+    std::getline(ss, tok, ',');
+    pid = std::stoi(tok);
+
+    if (legacy_format) {
+      /* proc_id, feeder_inst_uid, depth */
+      std::getline(ss, tok, ',');
+      feeder_inst_uid = (uns64)std::stoull(tok);
+      std::getline(ss, tok, ',');
+      depth = (uns)std::stoul(tok);
+    } else {
+      /* proc_id, branch_inst_uid, feeder_inst_uid, depth */
+      std::getline(ss, tok, ',');
+      branch_inst_uid = (uns64)std::stoull(tok);
+      std::getline(ss, tok, ',');
+      feeder_inst_uid = (uns64)std::stoull(tok);
+      std::getline(ss, tok, ',');
+      depth = (uns)std::stoul(tok);
+    }
+
+    if (pid >= 0 && (uns8)pid < num_cores)
+      bld_replay_add_pair((uns8)pid, branch_inst_uid, feeder_inst_uid, depth);
+  }
+
+  if (legacy_format) {
+    fprintf(stderr,
+            "[BLD] Warning: legacy 3-column trace (no branch_inst_uid) in %s; "
+            "re-record for per-branch depth semantics.\n",
+            trace_path);
+  }
+}
+
+void bld_init(uns8 num_cores) {
+  g_replay_pairs.resize(num_cores);
+  g_replay_feeder_depths.resize(num_cores);
+  g_trace_path[0] = '\0';
+  g_trace_rows_written = 0;
+
   if (BRANCH_LOAD_DEP_TRACE_REPLAY) {
-    std::ifstream f(trace_path);
-    if (!f.is_open()) {
-      fprintf(stderr, "[BLD] Cannot open trace file for reading: %s\n",
-              trace_path);
-      exit(1);
-    }
-    std::string row;
-    std::getline(f, row); /* skip header */
-    while (std::getline(f, row)) {
-      std::istringstream ss(row);
-      std::string tok;
-      int pid;
-      std::getline(ss, tok, ','); pid = std::stoi(tok);
-      std::getline(ss, tok, ','); uns64 iuid = (uns64)std::stoull(tok);
-      std::getline(ss, tok, ','); uns   d    = (uns)std::stoul(tok);
-      if (pid >= 0 && (uns8)pid < num_cores) {
-        auto& m = g_replay_maps[(uns8)pid];
-        auto it = m.find(iuid);
-        if (it == m.end() || d < it->second)
-          m[iuid] = d;
-      }
-    }
+    char trace_path[MAX_STR_LENGTH + 1];
+    bld_trace_path(trace_path, sizeof(trace_path));
+    bld_load_replay_csv(trace_path, num_cores);
   }
 }
 
@@ -157,13 +282,9 @@ void bld_process_op(uns8 proc_id, Op* op) {
   /* Replay: mark feeder loads by inst_uid so dcache gives them hit latency.
    * Runs independently of BRANCH_LOAD_DEP.  Off-path ops are skipped. */
   if (BRANCH_LOAD_DEP_TRACE_REPLAY && !op->off_path) {
-    const auto& m = g_replay_maps[proc_id];
-    auto it = m.find(op->inst_uid);
-    if (it != m.end()) {
-      uns replay_max_depth = BRANCH_LOAD_DEP_MAX_DEPTH;
-      if (replay_max_depth == 0 || it->second <= replay_max_depth)
-        op->feeds_branch = TRUE;
-    }
+    uns replay_max_depth = BRANCH_LOAD_DEP_MAX_DEPTH;
+    if (bld_replay_feeder_included(proc_id, op->inst_uid, replay_max_depth))
+      op->feeds_branch = TRUE;
   }
 
   if (!BRANCH_LOAD_DEP)
@@ -175,7 +296,6 @@ void bld_process_op(uns8 proc_id, Op* op) {
   if (op->inst_info->table_info.cf_type == NOT_CF)
     return;
 
-    
   /* BFS backward through REG_DATA_DEP src_info edges.  Mark any load found;
    * traverse through ALU ops to find loads beyond them.  Stop once
    * BRANCH_LOAD_DEP_MAX_DEPTH loads have been marked (0 = unlimited).
@@ -204,6 +324,7 @@ void bld_process_op(uns8 proc_id, Op* op) {
       continue;
 
     if (cur->inst_info->table_info.mem_type == MEM_LD) {
+      uns depth = loads_marked;
       cur->feeds_branch = TRUE;
       loads_marked++;
 
@@ -211,9 +332,7 @@ void bld_process_op(uns8 proc_id, Op* op) {
       if (cur->oracle_info.va != 0 && cache_set_feeds_branch(dcache, proc_id, cur->oracle_info.va))
         STAT_EVENT(proc_id, DCACHE_FEEDER_LINES_MARKED);
 
-      if (BRANCH_LOAD_DEP_TRACE_RECORD && g_trace_out)
-        fprintf(g_trace_out, "%u,%" PRIu64 ",%u\n",
-                (unsigned)proc_id, (uint64_t)cur->inst_uid, loads_marked - 1);
+      bld_trace_record_pair(proc_id, op->inst_uid, cur->inst_uid, depth);
 
       if (BRANCH_LOAD_DEP_PREFETCH && cur->oracle_info.va != 0 && model->mem == MODEL_MEM) {
         Addr line_addr;
@@ -239,5 +358,9 @@ void bld_finish(void) {
     fflush(g_trace_out);
     fclose(g_trace_out);
     g_trace_out = nullptr;
+    fprintf(stderr, "[BLD] Wrote %" PRIu64 " trace rows to %s\n",
+            (uint64_t)g_trace_rows_written, g_trace_path);
+  } else if (BRANCH_LOAD_DEP_TRACE_RECORD) {
+    fprintf(stderr, "[BLD] Warning: trace recording enabled but no rows were written\n");
   }
 }

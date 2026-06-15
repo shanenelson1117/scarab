@@ -21,9 +21,9 @@
 
 /***************************************************************************************
  * File         : branch_load_dep.h
- * Description  : Inline def-use analysis: marks loads whose values transitively
- *                feed branch instructions (through ALU chains, not load-to-load),
- *                and protects their L1D cache lines from premature eviction.
+ * Description  : Marks loads whose values feed branch instructions (through ALU
+ *                chains).  Records (branch_inst_uid, feeder_inst_uid, depth) pairs
+ *                for trace replay with oracle L1 hit latency on feeder loads.
  ***************************************************************************************/
 
 #ifndef __BRANCH_LOAD_DEP_H__

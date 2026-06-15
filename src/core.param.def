@@ -280,8 +280,9 @@ DEF_PARAM(perfect_dcache_hit_latency, PERFECT_DCACHE_HIT_LATENCY, Flag, Flag, FA
    0 = unlimited (traverse the full def-use chain). */
 DEF_PARAM(branch_load_dep_max_depth, BRANCH_LOAD_DEP_MAX_DEPTH, uns, uns, 0, )
 /* Record branch→feeder-load pairs to a CSV for offline analysis / replay. */
+/* Record branch→feeder-load pairs to CSV (proc_id,branch_inst_uid,feeder_inst_uid,depth). */
 DEF_PARAM(branch_load_dep_trace_record,    BRANCH_LOAD_DEP_TRACE_RECORD,    Flag,  Flag, FALSE, )
-/* Replay a previously recorded CSV: prefetch feeder lines LOOKAHEAD instrs ahead of each branch. */
+/* Replay a recorded CSV: mark feeder loads with depth <= branch_load_dep_max_depth. */
 DEF_PARAM(branch_load_dep_trace_replay,    BRANCH_LOAD_DEP_TRACE_REPLAY,    Flag,  Flag, FALSE, )
 /* Directory where per-benchmark trace CSVs are written/read.
    Filename is derived automatically from CBP_TRACE_R0 as <bench>_<simpoint>.csv.
