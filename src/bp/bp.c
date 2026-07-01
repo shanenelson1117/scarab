@@ -751,10 +751,23 @@ Addr bp_predict_op(Bp_Data* bp_data, Op* op, uns bp_id, uns br_num, Addr fetch_a
   }
 
   STAT_EVENT(op->proc_id, BP_L0_PREDICTIONS + pred_level);
-  if (bp_pred_info->mispred)
-    STAT_EVENT(op->proc_id, BP_L0_MISPRED + pred_level);
-  if (bp_pred_info->misfetch)
-    STAT_EVENT(op->proc_id, BP_L0_MISFETCH + pred_level);
+  if (!op->off_path) {
+    if (bp_pred_info->mispred)
+      STAT_EVENT(op->proc_id, BP_L0_MISPRED + pred_level);
+    if (bp_pred_info->misfetch)
+      STAT_EVENT(op->proc_id, BP_L0_MISFETCH + pred_level);
+    if ((bp_pred_info->mispred || bp_pred_info->misfetch) && pred_level == BP_PRED_MAIN) {
+      Flag dir_wrong   = bp_pred_info->pred_orig != op->oracle_info.dir;
+      Flag target_ok   = (op->oracle_info.dir == NOT_TAKEN) ||
+                         (op->btb_pred_info->pred_target == op->oracle_info.npc);
+      if (dir_wrong && !op->btb_pred_info->btb_miss && target_ok)
+        STAT_EVENT(op->proc_id, BP_MAIN_WRONG_DIR_ONLY);
+      else if (!dir_wrong)
+        STAT_EVENT(op->proc_id, BP_MAIN_WRONG_TARGET_ONLY);
+      else
+        STAT_EVENT(op->proc_id, BP_MAIN_WRONG_BOTH);
+    }
+  }
 
   // The case where BTB-miss not-taken branch pollute global hist
   // mispred || misfetch will trigger a re-steer but no chance to fix the global hist
