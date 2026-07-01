@@ -244,6 +244,8 @@ void update_map_stage(Stage_Data* src_sd) {
     ASSERT(map->proc_id, op != NULL);
     stage_process_op(op);
   }
+
+  bld_map_batch_branches(map->proc_id, map->last_sd->ops, (uns)map->last_sd->op_count);
 }
 
 /**************************************************************************************/

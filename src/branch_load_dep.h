@@ -21,9 +21,8 @@
 
 /***************************************************************************************
  * File         : branch_load_dep.h
- * Description  : Marks loads whose values feed branch instructions (through ALU
- *                chains).  Records (branch_inst_uid, feeder_inst_uid, depth) pairs
- *                for trace replay with oracle L1 hit latency on feeder loads.
+ * Description  : Marks loads whose values feed branch instructions (through
+ *                register and memory dependence chains).
  ***************************************************************************************/
 
 #ifndef __BRANCH_LOAD_DEP_H__
@@ -31,18 +30,24 @@
 
 #include "globals/global_types.h"
 
+struct Op_struct;
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-/* Called once at simulator init with the number of cores. */
 void bld_init(uns8 num_cores);
 
-/* Called for every op that exits the decode stage. */
-void bld_process_op(uns8 proc_id, Op* op);
+/* Per-op hook at map time: replay marking and InstRecord insertion. */
+void bld_process_op(uns8 proc_id, struct Op_struct* op);
 
-/* Called at simulation end to flush and close any open trace file. */
+/* After all ops in a map batch are recorded, walk branches in that batch. */
+void bld_map_batch_branches(uns8 proc_id, struct Op_struct** ops, uns op_count);
+
 void bld_finish(void);
+
+/* Classify operand-chain critical stall for a mispredicted branch at resolve time. */
+void bld_mispred_chain_classify(uns8 proc_id, struct Op_struct* branch_op);
 
 #ifdef __cplusplus
 }

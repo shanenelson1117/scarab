@@ -41,6 +41,7 @@
 #include "debug/debug_print.h"
 
 #include "core.param.h"
+#include "br_exec_wait.h"
 #include "memory/memory.param.h"
 #include "prefetcher//stream.param.h"
 #include "prefetcher/pref.param.h"
@@ -638,6 +639,8 @@ static inline void dcache_cacheline_miss(Op* op, Addr line_addr) {
         cmp_model.node_stage[dc->proc_id].mem_blocked = TRUE;
         mem->uncores[dc->proc_id].mem_block_start = freq_cycle_count(FREQ_DOMAIN_L1);
         STAT_EVENT(op->proc_id, DCACHE_MISS_WAITMEM);
+        if (op->feeds_branch)
+          STAT_EVENT(op->proc_id, BLD_FEEDER_MISS_WAITMEM);
         break;
       }
 
@@ -655,12 +658,17 @@ static inline void dcache_cacheline_miss(Op* op, Addr line_addr) {
         STAT_EVENT(op->proc_id, DCACHE_MISS_LD_ONPATH);
         op->oracle_info.dcmiss = TRUE;
         STAT_EVENT(op->proc_id, DCACHE_MISS_LD);
+        if (BRANCH_LOAD_DEP_ATTRIBUTE_RECORD)
+          br_note_load_miss(line_addr);
       } else {
         STAT_EVENT(op->proc_id, DCACHE_MISS_OFFPATH);
         STAT_EVENT(op->proc_id, DCACHE_MISS_LD_OFFPATH);
         wrongpath_dcmiss = FALSE;
       }
-      if ((BRANCH_LOAD_DEP_HIT_LATENCY && op->feeds_branch) || PERFECT_DCACHE_HIT_LATENCY) {
+      if ((BRANCH_LOAD_DEP_HIT_LATENCY && op->feeds_branch) || PERFECT_DCACHE_HIT_LATENCY ||
+          (BRANCH_LOAD_DEP_ADDR_REPLAY && br_addr_replay_hit(line_addr))) {
+        if (BRANCH_LOAD_DEP_HIT_LATENCY && op->feeds_branch)
+          STAT_EVENT(op->proc_id, BLD_FEEDER_HIT_LATENCY);
         op->done_cycle = cycle_count + DCACHE_CYCLES + op->inst_info->extra_ld_latency;
         op->state = OS_SCHEDULED;
         op->wake_cycle = op->done_cycle;
@@ -881,7 +889,8 @@ static inline void dcache_fill_process_cacheline(Mem_Req* req, Dcache_Data* data
 
     if (op->inst_info->table_info.mem_type != MEM_ST &&
         !(BRANCH_LOAD_DEP_HIT_LATENCY && op->feeds_branch) &&
-        !PERFECT_DCACHE_HIT_LATENCY) {
+        !PERFECT_DCACHE_HIT_LATENCY &&
+        !(BRANCH_LOAD_DEP_ADDR_REPLAY && br_addr_replay_hit(req->addr))) {
       op->done_cycle = cycle_count + 1;
       op->state = OS_SCHEDULED;
       op->wake_cycle = op->done_cycle;

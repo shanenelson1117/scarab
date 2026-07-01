@@ -221,6 +221,9 @@ void node_issue_queue_check_mem() {
   }
   INC_STAT_EVENT(node->proc_id, CORE_MEM_BLOCKED, node->mem_blocked);
   node->mem_block_length += node->mem_blocked;
+
+  if (mem_req_buffer_completely_full(node->proc_id))
+    STAT_EVENT(node->proc_id, MEM_REQ_BUFFER_FULL_CYCLES);
 }
 
 /*

@@ -2948,6 +2948,17 @@ Flag mem_can_allocate_req_buffer(uns proc_id, Mem_Req_Type type, Flag for_l1_wri
 }
 
 /**************************************************************************************/
+/* mem_req_buffer_completely_full: */
+
+Flag mem_req_buffer_completely_full(uns proc_id) {
+  if (PRIVATE_MSHR_ON) {
+    ASSERT(proc_id, proc_id < NUM_CORES);
+    return mem->num_req_buffers_per_core[proc_id] >= MEM_REQ_BUFFER_ENTRIES;
+  }
+  return mem->req_buffer_free_list.count == 0;
+}
+
+/**************************************************************************************/
 /* mem_allocate_req_buffer: */
 /* If queue is specified, only allocates if its entry_count < size */
 

@@ -292,6 +292,22 @@ DEF_PARAM(branch_load_dep_trace_lookahead, BRANCH_LOAD_DEP_TRACE_LOOKAHEAD, uns,
 /* Max allowed distance (in instructions) between feeder load and branch for replay to fire.
    Filters out deep ALU chains where the load is too far upstream. 0 = no limit. */
 DEF_PARAM(branch_load_dep_trace_max_dist,  BRANCH_LOAD_DEP_TRACE_MAX_DIST,  uns,   uns,    0,   )
+/* Log up to N mispredict operand-chain exemplars to bld_debug.csv in the simpoint dir. */
+DEF_PARAM(bld_debug_mispred, BLD_DEBUG_MISPRED, uns, uns, 20, )
+/* Profile value-slice span/hop from conditional branches (map-time, unbounded records).
+   Emits BLD_PROFILE_* stats; does not record CSV or mark feeders unless also enabled. */
+DEF_PARAM(branch_load_dep_profile, BRANCH_LOAD_DEP_PROFILE, Flag, Flag, FALSE, )
+/* Per-PC attribution of mispredicted-branch operand-wait cycles to the critical
+   load: category A = deepest outstanding miss in the branch's dataflow cone;
+   category B = oldest outstanding load miss clogging the window (ROB head) when
+   the cone itself has no miss. Writes branch_delay_loads.csv to the simpoint dir. */
+DEF_PARAM(branch_load_dep_attribute_record, BRANCH_LOAD_DEP_ATTRIBUTE_RECORD, Flag, Flag, FALSE, )
+/* Address-based replay: force an L1 hit on any load whose data cacheline is in
+   the recorded branch-delay set (from branch_load_dep_attribute_record), taking
+   the smallest set of lines covering branch_load_dep_addr_replay_coverage of the
+   recorded stall cycles. Models perfectly prefetching that data. */
+DEF_PARAM(branch_load_dep_addr_replay,          BRANCH_LOAD_DEP_ADDR_REPLAY,          Flag,  Flag,  FALSE, )
+DEF_PARAM(branch_load_dep_addr_replay_coverage, BRANCH_LOAD_DEP_ADDR_REPLAY_COVERAGE, float, float, 0.9,   )
 DEF_PARAM(dcache_hit_one_cycle, DCACHE_HIT_ONE_CYCLE, Flag, Flag, FALSE, )
 DEF_PARAM(cbp_trace_r0, CBP_TRACE_R0, char*, string, NULL, )
 DEF_PARAM(cbp_trace_r1, CBP_TRACE_R1, char*, string, NULL, )

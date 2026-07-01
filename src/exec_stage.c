@@ -49,6 +49,8 @@
 #include "bp/bp.h"
 #include "dvfs/perf_pred.h"
 
+#include "br_exec_wait.h"
+#include "branch_load_dep.h"
 #include "cmp_model.h"
 #include "exec_ports.h"
 #include "map.h"
@@ -369,6 +371,8 @@ void update_exec_stage(Stage_Data* src_sd) {
 
   topdown_exec_update(exec->proc_id, fu_busy_num);
   memview_fus_busy(exec->proc_id, exec->fus_busy);
+
+  br_exec_wait_cycle(exec->proc_id, cycle_count);
 }
 
 /**************************************************************************************/
@@ -557,31 +561,19 @@ static inline void exec_stage_bp_resolve(Op* op) {
     bp_resolve_op(g_bp_data, op);
   }
 
-  // Track cycle
+  // Track resolve events (cycle savings are counted per-cycle in br_exec_wait_cycle).
     if(!op->off_path && op->bp_pred_info->recover_at_exec &&
     (op->bp_pred_info->mispred || op->bp_pred_info->misfetch)) {
-      Counter real_rdy_cycle = MAX2(op->rdy_cycle, op->issue_cycle);
-      Counter resolve_cycles = op->exec_cycle - op->issue_cycle;
-      Counter operand_wait   = real_rdy_cycle  - op->issue_cycle;
-
       STAT_EVENT(op->proc_id, BR_EXEC_RESOLVE_COUNT);
-      INC_STAT_EVENT(op->proc_id, BR_EXEC_RESOLVE_TOTAL, resolve_cycles);
-      INC_STAT_EVENT(op->proc_id, BR_EXEC_OPERAND_WAIT,  operand_wait);
 
       if(op->bp_pred_info->mispred) {
         STAT_EVENT(op->proc_id, BR_EXEC_RESOLVE_COUNT_MISPRED);
-        INC_STAT_EVENT(op->proc_id, BR_EXEC_RESOLVE_TOTAL_MISPRED, resolve_cycles);
-        INC_STAT_EVENT(op->proc_id, BR_EXEC_OPERAND_WAIT_MISPRED,  operand_wait);
       } else {
         STAT_EVENT(op->proc_id, BR_EXEC_RESOLVE_COUNT_MISFETCH);
-        INC_STAT_EVENT(op->proc_id, BR_EXEC_RESOLVE_TOTAL_MISFETCH, resolve_cycles);
-        INC_STAT_EVENT(op->proc_id, BR_EXEC_OPERAND_WAIT_MISFETCH,  operand_wait);
       }
 
       if(op->bp_pred_info->mispred && op->bp_pred_info->misfetch) {
         STAT_EVENT(op->proc_id, BR_EXEC_RESOLVE_COUNT_BOTH);
-        INC_STAT_EVENT(op->proc_id, BR_EXEC_RESOLVE_TOTAL_BOTH, resolve_cycles);
-        INC_STAT_EVENT(op->proc_id, BR_EXEC_OPERAND_WAIT_BOTH,  operand_wait);
       }
     }
 

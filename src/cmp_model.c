@@ -55,6 +55,7 @@
 #include "prefetcher/pref_common.h"
 
 #include "branch_load_dep.h"
+#include "br_exec_wait.h"
 #include "decoupled_frontend.h"
 #include "freq.h"
 #include "ft.h"
@@ -305,6 +306,7 @@ void cmp_debug() {
 
 void cmp_done() {
   bld_finish();
+  br_exec_wait_finish();
   if (PREF_FRAMEWORK_ON)
     pref_done();
   if (DVFS_ON)
