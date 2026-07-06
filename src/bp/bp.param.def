@@ -113,7 +113,7 @@ DEF_PARAM(  tc_assoc                  , TC_ASSOC                  , uns     , un
 
 /* misprediction filter: after warmup_cycles, branches whose saturating counter
    reaches threshold are excluded from updating the BP and IBTB */
-DEF_PARAM(  bp_mispredict_filter_warmup    , BP_MISPREDICT_FILTER_WARMUP    , Counter , Counter , 0    , )
+DEF_PARAM(  bp_mispredict_filter_warmup    , BP_MISPREDICT_FILTER_WARMUP    , uns64   , uns64   , 0    , )
 DEF_PARAM(  bp_mispredict_filter_entries   , BP_MISPREDICT_FILTER_ENTRIES   , uns     , uns     , 4096 , )
 DEF_PARAM(  bp_mispredict_filter_threshold , BP_MISPREDICT_FILTER_THRESHOLD , uns     , uns     , 7    , )
 
