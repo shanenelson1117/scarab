@@ -163,6 +163,8 @@ typedef struct Bp_Data_struct {
   uns8 target_bit_length;
 
   Flag on_path_pred;
+
+  uns8* mispredict_filter;  /* saturating counters indexed by PC hash; branches at threshold are excluded from BP/IBTB updates */
 } Bp_Data;
 
 /**************************************************************************************/

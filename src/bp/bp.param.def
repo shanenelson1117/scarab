@@ -111,6 +111,12 @@ DEF_PARAM(  targets_in_hist           , TARGETS_IN_HIST           , uns     , un
 DEF_PARAM(  tc_entries                , TC_ENTRIES                , uns     , uns        , (4 * 1024) ,        )
 DEF_PARAM(  tc_assoc                  , TC_ASSOC                  , uns     , uns        , 4          ,        )
 
+/* misprediction filter: after warmup_cycles, branches whose saturating counter
+   reaches threshold are excluded from updating the BP and IBTB */
+DEF_PARAM(  bp_mispredict_filter_warmup    , BP_MISPREDICT_FILTER_WARMUP    , Counter , Counter , 0    , )
+DEF_PARAM(  bp_mispredict_filter_entries   , BP_MISPREDICT_FILTER_ENTRIES   , uns     , uns     , 4096 , )
+DEF_PARAM(  bp_mispredict_filter_threshold , BP_MISPREDICT_FILTER_THRESHOLD , uns     , uns     , 7    , )
+
 DEF_PARAM(  num_corr_branches         , NUM_CORR_BRANCHES         , uns     , uns        , 3          ,        )
 DEF_PARAM(  sel_hist_bp_entries       , SEL_HIST_BP_ENTRIES       , uns     , uns        , 8192       ,        )
 DEF_PARAM(  sel_hist_length           , SEL_HIST_LENGTH           , uns     , uns        , 16         ,        )

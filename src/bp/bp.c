@@ -262,6 +262,10 @@ void init_bp_data(uns8 proc_id, uns8 bp_id, Bp_Data* bp_data, Bp_Data* primary_b
     ASSERTM(bp_data->proc_id, bp_data->target_bit_length * TARGETS_IN_HIST == IBTB_HIST_LENGTH,
             "IBTB_HIST_LENGTH must be a multiple of TARGETS_IN_HIST\n");
 
+  if (BP_MISPREDICT_FILTER_WARMUP) {
+    bp_data->mispredict_filter = (uns8*)calloc(BP_MISPREDICT_FILTER_ENTRIES, sizeof(uns8));
+  }
+
   g_bp_data = bp_data;
 
   /* confidence */
@@ -789,6 +793,22 @@ Addr bp_predict_op(Bp_Data* bp_data, Op* op, uns bp_id, uns br_num, Addr fetch_a
 }
 
 /******************************************************************************/
+/* mispredict_filter helpers */
+
+static inline uns bp_mispred_filter_idx(Addr pc) {
+  return ((pc >> 2) ^ (pc >> 14)) % BP_MISPREDICT_FILTER_ENTRIES;
+}
+
+/* Returns TRUE if this branch should be excluded from BP/IBTB updates. */
+static inline Flag bp_mispred_filter_suppressed(Bp_Data* bp_data, Addr pc) {
+  if (!BP_MISPREDICT_FILTER_WARMUP || !bp_data->mispredict_filter)
+    return FALSE;
+  if (cycle_count < BP_MISPREDICT_FILTER_WARMUP)
+    return FALSE;
+  return bp_data->mispredict_filter[bp_mispred_filter_idx(pc)] >= BP_MISPREDICT_FILTER_THRESHOLD;
+}
+
+/******************************************************************************/
 /* bp_target_known_op: called on cf ops when the real target is known
    (either decode time or execute time) */
 
@@ -804,7 +824,8 @@ void bp_target_known_op(Bp_Data* bp_data, Op* op) {
     case CF_IBR:
       if (ENABLE_IBP) {
         if (IBTB_OFF_PATH_WRITES || !op->off_path) {
-          bp_data->bp_ibtb->update_func(bp_data, op);
+          if (!bp_mispred_filter_suppressed(bp_data, op->inst_info->addr))
+            bp_data->bp_ibtb->update_func(bp_data, op);
         }
       }
       break;
@@ -820,11 +841,26 @@ void bp_resolve_op(Bp_Data* bp_data, Op* op) {
   if (!UPDATE_BP_OFF_PATH && op->off_path) {
     return;
   }
+
+  /* Update misprediction filter counter on-path only. */
+  if (!op->off_path && bp_data->mispredict_filter && cycle_count >= BP_MISPREDICT_FILTER_WARMUP) {
+    uns fi = bp_mispred_filter_idx(op->inst_info->addr);
+    Flag was_wrong = op->bp_pred_info->mispred ||
+                     op->bp_pred_info->recover_at_exec ||
+                     op->bp_pred_info->recover_at_decode;
+    if (was_wrong)
+      bp_data->mispredict_filter[fi] = SAT_INC(bp_data->mispredict_filter[fi], 255);
+    else
+      bp_data->mispredict_filter[fi] = SAT_DEC(bp_data->mispredict_filter[fi], 0);
+  }
+
   // Always train both predictors regardless of which one made the active prediction.
   op->recovery_info.branch_id = op->bp_pred_main.pred_branch_id;
-  bp_data->bp->update_func(op, BP_PRED_MAIN);
-  if (bp_data->bp_l0)
-    bp_data->bp_l0->update_func(op, BP_PRED_L0);
+  if (!bp_mispred_filter_suppressed(bp_data, op->inst_info->addr)) {
+    bp_data->bp->update_func(op, BP_PRED_MAIN);
+    if (bp_data->bp_l0)
+      bp_data->bp_l0->update_func(op, BP_PRED_L0);
+  }
 
   if (ENABLE_BP_CONF && IS_CONF_CF(op)) {
     bp_data->br_conf->update_func(op);
