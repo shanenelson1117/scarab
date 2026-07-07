@@ -826,6 +826,8 @@ void bp_target_known_op(Bp_Data* bp_data, Op* op) {
         if (IBTB_OFF_PATH_WRITES || !op->off_path) {
           if (!bp_mispred_filter_suppressed(bp_data, op->inst_info->addr))
             bp_data->bp_ibtb->update_func(bp_data, op);
+          else
+            STAT_EVENT(op->proc_id, BP_MISPREDICT_FILTER_SUPPRESS_IBTB);
         }
       }
       break;
@@ -860,6 +862,8 @@ void bp_resolve_op(Bp_Data* bp_data, Op* op) {
     bp_data->bp->update_func(op, BP_PRED_MAIN);
     if (bp_data->bp_l0)
       bp_data->bp_l0->update_func(op, BP_PRED_L0);
+  } else {
+    STAT_EVENT(op->proc_id, BP_MISPREDICT_FILTER_SUPPRESS_BP);
   }
 
   if (ENABLE_BP_CONF && IS_CONF_CF(op)) {
