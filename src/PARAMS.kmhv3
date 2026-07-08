@@ -1,0 +1,271 @@
+# File         : PARAMS.kmhv3
+# Date         : 07/08/26
+# Description  : XiangShan KMH V3 configuration, derived from gem5 setKmhV3Params
+#
+# Key differences from PARAMS.beefy:
+#   - ICache doubled to 64KB (icache.size = '64kB')
+#   - decode_width narrowed to 8 (decodeWidth = 8)
+#   - ROB enlarged to 352 entries (numROBEntries = 352)
+#   - Commit/retire width reduced to 8 (commitWidth = 8)
+#   - FTQ size set to 64 (branchPred.ftq_size = 64)
+#
+# Unmapped gem5 params (no Scarab equivalent):
+#   - LQEntries = 72, SQEntries = 56   (Scarab has no explicit LSQ size knob)
+#   - commitToFetchDelay / iewToFetchDelay = 2  (pipeline redirect latency)
+#   - RobCompressPolicy = 'none'
+#   - XSDRRIP replacement policy on L2/L3 (Scarab uses LRU)
+#   - dcache.mshrs = 16 (approximated by mem_req_buffer_entries)
+#   - L3 mshrs = 64, num_slices = 4
+
+## Simulation Parameters
+--mode                          full
+--model                         cmp
+--sim_limit                     none
+
+## Core Parameters
+
+# Femptoseconds, 3.2GHz, used for energy estimates.
+--chip_cycle_time               312500
+
+
+### Fetch Stage
+--fetch_off_path_ops            1
+
+# Decoupled frontend FTQ: ftq_size = 64, fsq_size = 64
+--fe_ftq_block_num              64
+--fe_ftq_ft_per_cycle           4
+
+#### ICache
+# gem5: cpu.icache.size = '64kB'
+--icache_size                   65536
+--icache_assoc                  8
+--icache_line_size              64
+--icache_read_ports             8
+
+### Uop Cache
+# Not modeled in KMH V3 (RISC-V core; no uop cache concept)
+--uop_cache_enable              0
+--uop_cache_width               8
+--uop_cache_lines               512
+--uop_cache_assoc               8
+--iprf_on_uop_cache_hit         1
+
+### Branch Predictor
+# gem5: DecoupledBPUWithBTB, resolvedUpdate = True → update at exec (retire=0)
+# gem5: mbtb + tage + ittage + mgsc + ras + ubtb + abtb + microtage all enabled
+--cfs_per_cycle                 6
+--bp_update_at_retire           0
+--update_bp_off_path            1
+--bp_mech                       tage64k
+
+
+#### BTB
+# Three-level BTB matching XiangShan hierarchy:
+#   uBTB (L0): 128 entries  — gem5: branchPred.ubtb.enabled = True
+#   MBTB (L1): 6144 entries — gem5: branchPred.mbtb.enabled = True
+#   Main (L2): 12288 entries
+--btb_mech                      generic
+--btb_entries                   12288
+--btb_assoc                     4
+--btb_main_latency              3
+--btb_l0_present                1
+--btb_l0_entries                128
+--btb_l0_assoc                  4
+--btb_l0_latency                1
+--btb_l1_present                1
+--btb_l1_entries                6144
+--btb_l1_assoc                  4
+--btb_l1_latency                2
+
+# gem5: branchPred.mbtb.resolvedUpdate = True → off-path writes enabled
+--btb_off_path_writes           1
+
+--perfect_nt_btb                0
+
+#### CRS (RAS)
+# gem5: branchPred.ras.enabled = True
+--enable_crs                    1
+--crs_entries                   128
+--crs_realistic                 1
+
+### iBP (ITTAGE)
+# gem5: branchPred.ittage.enabled = True, resolvedUpdate = True
+--enable_ibp                    1
+--ibtb_mech                     tc_tagged
+--ibtb_off_path_writes          1
+--tc_entries                    4096
+--tc_assoc                      4
+
+### Decode Stage
+# gem5: decodeWidth = 8
+--decode_width                  8
+--decode_cycles                 5
+
+### Instruction Decode Queue
+# gem5: fetchQueueSize = 64
+--idq_size                      64
+
+### Map Stage
+# gem5: renameWidth = 8
+--map_cycles                    5
+
+# gem5: numPhysIntRegs = 224, numPhysFloatRegs = 256
+--reg_renaming_scheme               1
+--reg_table_integer_physical_size   224
+--reg_table_vector_physical_size    256
+
+### Issue Stage
+
+# gem5: renameWidth = 8 (dispatch/issue bandwidth)
+--issue_width                   8
+
+--rs_fill_width                 0
+# RS split across three scheduler IQs (intiq0, intiq1, intiq2 from gem5 KMHV3Scheduler)
+# Keeping XiangShan RS topology from PARAMS.beefy:
+#   RS1 (97): connected to ALU/branch ports 0,1,4,5,8
+#   RS2 (70): connected to AGU/load ports 2,3,9
+#   RS3 (19): connected to FP ports 6,7
+--rs_sizes                      97 70 19
+--rs_connections                b0100110011 b1000001100 b0011000000
+--fu_types                      b00100100111111100111001001111110010010011111110011100100111111 b10010000110111100011111001110111001000011011110001111100111011 b00000001000000001000000010000010000000100000000100000001000001 b00000001000000001000000010000010000000100000000100000001000001 b00000000110111100011011001110110000000011011110001101100111011 b01001000000000000111001001111110100100000000000011100100111111 b00000010000000010000000100000010000001000000001000000010000001 b00000010000000010000000100000010000001000000001000000010000001 b00000000000000000011001001110110000000000000000001100100111011 b00000001000000001000000010000010000000100000000100000001000001
+
+### Exec Stage
+
+### DCache
+# gem5: cpu.dcache.size = '64kB', dcache.mshrs = 16
+--dcache_size                   65536
+--dcache_read_ports             100
+--dcache_write_ports            1
+--dcache_banks                  8
+--dcache_assoc                  12
+--dcache_line_size              64
+--dcache_cycles                 5
+
+### Reorder/Retire Stage
+
+# gem5: commitWidth = 8, squashWidth = 8
+--node_ret_width                8
+# gem5: numROBEntries = 352
+--node_table_size               352
+
+--stores_do_not_block_window    1
+--prefs_do_not_block_window     1
+
+
+## Uncore
+
+### Mid-level cache (L2)
+# gem5: l2_size = '1MB' per slice × 4 slices → 2MB/core total, 8-way
+# gem5: XSDRRIP replacement policy (approximated; Scarab uses LRU)
+--mlc_present                   1
+--mlc_size                      2097152
+--mlc_assoc                     8
+--mlc_cycles                    16
+
+
+### LLC (L3)
+# gem5: l3.num_slices = 4, l3.mshrs = 64
+# Keeping 32MB total LLC from PARAMS.beefy; mshrs unmapped in Scarab
+--l1_size                       33554432
+--l1_banks                      8
+--l1_cycles                     36
+--l1_assoc                      16
+--l1_line_size                  64
+--l1_interleave_factor          64
+
+
+### Prefetcher
+--pref_framework_on             1
+--pref_stream_on                1
+--pref_train_on_pref_misses     0
+--pref_oracle_train             0
+--pref_ul1req_queue_overwrite_on_full 1
+
+--stream_length                 64
+--stream_prefetch_n             4
+--stream_start_dis              1
+--stream_train_num              4
+--stream_create_on_dc_miss      0
+--stream_create_on_l1_miss      1
+
+--pref_throttlefb_on=1
+--pref_acc_thresh_1=0.75
+--pref_acc_thresh_2=0.4
+--pref_acc_thresh_3=0.4
+--pref_timely_thresh=0.01
+--pref_polpf_thresh=0.005
+--pref_update_interval=8192
+
+--mem_req_buffer_pref_watermark 4
+--promote_to_higher_priority_mem_req_type 1
+
+### Memory
+--addr_translation              random
+
+--mem_priority_ifetch           0
+--mem_priority_dfetch           1
+--mem_priority_dstore           2
+--mem_priority_iprf             3
+--mem_priority_dprf             4
+--mem_priority_wb               5
+--mem_priority_wb_nodirty       5
+
+# gem5: dcache.mshrs = 16 → approximated here
+--mem_req_buffer_entries        16
+--bus_width_in_bytes            8
+
+--ramulator_standard            DDR4
+--ramulator_speed               DDR4_2400R
+--ramulator_org                 DDR4_8Gb_x8
+--ramulator_channels            1
+--ramulator_ranks               1
+--ramulator_bankgroups          4
+--ramulator_banks               4
+--ramulator_chip_width          8
+--ramulator_rows                65536
+--ramulator_cols                1024
+--ramulator_scheduling_policy   FRFCFS_Cap
+--ramulator_readq_entries       32
+--ramulator_writeq_entries      32
+--ramulator_record_cmd_trace    FALSE
+--ramulator_print_cmd_trace     FALSE
+--ramulator_tCK                 833333
+--ramulator_tCL                 16
+--ramulator_tCCD                6
+--ramulator_tCCDS               4
+--ramulator_tCCDL               6
+--ramulator_tCWL                12
+--ramulator_tBL                 4
+--ramulator_tWTR                9
+--ramulator_tWTRS               3
+--ramulator_tWTRL               9
+--ramulator_tRP                 16
+--ramulator_tRPpb               16
+--ramulator_tRPab               16
+--ramulator_tRCD                16
+--ramulator_tRCDR               16
+--ramulator_tRCDW               16
+--ramulator_tRAS                39
+--dram_tech_in_nm               32
+
+## Other
+
+### Debug
+--debug_inst_start              0
+--debug_inst_stop              -1
+--debug_cycle_start             0
+--debug_cycle_stop             -1
+
+
+## Stats and Params
+--dump_params                   1
+--dump_stats                    1
+--dump_trace                    0
+
+####################################
+--set_off_path_confirmed        1
+
+--order_beyond_bus              1
+
+--mem_ooo_stores                1
+--mem_obey_store_dep            1
