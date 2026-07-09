@@ -33,7 +33,7 @@
 
 # Decoupled frontend FTQ: ftq_size = 64, fsq_size = 64
 --fe_ftq_block_num              64
---fe_ftq_ft_per_cycle           4
+--fe_ftq_FT_per_cycle           4
 
 #### ICache
 # gem5: cpu.icache.size = '64kB'
