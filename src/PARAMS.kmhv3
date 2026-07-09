@@ -134,7 +134,7 @@
 ### DCache
 # gem5: cpu.dcache.size = '64kB', dcache.mshrs = 16
 --dcache_size                   65536
---dcache_read_ports             100
+--dcache_read_ports             3
 --dcache_write_ports            1
 --dcache_banks                  8
 --dcache_assoc                  12
@@ -165,9 +165,10 @@
 
 ### LLC (L3)
 # gem5: l3.num_slices = 4, l3.mshrs = 64
-# Keeping 32MB total LLC from PARAMS.beefy; mshrs unmapped in Scarab
+# Total LLC size not set in gem5 config; keeping 32MB from PARAMS.beefy
+# mshrs = 64 unmapped in Scarab
 --l1_size                       33554432
---l1_banks                      8
+--l1_banks                      4
 --l1_cycles                     36
 --l1_assoc                      16
 --l1_line_size                  64
