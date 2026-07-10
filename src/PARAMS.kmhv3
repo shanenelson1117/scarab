@@ -38,9 +38,9 @@
 #### ICache
 # gem5: cpu.icache.size = '64kB'
 --icache_size                   65536
---icache_assoc                  8
+--icache_assoc                  4
 --icache_line_size              64
---icache_read_ports             8
+--icache_read_ports             3
 
 ### Uop Cache
 # Not modeled in KMH V3 (RISC-V core; no uop cache concept)
