@@ -49,6 +49,7 @@
 #include "isa/isa_macros.h"
 #include "prefetcher/branch_misprediction_table.h"
 
+#include "bld_reuse.h"
 #include "branch_load_dep.h"
 #include "decoupled_frontend.h"
 #include "ft.h"
@@ -90,8 +91,10 @@ void init_decode_stage(uns8 proc_id, const char* name) {
   ASSERT(0, STAGE_MAX_DEPTH > 0);
   DEBUG(proc_id, "Initializing %s stage\n", name);
 
-  if (proc_id == 0)
+  if (proc_id == 0) {
     bld_init(NUM_CORES);
+    bld_reuse_init(NUM_CORES);
+  }
 
   memset(dec, 0, sizeof(Decode_Stage));
   dec->proc_id = proc_id;

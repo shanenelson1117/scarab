@@ -308,6 +308,18 @@ DEF_PARAM(branch_load_dep_attribute_record, BRANCH_LOAD_DEP_ATTRIBUTE_RECORD, Fl
    recorded stall cycles. Models perfectly prefetching that data. */
 DEF_PARAM(branch_load_dep_addr_replay,          BRANCH_LOAD_DEP_ADDR_REPLAY,          Flag,  Flag,  FALSE, )
 DEF_PARAM(branch_load_dep_addr_replay_coverage, BRANCH_LOAD_DEP_ADDR_REPLAY_COVERAGE, float, float, 0.9,   )
+/* Reuse-distance study for branch-delaying loads (measurement only, does not
+   alter cache replacement). For every on-path demand access it maintains a
+   shadow LRU-stack analyzer and, for loads whose PC has been attributed as a
+   branch-delaying load (see branch_load_dep_attribute_record), records the
+   true stack (reuse) distance of the accessed line two ways: over the
+   delaying-load-only reference stream (sizes a dedicated feeder cache) and
+   over the full demand stream (its depth in the shared L1/L2 LRU stack).
+   Writes <bench>_<simpt>_reuse.csv to the trace dir. */
+DEF_PARAM(branch_load_dep_reuse_study, BRANCH_LOAD_DEP_REUSE_STUDY, Flag, Flag, FALSE, )
+/* Max distinct lines tracked per shadow stack; reuses of lines aged past this
+   are counted in a >cap overflow bucket. Bounds analyzer memory. */
+DEF_PARAM(branch_load_dep_reuse_cap, BRANCH_LOAD_DEP_REUSE_CAP, uns, uns, 1048576, )
 DEF_PARAM(dcache_hit_one_cycle, DCACHE_HIT_ONE_CYCLE, Flag, Flag, FALSE, )
 DEF_PARAM(cbp_trace_r0, CBP_TRACE_R0, char*, string, NULL, )
 DEF_PARAM(cbp_trace_r1, CBP_TRACE_R1, char*, string, NULL, )

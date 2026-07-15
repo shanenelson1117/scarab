@@ -41,6 +41,7 @@
 #include "debug/debug_print.h"
 
 #include "core.param.h"
+#include "bld_reuse.h"
 #include "br_exec_wait.h"
 #include "memory/memory.param.h"
 #include "prefetcher//stream.param.h"
@@ -271,6 +272,12 @@ void update_dcache_stage(Stage_Data* src_sd) {
     if (DC_PREF_CACHE_ENABLE && !line) {
       line = dc_pref_cache_access(op);
     }
+
+    // reuse-distance study: record the on-path demand reference stream and, for
+    // branch-delaying loads, the accessed line's stack (reuse) distance.
+    if (BRANCH_LOAD_DEP_REUSE_STUDY && !PERFECT_DCACHE && !op->off_path)
+      bld_reuse_note_access(op->proc_id, op->inst_info->addr, line_addr,
+                            op->inst_info->table_info.mem_type != MEM_ST, line != NULL);
 
     op->oracle_info.dcmiss = FALSE;
     if (PERFECT_DCACHE) {

@@ -36,6 +36,7 @@
 #include <utility>
 #include <vector>
 
+#include "bld_reuse.h"
 #include "branch_load_dep.h"
 
 extern "C" {
@@ -307,6 +308,8 @@ static void br_charge_line(std::unordered_map<Addr, std::unordered_map<Addr, BrL
                            Op* miss_op, Counter* cat_total) {
   Addr pc = miss_op->inst_info->addr;
   Addr line = br_line_of(miss_op->oracle_info.va);
+  if (BRANCH_LOAD_DEP_REUSE_STUDY)
+    bld_reuse_mark_delaying_pc(miss_op->proc_id, pc);
   BrLineRec& r = cat[pc][line];
   r.cycles++;
   (*cat_total)++;
