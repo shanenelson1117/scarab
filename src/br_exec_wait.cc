@@ -27,6 +27,7 @@
 #include "br_exec_wait.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <deque>
@@ -364,6 +365,39 @@ static void br_braddr_path(char* out, size_t sz) {
   snprintf(out, sz, "%s/%s_%s_braddr.csv", dir, bench, simpt);
 }
 
+/* Same <bench>_<simpt> derivation as br_braddr_path, for the non-feeder
+ * displacement pool file. */
+static void br_nfpool_path(char* out, size_t sz) {
+  const char* dir = BRANCH_LOAD_DEP_TRACE_DIR;
+  const char* trace = CBP_TRACE_R0;
+  if (!trace || !*trace) {
+    snprintf(out, sz, "%s/branch_delay_nfpool.csv", dir);
+    return;
+  }
+  char tmp[MAX_STR_LENGTH + 1];
+  strncpy(tmp, trace, sizeof(tmp) - 1);
+  tmp[sizeof(tmp) - 1] = '\0';
+  char* slash = strrchr(tmp, '/');
+  const char* filename = slash ? slash + 1 : tmp;
+  char simpt[64];
+  const char* dot = strchr(filename, '.');
+  size_t n = dot ? (size_t)(dot - filename) : strlen(filename);
+  if (n > sizeof(simpt) - 1)
+    n = sizeof(simpt) - 1;
+  strncpy(simpt, filename, n);
+  simpt[n] = '\0';
+  if (slash)
+    *slash = '\0';
+  for (int lvl = 0; lvl < 2; lvl++) {
+    char* p = strrchr(tmp, '/');
+    if (p)
+      *p = '\0';
+  }
+  const char* bench_slash = strrchr(tmp, '/');
+  const char* bench = bench_slash ? bench_slash + 1 : tmp;
+  snprintf(out, sz, "%s/%s_%s_nfpool.csv", dir, bench, simpt);
+}
+
 void br_exec_wait_finish(void) {
   if (!BRANCH_LOAD_DEP_ATTRIBUTE_RECORD)
     return;
@@ -428,12 +462,60 @@ void br_exec_wait_finish(void) {
               (unsigned long long)kv.second);
     fclose(g);
   }
+
+  /* Non-feeder displacement pool: every load line that missed L1 >=2x
+   * (reused-and-evicted = the true retention candidates), sorted desc by miss
+   * count and capped to pool_cap. The count-matched non-feeder oracle draws from
+   * this at replay; feeder lines are filtered out there. */
+  char npath[MAX_STR_LENGTH + 1];
+  br_nfpool_path(npath, sizeof(npath));
+  FILE* nf = fopen(npath, "w");
+  if (nf) {
+    std::vector<std::pair<Addr, Counter>> pool;
+    for (auto& kv : g_line_miss_count)
+      if (kv.second >= 2)
+        pool.push_back(kv);
+    std::sort(pool.begin(), pool.end(),
+              [](const std::pair<Addr, Counter>& a, const std::pair<Addr, Counter>& b) {
+                return a.second > b.second;
+              });
+    size_t cap = (size_t)BRANCH_LOAD_DEP_ADDR_REPLAY_POOL_CAP;
+    size_t emit = (cap && pool.size() > cap) ? cap : pool.size();
+    fprintf(nf, "# reused-missed non-feeder pool: load lines with L1 miss_count>=2\n");
+    fprintf(nf, "# reused_missed_lines=%zu emitted=%zu cap=%zu\n", pool.size(), emit, cap);
+    for (size_t i = 0; i < emit; i++)
+      fprintf(nf, "0x%llx,%llu\n", (unsigned long long)pool[i].first,
+              (unsigned long long)pool[i].second);
+    fclose(nf);
+  }
 }
 
 /* ----------------------- address-based replay ------------------------ */
 
 static Flag g_addr_replay_loaded = FALSE;
 static std::unordered_set<Addr> g_addr_replay_set;
+
+/* Non-feeder displacement oracle: count-matched random set drawn from the
+ * reused-missed pool, disjoint from the feeder set. */
+static Flag g_nf_replay_loaded = FALSE;
+static std::unordered_set<Addr> g_nf_replay_set;
+
+static uint64_t br_splitmix64(uint64_t* s) {
+  uint64_t z = (*s += 0x9E3779B97F4A7C15ULL);
+  z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+  z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+  return z ^ (z >> 31);
+}
+
+/* Record the (target, selected) line counts to the simpoint cwd so the analysis
+ * can confirm the feeder/non-feeder oracles retained an equal number of lines. */
+static void br_replay_marker(const char* mode, uns target, uns selected) {
+  FILE* m = fopen("replay_selection.csv", "a");
+  if (m) {
+    fprintf(m, "%s,%u,%u\n", mode, target, selected);
+    fclose(m);
+  }
+}
 
 static void br_addr_replay_load(void) {
   g_addr_replay_loaded = TRUE;
@@ -473,9 +555,64 @@ static void br_addr_replay_load(void) {
   fprintf(stderr, "br_addr_replay: %u/%zu lines cover %.1f%% of %llu cycles (target %.0f%%)\n",
           picked, lines.size(), total ? 100.0 * (double)acc / (double)total : 0.0,
           (unsigned long long)total, 100.0 * cov);
+  if (!BRANCH_LOAD_DEP_ADDR_REPLAY_NONFEEDER)
+    br_replay_marker("feeder", picked, picked);
+}
+
+/* Build the count-matched non-feeder set: N = size of the feeder coverage set;
+ * draw N random reused-missed lines (from nfpool.csv) that are not feeders. */
+static void br_nf_replay_load(void) {
+  g_nf_replay_loaded = TRUE;
+  if (!g_addr_replay_loaded)
+    br_addr_replay_load();  // feeder set + coverage prefix -> N
+  uns N = (uns)g_addr_replay_set.size();
+
+  char path[MAX_STR_LENGTH + 1];
+  br_nfpool_path(path, sizeof(path));
+  FILE* f = fopen(path, "r");
+  if (!f) {
+    fprintf(stderr, "br_nf_replay: cannot open %s\n", path);
+    br_replay_marker("nonfeeder", N, 0);
+    return;
+  }
+  std::vector<Addr> cand;  // distinct reused-missed non-feeder lines
+  char buf[256];
+  while (fgets(buf, sizeof(buf), f)) {
+    if (buf[0] == '#' || buf[0] == '\n')
+      continue;
+    unsigned long long line = 0, cnt = 0;
+    if (sscanf(buf, "0x%llx,%llu", &line, &cnt) >= 1) {
+      Addr L = br_line_of((Addr)line);
+      if (!g_addr_replay_set.count(L))  // exclude feeders
+        cand.push_back(L);
+    }
+  }
+  fclose(f);
+
+  /* Deterministic Fisher-Yates shuffle (seeded), then take the first N. */
+  uint64_t state = (uint64_t)BRANCH_LOAD_DEP_ADDR_REPLAY_SEED;
+  for (size_t i = cand.size(); i > 1;) {
+    --i;
+    size_t j = (size_t)(br_splitmix64(&state) % (uint64_t)(i + 1));
+    std::swap(cand[i], cand[j]);
+  }
+  uns sel = 0;
+  for (size_t i = 0; i < cand.size() && sel < N; i++)
+    if (g_nf_replay_set.insert(cand[i]).second)
+      sel++;
+
+  fprintf(stderr,
+          "br_nf_replay: selected %u/%u non-feeder lines (pool %zu, seed %u)\n",
+          sel, N, cand.size(), (unsigned)BRANCH_LOAD_DEP_ADDR_REPLAY_SEED);
+  br_replay_marker("nonfeeder", N, sel);
 }
 
 Flag br_addr_replay_hit(Addr line_addr) {
+  if (BRANCH_LOAD_DEP_ADDR_REPLAY_NONFEEDER) {
+    if (!g_nf_replay_loaded)
+      br_nf_replay_load();
+    return g_nf_replay_set.count(br_line_of(line_addr)) ? TRUE : FALSE;
+  }
   if (!g_addr_replay_loaded)
     br_addr_replay_load();
   return g_addr_replay_set.count(br_line_of(line_addr)) ? TRUE : FALSE;

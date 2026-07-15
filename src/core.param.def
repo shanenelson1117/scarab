@@ -308,6 +308,15 @@ DEF_PARAM(branch_load_dep_attribute_record, BRANCH_LOAD_DEP_ATTRIBUTE_RECORD, Fl
    recorded stall cycles. Models perfectly prefetching that data. */
 DEF_PARAM(branch_load_dep_addr_replay,          BRANCH_LOAD_DEP_ADDR_REPLAY,          Flag,  Flag,  FALSE, )
 DEF_PARAM(branch_load_dep_addr_replay_coverage, BRANCH_LOAD_DEP_ADDR_REPLAY_COVERAGE, float, float, 0.9,   )
+/* Displacement counterfactual: instead of the feeder set, force-hit a count-matched
+   set of NON-feeder lines drawn at random from the reused-and-evicted pool (lines
+   that missed L1 >=2x, recorded as <bench>_<simpt>_nfpool.csv in the record pass).
+   The set size equals the feeder replay set at branch_load_dep_addr_replay_coverage,
+   so the two oracles retain an equal number of lines. Answers whether a cache line
+   spent on a feeder is worth more IPC than one spent on an average reused non-feeder. */
+DEF_PARAM(branch_load_dep_addr_replay_nonfeeder, BRANCH_LOAD_DEP_ADDR_REPLAY_NONFEEDER, Flag, Flag, FALSE, )
+DEF_PARAM(branch_load_dep_addr_replay_seed,      BRANCH_LOAD_DEP_ADDR_REPLAY_SEED,      uns,  uns,  1,     )
+DEF_PARAM(branch_load_dep_addr_replay_pool_cap,  BRANCH_LOAD_DEP_ADDR_REPLAY_POOL_CAP,  uns,  uns,  1048576, )
 /* Reuse-distance study for branch-delaying loads (measurement only, does not
    alter cache replacement). For every on-path demand access it maintains a
    shadow LRU-stack analyzer and, for loads whose PC has been attributed as a
