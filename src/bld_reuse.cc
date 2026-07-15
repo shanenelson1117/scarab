@@ -128,7 +128,8 @@ struct ReuseState {
   Counter feeder_hist_hit[BLD_REUSE_NB]    = {0};
   Counter feeder_hist_miss[BLD_REUSE_NB]   = {0};
 
-  // full-stream depth, evaluated at each delaying-load access
+  // full-stream stack distance of a MARKED line, evaluated at every access to it
+  // (distinct lines since the line was last touched by ANY access i -> i+1).
   Counter full_reuse         = 0;
   Counter full_notracked     = 0;  // cold or aged past cap in the full stream
   Counter full_dist_sum      = 0;
@@ -170,11 +171,32 @@ void bld_reuse_note_access(uns8 proc_id, Addr pc, Addr line_addr, Flag is_load, 
     return;
   ReuseState& s = g_reuse[proc_id];
 
-  /* Advance the full demand stream for every access; capture this line's depth. */
+  /* Advance the full demand stream for every access; full_dist is this line's
+   * stack distance = distinct lines touched since it was last accessed by ANY
+   * access. */
   uint64_t full_dist = s.full.access(line_addr);
 
+  /* Full-stream reuse of a *marked* feeder line, recorded at EVERY access to it
+   * (any load/store, any PC) -- distinct lines between any access i and i+1. A
+   * line becomes marked once a delaying load first touches it (below), so the
+   * marking access itself is not counted, only its later reuses. */
+  if(s.feeder_count.find(line_addr) != s.feeder_count.end()) {
+    if(full_dist != SD_NOT_TRACKED) {
+      int b = bld_reuse_bucket(full_dist);
+      s.full_reuse++;
+      s.full_dist_sum += full_dist;
+      s.full_hist[b]++;
+      if(real_hit)
+        s.full_hist_hit[b]++;
+      else
+        s.full_hist_miss[b]++;
+    } else {
+      s.full_notracked++;
+    }
+  }
+
   if(!is_load || s.delaying_pcs.find(pc) == s.delaying_pcs.end())
-    return;  // only delaying loads contribute to the feeder measurement
+    return;  // only delaying loads populate the marked set + feeder-only stream
 
   s.feeder_accesses++;
   if(real_hit)
@@ -182,7 +204,8 @@ void bld_reuse_note_access(uns8 proc_id, Addr pc, Addr line_addr, Flag is_load, 
   else
     s.real_miss++;
 
-  /* ---- feeder-only stream ---- */
+  /* ---- feeder-only stream: distinct delaying-load lines between consecutive
+   *      delaying-load accesses (sizes a dedicated marked-load cache) ---- */
   uint32_t& cnt = s.feeder_count[line_addr];
   cnt++;
   uint64_t feeder_dist = s.feeder.access(line_addr);
@@ -199,20 +222,6 @@ void bld_reuse_note_access(uns8 proc_id, Addr pc, Addr line_addr, Flag is_load, 
     s.feeder_cold++;  // first ever delaying-load touch of this line
   } else {
     s.feeder_overflow++;  // seen before but aged past the cap
-  }
-
-  /* ---- full-stream depth at this delaying-load access ---- */
-  if(full_dist != SD_NOT_TRACKED) {
-    int b = bld_reuse_bucket(full_dist);
-    s.full_reuse++;
-    s.full_dist_sum += full_dist;
-    s.full_hist[b]++;
-    if(real_hit)
-      s.full_hist_hit[b]++;
-    else
-      s.full_hist_miss[b]++;
-  } else {
-    s.full_notracked++;
   }
 }
 
@@ -285,7 +294,8 @@ void bld_reuse_finish(void) {
 
   fprintf(f, "# reuse-distance study for branch-delaying loads\n");
   fprintf(f, "# cap=%u line_bytes=%u\n", (unsigned)BRANCH_LOAD_DEP_REUSE_CAP, (unsigned)DCACHE_LINE_SIZE);
-  fprintf(f, "# feeder stream = delaying-load accesses only; full stream = all on-path demand accesses\n");
+  fprintf(f, "# full stream = distinct lines between ANY access i and i+1 to a marked line (all demand accesses)\n");
+  fprintf(f, "# feeder stream = distinct delaying-load lines between consecutive delaying-load accesses\n");
   fprintf(f, "# stack distance = distinct lines since last access; bucket b -> fully-assoc cache size ~2^b lines\n");
   fprintf(f, "# rows: <proc>,summary,<key>,<value>  and  <proc>,hist,<stream>,<outcome>,<bucket>,<cache_size_lines>,<count>\n");
 
