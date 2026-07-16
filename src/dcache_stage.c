@@ -312,6 +312,13 @@ void update_dcache_stage(Stage_Data* src_sd) {
           STAT_EVENT(op->proc_id, DCACHE_FEEDER_REUSE_DIST_LT256 + bucket);
         }
       }
+      /* Mark a resident line as a feeder on hit if it is in the attribution set
+         (the fill path only sees it on (re)fetch, so this closes the warmup gap
+         for lines that stay resident). cache_set_feeds_branch refills the reprieve
+         budget, matching the reset-on-reuse policy. */
+      if (BRANCH_LOAD_DEP_REPL_ATTRIBUTION && !op->off_path && br_addr_replay_hit(op->oracle_info.va) &&
+          cache_set_feeds_branch(&dc->dcache, dc->proc_id, op->oracle_info.va))
+        STAT_EVENT(op->proc_id, DCACHE_FEEDER_MARKED_ATTRIBUTION);
       dcache_cacheline_hit(op, line_addr, line);
       continue;
     }
@@ -886,6 +893,13 @@ static inline void dcache_fill_process_cacheline(Mem_Req* req, Dcache_Data* data
 
     if (op->feeds_branch && cache_set_feeds_branch(&dc->dcache, dc->proc_id, req->addr))
       STAT_EVENT(op->proc_id, DCACHE_FEEDER_LINES_MARKED);
+
+    /* Attribution-sourced feeder marking: tag the just-filled line as a feeder
+       if it is in the branch-delay attribution set, so the reprieve replacement
+       policy retains it. Decoupled from the addr-replay force-hit oracle. */
+    if (BRANCH_LOAD_DEP_REPL_ATTRIBUTION && !op->off_path && br_addr_replay_hit(req->addr) &&
+        cache_set_feeds_branch(&dc->dcache, dc->proc_id, req->addr))
+      STAT_EVENT(op->proc_id, DCACHE_FEEDER_MARKED_ATTRIBUTION);
 
     DEBUG(dc->proc_id, "%s: %s line addr:0x%s: %7d\n", unsstr64(op->op_num), disasm_op(op, FALSE), hexstr64s(req->addr),
           (int)(req->addr >> LOG2(DCACHE_LINE_SIZE)));

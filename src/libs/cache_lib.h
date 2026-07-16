@@ -93,6 +93,7 @@ typedef struct Cache_Entry_struct {
   Flag outcome;       /* for replacement policy */
   Flag    feeds_branch;         /* line brought in by a load that feeds a branch; evict last */
   Flag    feeder_reuse_counted; /* first reuse of this feeder residency has been recorded */
+  uns     feeder_reprieves_left;/* remaining deferred evictions before this feeder line is evictable */
   Counter insertion_access;     /* cache->access_seq_num when this line was inserted */
 } Cache_Entry;
 

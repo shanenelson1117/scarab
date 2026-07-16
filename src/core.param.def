@@ -269,6 +269,13 @@ DEF_PARAM(branch_load_dep, BRANCH_LOAD_DEP, Flag, Flag, FALSE, )
    0.0 = strict protection (feeder never evicted while a non-feeder exists). */
 DEF_PARAM(branch_load_dep_repl_threshold, BRANCH_LOAD_DEP_REPL_THRESHOLD, float, float, 0.0, )
 DEF_PARAM(branch_load_dep_repl, BRANCH_LOAD_DEP_REPL, Flag, Flag, FALSE, )
+/* Reprieve budget for branch-feeder line protection (count-based).
+   When >0, a feeder line that would be the LRU victim is spared and its budget
+   decremented; it only becomes evictable after it has been the LRU victim N
+   times (i.e. N times it "should have been evicted" under plain LRU). A demand
+   hit on the feeder line refills the budget back to N. 0 disables the counter
+   scheme (falls back to the BRANCH_LOAD_DEP_REPL_THRESHOLD age-ratio policy). */
+DEF_PARAM(branch_load_dep_repl_n, BRANCH_LOAD_DEP_REPL_N, uns, uns, 0, )
 DEF_PARAM(branch_load_dep_prefetch, BRANCH_LOAD_DEP_PREFETCH, Flag, Flag, FALSE, )
 DEF_PARAM(branch_load_dep_zero_latency, BRANCH_LOAD_DEP_ZERO_LATENCY, Flag, Flag, FALSE, )
 /* On a D-cache miss, complete a feeder load at DCACHE_CYCLES (as if it hit) while
@@ -308,6 +315,12 @@ DEF_PARAM(branch_load_dep_attribute_record, BRANCH_LOAD_DEP_ATTRIBUTE_RECORD, Fl
    recorded stall cycles. Models perfectly prefetching that data. */
 DEF_PARAM(branch_load_dep_addr_replay,          BRANCH_LOAD_DEP_ADDR_REPLAY,          Flag,  Flag,  FALSE, )
 DEF_PARAM(branch_load_dep_addr_replay_coverage, BRANCH_LOAD_DEP_ADDR_REPLAY_COVERAGE, float, float, 0.9,   )
+/* Mark D-cache lines in the attribution replay set (branch_delay_loads coverage
+   set, same file/coverage/nonfeeder knobs as branch_load_dep_addr_replay) as
+   branch feeders, so the reprieve replacement policy (branch_load_dep_repl +
+   branch_load_dep_repl_n) protects them. Independent of branch_load_dep_addr_replay:
+   this only tags lines for retention, it does NOT force L1 hits. */
+DEF_PARAM(branch_load_dep_repl_attribution,     BRANCH_LOAD_DEP_REPL_ATTRIBUTION,     Flag,  Flag,  FALSE, )
 /* Displacement counterfactual: instead of the feeder set, force-hit a count-matched
    set of NON-feeder lines drawn at random from the reused-and-evicted pool (lines
    that missed L1 >=2x, recorded as <bench>_<simpt>_nfpool.csv in the record pass).

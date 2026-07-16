@@ -45,6 +45,8 @@
 
 #include "frontend/frontend_intf.h"
 
+#include "statistics.h"
+
 // DeleteMe
 #define ideal_num_entries 256
 
@@ -330,6 +332,7 @@ void* cache_insert_replpos(Cache* cache, uns8 proc_id, Addr addr, Addr* line_add
   new_line->pref                = isPrefetch;
   new_line->feeds_branch        = FALSE;
   new_line->feeder_reuse_counted = FALSE;
+  new_line->feeder_reprieves_left = 0;
 
   new_line->pw_start_addr = addr;  // only means anything for uop cache
 
@@ -451,6 +454,9 @@ Flag cache_set_feeds_branch(Cache* cache, uns8 proc_id, Addr addr) {
     if (line->valid && line->tag == tag) {
       line->feeds_branch         = TRUE;
       line->feeder_reuse_counted = FALSE;
+      /* (Re)charge the reprieve budget every time the line is (re)marked as a
+         feeder, so a feeder that keeps proving useful stays protected. */
+      line->feeder_reprieves_left = BRANCH_LOAD_DEP_REPL_N;
       return TRUE;
     }
   }
@@ -560,6 +566,51 @@ Cache_Entry* find_repl_entry(Cache* cache, uns8 proc_id, uns set, uns* way) {
       }
 
       /* Feeder-aware LRU: protect branch-feeder lines from eviction. */
+
+      /* Count-based reprieve scheme (BRANCH_LOAD_DEP_REPL_N > 0): the true-LRU
+         victim, if it is a feeder that still has reprieves left, is spared and
+         its budget decremented (one "should have been evicted" event). We then
+         evict the LRU line that is not a still-protected feeder. The feeder is
+         only actually evicted once its budget is exhausted, or as a last resort
+         when every valid line in the set is a still-protected feeder. */
+      if (BRANCH_LOAD_DEP_REPL_N > 0) {
+        uns  lru_way = 0;    Counter lru_time = MAX_CTR;    /* true (plain) LRU */
+        uns  evict_way = 0;  Counter evict_time = MAX_CTR;  /* LRU among evictable */
+        Flag has_evictable = FALSE;
+
+        for (ii = 0; ii < cache->assoc; ii++) {
+          Cache_Entry* entry = &cache->entries[set][ii];
+          if (!entry->valid) {
+            *way = ii;
+            return entry;
+          }
+          if (entry->last_access_time < lru_time) {
+            lru_way = ii; lru_time = entry->last_access_time;
+          }
+          Flag protected_feeder = entry->feeds_branch && entry->feeder_reprieves_left > 0;
+          if (!protected_feeder && entry->last_access_time < evict_time) {
+            evict_way = ii; evict_time = entry->last_access_time; has_evictable = TRUE;
+          }
+        }
+
+        Cache_Entry* true_lru = &cache->entries[set][lru_way];
+        if (true_lru->feeds_branch && true_lru->feeder_reprieves_left > 0 && has_evictable) {
+          /* Spare the feeder for now; charge one reprieve against it. */
+          true_lru->feeder_reprieves_left--;
+          STAT_EVENT(proc_id, DCACHE_FEEDER_REPRIEVE_GRANTED);
+          *way = evict_way;
+          return &cache->entries[set][evict_way];
+        }
+
+        /* The true LRU is evictable (non-feeder or budget exhausted), or the
+           whole set is protected feeders (necessity eviction). */
+        if (true_lru->feeds_branch)
+          STAT_EVENT(proc_id, DCACHE_FEEDER_EVICTED);
+        *way = lru_way;
+        return true_lru;
+      }
+
+      /* Age-ratio scheme (BRANCH_LOAD_DEP_REPL_N == 0): protect via relative age. */
       uns  nfb_way = 0;        Counter nfb_time = MAX_CTR;  Flag has_nfb = FALSE;
       uns  fb_way  = 0;        Counter fb_time  = MAX_CTR;  Flag has_fb  = FALSE;
 
@@ -743,6 +794,10 @@ static inline void update_repl_policy(Cache* cache, Cache_Entry* cur_entry, uns 
     case REPL_TRUE_LRU:
     case REPL_PARTITION:
       cur_entry->last_access_time = sim_time;
+      /* A demand reuse of a feeder line refills its reprieve budget: the line
+         only dies after N eviction attempts with no intervening reuse. */
+      if (BRANCH_LOAD_DEP_REPL && !repl && cur_entry->feeds_branch)
+        cur_entry->feeder_reprieves_left = BRANCH_LOAD_DEP_REPL_N;
       break;
     case REPL_RANDOM: {
       char* old_rand_state = (char*)setstate(rand_repl_state);
@@ -1372,6 +1427,7 @@ void* cache_insert_strategy(Cache* cache, uns8 proc_id, Addr addr, Addr* line_ad
   new_line = repl_policy_func_table[policy].update_evict(cache, proc_id, set, &repl_index, NULL, FALSE);
   new_line->feeds_branch         = FALSE;
   new_line->feeder_reuse_counted = FALSE;
+  new_line->feeder_reprieves_left = 0;
   new_line->insertion_time       = cycle_count;
   new_line->insertion_access     = cache->access_seq_num;
 
