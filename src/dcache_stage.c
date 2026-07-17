@@ -319,9 +319,15 @@ void update_dcache_stage(Stage_Data* src_sd) {
       if (BRANCH_LOAD_DEP_REPL_ATTRIBUTION && !op->off_path && br_addr_replay_hit(op->oracle_info.va) &&
           cache_set_feeds_branch(&dc->dcache, dc->proc_id, op->oracle_info.va))
         STAT_EVENT(op->proc_id, DCACHE_FEEDER_MARKED_ATTRIBUTION);
+      if (BRANCH_LOAD_DEP_FEEDER_ACCESS_PROFILE && !op->off_path &&
+          op->inst_info->table_info.mem_type == MEM_LD)
+        feeder_access_profile_note(op->proc_id, op->oracle_info.va, TRUE);
       dcache_cacheline_hit(op, line_addr, line);
       continue;
     }
+    if (BRANCH_LOAD_DEP_FEEDER_ACCESS_PROFILE && !op->off_path &&
+        op->inst_info->table_info.mem_type == MEM_LD)
+      feeder_access_profile_note(op->proc_id, op->oracle_info.va, FALSE);
     dcache_cacheline_miss(op, line_addr);
   }
 

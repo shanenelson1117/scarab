@@ -236,6 +236,16 @@ DEF_STAT(  DCACHE_FEEDER_REUSE_DIST_8M     , COUNT , NO_RATIO  )
 DEF_STAT(  DCACHE_FEEDER_REUSE_DIST_16M    , COUNT , NO_RATIO  )
 DEF_STAT(  DCACHE_FEEDER_REUSE_DIST_32MPLUS, COUNT , NO_RATIO  )
 
+/* Feeder-access stream profile (branch_load_dep_feeder_access_profile). Every
+   on-path demand-load access to a line in the attribution feeder set is one of:
+   COLD (first-ever access to the line -> compulsory, prefetch-reachable),
+   REUSE_HIT (line resident), or REUSE_MISS (line seen before but evicted ->
+   retention-reachable). TOTAL = COLD + REUSE_HIT + REUSE_MISS. */
+DEF_STAT(  DCACHE_FEEDER_ACCESS_TOTAL     , COUNT , NO_RATIO  )
+DEF_STAT(  DCACHE_FEEDER_ACCESS_COLD      , COUNT , DCACHE_FEEDER_ACCESS_TOTAL  )
+DEF_STAT(  DCACHE_FEEDER_ACCESS_REUSE_HIT , COUNT , DCACHE_FEEDER_ACCESS_TOTAL  )
+DEF_STAT(  DCACHE_FEEDER_ACCESS_REUSE_MISS, COUNT , DCACHE_FEEDER_ACCESS_TOTAL  )
+
 DEF_STAT(  DCACHE_HIT_ONPATH_SAT_BY_OFFPATH		   , DIST  , NO_RATIO  )
 DEF_STAT(  DCACHE_HIT_ONPATH_SAT_BY_ONPATH		   , DIST  , NO_RATIO  )
 

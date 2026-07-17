@@ -60,6 +60,13 @@ void br_note_load_miss(Addr line_addr);
    (branch_load_dep_addr_replay). Lazily loads the recorded line file. */
 Flag br_addr_replay_hit(Addr line_addr);
 
+/* Feeder-access stream profiler (branch_load_dep_feeder_access_profile). Call on
+   every on-path demand-load access to a data cacheline; hit=TRUE for an L1D hit,
+   FALSE for a miss. Only accesses to lines in the attribution feeder set are
+   counted, split into cold / reuse-hit / reuse-miss (see the
+   DCACHE_FEEDER_ACCESS_* stats). Measurement-only; does not affect replacement. */
+void feeder_access_profile_note(uns8 proc_id, Addr line_addr, Flag hit);
+
 #ifdef __cplusplus
 }
 #endif

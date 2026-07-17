@@ -618,6 +618,32 @@ Flag br_addr_replay_hit(Addr line_addr) {
   return g_addr_replay_set.count(br_line_of(line_addr)) ? TRUE : FALSE;
 }
 
+/* Per-core set of feeder lines observed so far, used to separate the first
+   (cold/compulsory) access to a feeder line from later reuse. */
+static std::unordered_map<uns8, std::unordered_set<Addr>> g_feeder_seen;
+
+void feeder_access_profile_note(uns8 proc_id, Addr line_addr, Flag hit) {
+  if (!BRANCH_LOAD_DEP_FEEDER_ACCESS_PROFILE)
+    return;
+  /* Only profile lines that belong to the attribution feeder set (honors the
+     same trace_dir/coverage knobs as br_addr_replay_hit). */
+  if (!br_addr_replay_hit(line_addr))
+    return;
+  Addr line = br_line_of(line_addr);
+  STAT_EVENT(proc_id, DCACHE_FEEDER_ACCESS_TOTAL);
+  if (hit) {
+    /* A resident feeder line is by definition already seen. */
+    g_feeder_seen[proc_id].insert(line);
+    STAT_EVENT(proc_id, DCACHE_FEEDER_ACCESS_REUSE_HIT);
+  } else {
+    /* insert().second is TRUE when the line was not previously seen -> cold. */
+    if (g_feeder_seen[proc_id].insert(line).second)
+      STAT_EVENT(proc_id, DCACHE_FEEDER_ACCESS_COLD);
+    else
+      STAT_EVENT(proc_id, DCACHE_FEEDER_ACCESS_REUSE_MISS);
+  }
+}
+
 void br_exec_wait_cycle(uns8 proc_id, Counter cycle_count) {
   Op* tracked = NULL;
   for (Op* op = cmp_model.node_stage[proc_id].node_head; op; op = op->next_node) {

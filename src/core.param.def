@@ -321,6 +321,13 @@ DEF_PARAM(branch_load_dep_addr_replay_coverage, BRANCH_LOAD_DEP_ADDR_REPLAY_COVE
    branch_load_dep_repl_n) protects them. Independent of branch_load_dep_addr_replay:
    this only tags lines for retention, it does NOT force L1 hits. */
 DEF_PARAM(branch_load_dep_repl_attribution,     BRANCH_LOAD_DEP_REPL_ATTRIBUTION,     Flag,  Flag,  FALSE, )
+/* Measurement-only: classify every on-path demand-load access to a line in the
+   attribution feeder set (br_addr_replay_hit, same trace_dir/coverage knobs) as
+   cold (compulsory: first-ever access to the line), reuse-hit (line resident),
+   or reuse-miss (line was seen before but was evicted -> the retention-reachable
+   slice). Emits DCACHE_FEEDER_ACCESS_{TOTAL,COLD,REUSE_HIT,REUSE_MISS}. Does not
+   alter replacement; run alongside baseline to characterize the feeder stream. */
+DEF_PARAM(branch_load_dep_feeder_access_profile, BRANCH_LOAD_DEP_FEEDER_ACCESS_PROFILE, Flag, Flag, FALSE, )
 /* Displacement counterfactual: instead of the feeder set, force-hit a count-matched
    set of NON-feeder lines drawn at random from the reused-and-evicted pool (lines
    that missed L1 >=2x, recorded as <bench>_<simpt>_nfpool.csv in the record pass).
