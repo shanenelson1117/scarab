@@ -72,6 +72,11 @@ static inline void invalidate_unsure_line(Cache*, uns, Addr);
 
 char rand_repl_state[31];
 
+/* RRIP: SRRIP, BRRIP, DRRIP. Defined at file scope so feeder-priority logic in
+   cache_set_feeds_branch() (above the RRIP policy functions) can reference them. */
+const static uns8 RRIP_M = 2;
+const static uns8 RRIP_DISTANT_VAL = (1 << RRIP_M) - 1;
+
 /**************************************************************************************/
 
 static inline uns cache_index(Cache* cache, Addr addr, Addr* tag, Addr* line_addr) {
@@ -457,6 +462,19 @@ Flag cache_set_feeds_branch(Cache* cache, uns8 proc_id, Addr addr) {
       /* (Re)charge the reprieve budget every time the line is (re)marked as a
          feeder, so a feeder that keeps proving useful stays protected. */
       line->feeder_reprieves_left = BRANCH_LOAD_DEP_REPL_N;
+      /* RRIP-family analogue: give the feeder better incoming priority by
+         lowering its RRPV. Only ever improves priority (never demotes a line
+         already hot from a recent hit). */
+      if (BRANCH_LOAD_DEP_REPL_RRIP &&
+          (cache->repl_policy == REPL_SRRIP ||
+           cache->repl_policy == REPL_BRRIP ||
+           cache->repl_policy == REPL_DRRIP)) {
+        uns8 rrpv = MIN2(BRANCH_LOAD_DEP_REPL_RRIP_RRPV, RRIP_DISTANT_VAL - 1);
+        if (line->reference_val > rrpv) {
+          line->reference_val = rrpv;
+          STAT_EVENT(proc_id, DCACHE_FEEDER_RRIP_PROMOTED);
+        }
+      }
       return TRUE;
     }
   }
@@ -1677,9 +1695,7 @@ Cache_Entry* nru_update_evict(Cache* cache, uns8 proc_id, uns set, uns* way, voi
 }
 
 /**************************************************************************************/
-/* RRIP: SRRIP, BRRIP, DRRIP */
-const static uns8 RRIP_M = 2;
-const static uns8 RRIP_DISTANT_VAL = (1 << RRIP_M) - 1;
+/* RRIP: SRRIP, BRRIP, DRRIP (RRIP_M / RRIP_DISTANT_VAL defined at file top). */
 
 /**************************************************************************************/
 /* SRRIP */

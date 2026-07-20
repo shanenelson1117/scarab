@@ -276,6 +276,15 @@ DEF_PARAM(branch_load_dep_repl, BRANCH_LOAD_DEP_REPL, Flag, Flag, FALSE, )
    hit on the feeder line refills the budget back to N. 0 disables the counter
    scheme (falls back to the BRANCH_LOAD_DEP_REPL_THRESHOLD age-ratio policy). */
 DEF_PARAM(branch_load_dep_repl_n, BRANCH_LOAD_DEP_REPL_N, uns, uns, 0, )
+/* RRIP-family analogue of the LRU reprieve scheme: when a D-cache line is
+   (re)marked as a branch feeder and the cache uses SRRIP/BRRIP/DRRIP, install it
+   at reference_val = BRANCH_LOAD_DEP_REPL_RRIP_RRPV instead of the default RRIP
+   insertion value, giving feeders longer residency. Independent of
+   BRANCH_LOAD_DEP_REPL / _repl_n (those only affect LRU). */
+DEF_PARAM(branch_load_dep_repl_rrip,      BRANCH_LOAD_DEP_REPL_RRIP,      Flag, Flag, FALSE, )
+/* RRPV to give feeders on (re)mark; 0 = strongest (like a fresh hit). Clamped to
+   [0, RRIP_DISTANT_VAL-1] so a feeder is never inserted as immediately evictable. */
+DEF_PARAM(branch_load_dep_repl_rrip_rrpv, BRANCH_LOAD_DEP_REPL_RRIP_RRPV, uns,  uns,  0,     )
 DEF_PARAM(branch_load_dep_prefetch, BRANCH_LOAD_DEP_PREFETCH, Flag, Flag, FALSE, )
 DEF_PARAM(branch_load_dep_zero_latency, BRANCH_LOAD_DEP_ZERO_LATENCY, Flag, Flag, FALSE, )
 /* On a D-cache miss, complete a feeder load at DCACHE_CYCLES (as if it hit) while
