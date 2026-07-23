@@ -51,6 +51,8 @@
 #include "frontend/frontend.h"
 #include "memory/memory.h"
 
+#include "br_exec_wait.h"
+
 #include "decoupled_frontend.h"
 #include "exec_ports.h"
 #include "ft.h"
@@ -571,6 +573,9 @@ void node_retire() {
 
     ASSERTM(node->proc_id, op->op_num == node->ret_op, "op_num=%s  ret_op=%s\n", unsstr64(op->op_num),
             unsstr64(node->ret_op));
+
+    /* Seqnum-driven branch-delay-load replay prefetcher (no-op unless enabled). */
+    br_pf_replay_on_retire(op->proc_id, op->op_num);
 
     if (op->eom) {
       /* We need to retire sys calls, bar fetch instructions, and the last instruction.

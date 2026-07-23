@@ -55,6 +55,11 @@ extern "C" {
 }
 
 #include "cmp_model.h"
+#include "dcache_stage.h"
+#include "libs/cache_lib.h"
+#include "memory/mem_req.h"
+#include "memory/memory.h"
+#include "model.h"
 
 /* Cycle when this branch would complete exec (and retire for CF) if it had no
  * operand dependencies: one cycle after ROB issue to reach the RS, then branch
@@ -420,10 +425,11 @@ static void br_nfpool_path(char* out, size_t sz) {
   snprintf(out, sz, "%s/%s_%s_nfpool.csv", dir, bench, simpt);
 }
 
-/* Generic <trace_dir>/<bench>_<simpt>_<suffix>.csv derivation (same scheme as
- * br_braddr_path / br_nfpool_path) for additional per-simpoint output files. */
-static void br_trace_suffix_path(char* out, size_t sz, const char* suffix) {
-  const char* dir = BRANCH_LOAD_DEP_TRACE_DIR;
+/* Generic <dir>/<bench>_<simpt>_<suffix>.csv derivation (same scheme as
+ * br_braddr_path / br_nfpool_path) for additional per-simpoint files. The
+ * directory is a parameter so record (trace dir) and replay (pf/coverage dirs)
+ * can point at different locations. */
+static void br_trace_suffix_path(char* out, size_t sz, const char* dir, const char* suffix) {
   const char* trace = CBP_TRACE_R0;
   if (!trace || !*trace) {
     snprintf(out, sz, "%s/branch_delay_%s.csv", dir, suffix);
@@ -548,7 +554,7 @@ void br_exec_wait_finish(void) {
    * (seqnum, line) sorted ascending by seqnum so a replay run advances a single
    * cursor. seqnum = on-path retire-order op_num; line = block-aligned address. */
   char pfpath[MAX_STR_LENGTH + 1];
-  br_trace_suffix_path(pfpath, sizeof(pfpath), "pf");
+  br_trace_suffix_path(pfpath, sizeof(pfpath), BRANCH_LOAD_DEP_TRACE_DIR, "pf");
   FILE* pfp = fopen(pfpath, "w");
   if (pfp) {
     std::sort(g_pf_rows.begin(), g_pf_rows.end(),
@@ -716,6 +722,136 @@ void feeder_access_profile_note(uns8 proc_id, Addr line_addr, Flag hit) {
       STAT_EVENT(proc_id, DCACHE_FEEDER_ACCESS_COLD);
     else
       STAT_EVENT(proc_id, DCACHE_FEEDER_ACCESS_REUSE_MISS);
+  }
+}
+
+/* ================= seqnum-driven replay prefetcher ==================== *
+ * Reads <bench>_<simpt>_pf.csv (seqnum,line) and, on each retired op, issues
+ * MRT_DPRF prefetches for recorded lines whose seqnum is within
+ * BRANCH_LOAD_DEP_PF_LOOKAHEAD of the current retire pointer. Coverage gating
+ * (optional) comes from a separately-located braddr.csv line-set.
+ * ===================================================================== */
+
+static Flag g_pf_replay_loaded = FALSE;
+static std::vector<std::pair<Counter, Addr>> g_pf_replay_rows;  // (seqnum, line), sorted asc
+static size_t g_pf_replay_cursor = 0;
+static std::unordered_set<Addr> g_pf_cov_set;  // coverage line-set
+static Flag g_pf_cov_gated = FALSE;            // gate prefetches by g_pf_cov_set
+
+static void br_pf_replay_load(void) {
+  g_pf_replay_loaded = TRUE;
+  char path[MAX_STR_LENGTH + 1];
+  br_trace_suffix_path(path, sizeof(path), BRANCH_LOAD_DEP_PF_DIR, "pf");
+  FILE* f = fopen(path, "r");
+  if (!f) {
+    fprintf(stderr, "br_pf_replay: cannot open %s\n", path);
+    return;
+  }
+  char buf[256];
+  while (fgets(buf, sizeof(buf), f)) {
+    if (buf[0] == '#' || buf[0] == '\n')
+      continue;
+    unsigned long long seq = 0, line = 0;
+    if (sscanf(buf, "%llu,0x%llx", &seq, &line) == 2)  // skips the seqnum,line header
+      g_pf_replay_rows.push_back({(Counter)seq, (Addr)line});
+  }
+  fclose(f);
+  std::sort(g_pf_replay_rows.begin(), g_pf_replay_rows.end(),
+            [](const std::pair<Counter, Addr>& a, const std::pair<Counter, Addr>& b) {
+              return a.first < b.first;
+            });
+  fprintf(stderr, "br_pf_replay: loaded %zu prefetch triggers from %s\n", g_pf_replay_rows.size(), path);
+}
+
+/* Coverage line-set: smallest prefix of braddr.csv (sorted desc by cycles)
+ * covering BRANCH_LOAD_DEP_PF_COVERAGE of recorded stall cycles. 1.0 = no gate. */
+static void br_pf_cov_load(void) {
+  double cov = (double)BRANCH_LOAD_DEP_PF_COVERAGE;
+  if (cov >= 1.0)
+    return;  // keep all lines -> g_pf_cov_gated stays FALSE
+  char path[MAX_STR_LENGTH + 1];
+  br_trace_suffix_path(path, sizeof(path), BRANCH_LOAD_DEP_PF_COVERAGE_DIR, "braddr");
+  FILE* f = fopen(path, "r");
+  if (!f) {
+    fprintf(stderr, "br_pf_cov: cannot open %s (coverage gating disabled)\n", path);
+    return;
+  }
+  Counter total = 0;
+  std::vector<std::pair<Addr, Counter>> lines;
+  char buf[256];
+  while (fgets(buf, sizeof(buf), f)) {
+    if (buf[0] == '#' || buf[0] == '\n')
+      continue;
+    unsigned long long line = 0, cyc = 0;
+    if (sscanf(buf, "0x%llx,%llu", &line, &cyc) == 2) {
+      lines.push_back({(Addr)line, (Counter)cyc});
+      total += cyc;
+    }
+  }
+  fclose(f);
+  g_pf_cov_gated = TRUE;
+  Counter target = (Counter)(cov * (double)total);
+  Counter acc = 0;
+  for (auto& kv : lines) {  // braddr.csv is written sorted desc by cycles
+    g_pf_cov_set.insert(kv.first);
+    acc += kv.second;
+    if (acc >= target)
+      break;
+  }
+  fprintf(stderr, "br_pf_cov: %zu lines cover %.0f%% of %llu cycles\n", g_pf_cov_set.size(), 100.0 * cov,
+          (unsigned long long)total);
+}
+
+static void br_pf_issue(uns8 proc_id, Addr line_addr) {
+  if (model->mem != MODEL_MEM)
+    return;
+  if (BRANCH_LOAD_DEP_PF_LEVEL == 0) {
+    /* L1D: skip if already resident. */
+    Cache* dcache = &cmp_model.dcache_stage[proc_id].dcache;
+    Addr la;
+    if (cache_access(dcache, line_addr, &la, FALSE)) {
+      STAT_EVENT(proc_id, BLD_PF_ALREADY_PRESENT);
+      return;
+    }
+    if (new_mem_req(MRT_DPRF, proc_id, line_addr, DCACHE_LINE_SIZE, 0, NULL, dcache_fill_line, 0, NULL))
+      STAT_EVENT(proc_id, BLD_PF_ISSUED);
+    else
+      STAT_EVENT(proc_id, BLD_PF_DROPPED_BUFFER);
+    return;
+  }
+  Pref_Req_Info info;
+  memset(&info, 0, sizeof(info));
+  uns size;
+  if (BRANCH_LOAD_DEP_PF_LEVEL == 1) {
+    info.dest = DEST_MLC;
+    size = MLC_LINE_SIZE;
+  } else {
+    info.dest = DEST_L1;
+    size = L1_LINE_SIZE;
+  }
+  if (new_mem_req(MRT_DPRF, proc_id, line_addr, size, 0, NULL, NULL, 0, &info))
+    STAT_EVENT(proc_id, BLD_PF_ISSUED);
+  else
+    STAT_EVENT(proc_id, BLD_PF_DROPPED_BUFFER);
+}
+
+/* Retire hook: R = op_num of the op just retired (the monotonic retire pointer).
+ * Fire every not-yet-issued trigger whose seqnum <= R + W. */
+void br_pf_replay_on_retire(uns8 proc_id, Counter op_num) {
+  if (!BRANCH_LOAD_DEP_PF_REPLAY)
+    return;
+  if (!g_pf_replay_loaded) {
+    br_pf_replay_load();
+    br_pf_cov_load();
+  }
+  Counter horizon = op_num + (Counter)BRANCH_LOAD_DEP_PF_LOOKAHEAD;
+  while (g_pf_replay_cursor < g_pf_replay_rows.size() && g_pf_replay_rows[g_pf_replay_cursor].first <= horizon) {
+    Addr line = g_pf_replay_rows[g_pf_replay_cursor].second;
+    if (!g_pf_cov_gated || g_pf_cov_set.count(line))
+      br_pf_issue(proc_id, line);
+    else
+      STAT_EVENT(proc_id, BLD_PF_SKIPPED_COVERAGE);
+    g_pf_replay_cursor++;
   }
 }
 

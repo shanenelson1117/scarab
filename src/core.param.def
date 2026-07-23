@@ -358,6 +358,28 @@ DEF_PARAM(branch_load_dep_reuse_study, BRANCH_LOAD_DEP_REUSE_STUDY, Flag, Flag, 
 /* Max distinct lines tracked per shadow stack; reuses of lines aged past this
    are counted in a >cap overflow bucket. Bounds analyzer memory. */
 DEF_PARAM(branch_load_dep_reuse_cap, BRANCH_LOAD_DEP_REUSE_CAP, uns, uns, 1048576, )
+
+/* Seqnum-driven replay prefetcher. Reads the per-instance <bench>_<simpt>_pf.csv
+   (seqnum,line) recorded by branch_load_dep_attribute_record and, during a normal
+   timing run, issues an MRT_DPRF prefetch for each recorded line when the retire
+   pointer (op_num) is within branch_load_dep_pf_lookahead of that instance's
+   seqnum. Coverage is applied separately from the pf stream: the braddr.csv
+   line-set (its own dir + coverage fraction) gates which lines are prefetched. */
+DEF_PARAM(branch_load_dep_pf_replay,       BRANCH_LOAD_DEP_PF_REPLAY,       Flag,  Flag,   FALSE, )
+/* Directory holding <bench>_<simpt>_pf.csv (the seqnum,line trigger stream). */
+DEF_PARAM(branch_load_dep_pf_dir,          BRANCH_LOAD_DEP_PF_DIR,          char*, string, ".",   )
+/* Directory holding <bench>_<simpt>_braddr.csv (the coverage line-set). Separate
+   from pf_dir so the trigger stream and the coverage set can live apart. */
+DEF_PARAM(branch_load_dep_pf_coverage_dir, BRANCH_LOAD_DEP_PF_COVERAGE_DIR, char*, string, ".",   )
+/* Fraction of recorded braddr stall cycles to keep as the prefetchable line-set;
+   1.0 = keep all lines = no coverage gating. */
+DEF_PARAM(branch_load_dep_pf_coverage,     BRANCH_LOAD_DEP_PF_COVERAGE,     float, float,  1.0,   )
+/* Lookahead W, in retire-order op_num units: prefetch fires when the retire
+   pointer R satisfies seqnum <= R + W. Absolute (does not scale with ROB size). */
+DEF_PARAM(branch_load_dep_pf_lookahead,    BRANCH_LOAD_DEP_PF_LOOKAHEAD,    uns,   uns,    0,     )
+/* Cache level the prefetch fills into: 0 = L1D (dcache), 1 = L2 (MLC), 2 = LLC (L1). */
+DEF_PARAM(branch_load_dep_pf_level,        BRANCH_LOAD_DEP_PF_LEVEL,        uns,   uns,    0,     )
+
 DEF_PARAM(dcache_hit_one_cycle, DCACHE_HIT_ONE_CYCLE, Flag, Flag, FALSE, )
 DEF_PARAM(cbp_trace_r0, CBP_TRACE_R0, char*, string, NULL, )
 DEF_PARAM(cbp_trace_r1, CBP_TRACE_R1, char*, string, NULL, )
