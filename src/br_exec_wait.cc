@@ -46,7 +46,12 @@ extern "C" {
 #include "globals/global_vars.h"
 #include "globals/utils.h"
 #include "inst_info.h"
+#include "libs/cache_lib.h"
+#include "memory/mem_req.h"
+#include "memory/memory.h"
 #include "memory/memory.param.h"
+#include "model.h"
+#include "dcache_stage.h"
 #include "op.h"
 #include "op_info.h"
 #include "op_pool.h"
@@ -55,11 +60,6 @@ extern "C" {
 }
 
 #include "cmp_model.h"
-#include "dcache_stage.h"
-#include "libs/cache_lib.h"
-#include "memory/mem_req.h"
-#include "memory/memory.h"
-#include "model.h"
 
 /* Cycle when this branch would complete exec (and retire for CF) if it had no
  * operand dependencies: one cycle after ROB issue to reach the RS, then branch
