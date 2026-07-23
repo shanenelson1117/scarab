@@ -301,6 +301,15 @@ static Counter g_cold_total = 0;
  * load miss; lets us tell a compulsory (cold) miss from a repeat (warm) one. */
 static std::unordered_map<Addr, Counter> g_line_miss_count;
 
+/* Per-dynamic-instance prefetch triggers for the seqnum-driven prefetcher: one
+ * (seqnum, line) per delaying-load instance. seqnum is the load's on-path
+ * retire-order op_num; an off-path window-clog load has no stable op_num, so it
+ * anchors to the on-path branch's op_num. Deduped on unique_num (globally unique
+ * across recovery, unlike op_num) so a load charged over many stall cycles is
+ * written once. Flushed sorted by seqnum to <bench>_<simpt>_pf.csv. */
+static std::vector<std::pair<Counter, Addr>> g_pf_rows;
+static std::unordered_set<Counter> g_pf_seen;
+
 void br_note_load_miss(Addr line_addr) {
   g_line_miss_count[br_line_of(line_addr)]++;
 }
@@ -321,12 +330,25 @@ static void br_charge_line(std::unordered_map<Addr, std::unordered_map<Addr, BrL
   }
 }
 
+/* Emit one prefetch trigger per dynamic delaying-load instance. Deduped on
+ * unique_num so a load charged over many stall cycles is written once. On-path
+ * loads record their own op_num; an off-path window-clog load has no stable
+ * op_num, so it anchors to the on-path branch (the consumer we are helping). */
+static void br_pf_emit(Op* m, Op* branch_op) {
+  if (!g_pf_seen.insert(m->unique_num).second)
+    return;
+  Counter seqnum = m->off_path ? branch_op->op_num : m->op_num;
+  g_pf_rows.push_back({seqnum, br_line_of(m->oracle_info.va)});
+}
+
 static void br_record_delay_load(uns8 proc_id, Op* branch_op, Counter now) {
   Op* m = br_find_cone_critical_miss(branch_op, now);
   if (m) {
     br_charge_line(g_anc, m, &g_anc_total);
+    br_pf_emit(m, branch_op);
   } else if ((m = br_find_window_clog_miss(proc_id)) != nullptr) {
     br_charge_line(g_clog, m, &g_clog_total);
+    br_pf_emit(m, branch_op);
   } else {
     g_none_total++;
   }
@@ -396,6 +418,39 @@ static void br_nfpool_path(char* out, size_t sz) {
   const char* bench_slash = strrchr(tmp, '/');
   const char* bench = bench_slash ? bench_slash + 1 : tmp;
   snprintf(out, sz, "%s/%s_%s_nfpool.csv", dir, bench, simpt);
+}
+
+/* Generic <trace_dir>/<bench>_<simpt>_<suffix>.csv derivation (same scheme as
+ * br_braddr_path / br_nfpool_path) for additional per-simpoint output files. */
+static void br_trace_suffix_path(char* out, size_t sz, const char* suffix) {
+  const char* dir = BRANCH_LOAD_DEP_TRACE_DIR;
+  const char* trace = CBP_TRACE_R0;
+  if (!trace || !*trace) {
+    snprintf(out, sz, "%s/branch_delay_%s.csv", dir, suffix);
+    return;
+  }
+  char tmp[MAX_STR_LENGTH + 1];
+  strncpy(tmp, trace, sizeof(tmp) - 1);
+  tmp[sizeof(tmp) - 1] = '\0';
+  char* slash = strrchr(tmp, '/');
+  const char* filename = slash ? slash + 1 : tmp;
+  char simpt[64];
+  const char* dot = strchr(filename, '.');
+  size_t n = dot ? (size_t)(dot - filename) : strlen(filename);
+  if (n > sizeof(simpt) - 1)
+    n = sizeof(simpt) - 1;
+  strncpy(simpt, filename, n);
+  simpt[n] = '\0';
+  if (slash)
+    *slash = '\0';
+  for (int lvl = 0; lvl < 2; lvl++) {
+    char* p = strrchr(tmp, '/');
+    if (p)
+      *p = '\0';
+  }
+  const char* bench_slash = strrchr(tmp, '/');
+  const char* bench = bench_slash ? bench_slash + 1 : tmp;
+  snprintf(out, sz, "%s/%s_%s_%s.csv", dir, bench, simpt, suffix);
 }
 
 void br_exec_wait_finish(void) {
@@ -487,6 +542,26 @@ void br_exec_wait_finish(void) {
       fprintf(nf, "0x%llx,%llu\n", (unsigned long long)pool[i].first,
               (unsigned long long)pool[i].second);
     fclose(nf);
+  }
+
+  /* Per-instance prefetch trigger stream for the seqnum-driven prefetcher:
+   * (seqnum, line) sorted ascending by seqnum so a replay run advances a single
+   * cursor. seqnum = on-path retire-order op_num; line = block-aligned address. */
+  char pfpath[MAX_STR_LENGTH + 1];
+  br_trace_suffix_path(pfpath, sizeof(pfpath), "pf");
+  FILE* pfp = fopen(pfpath, "w");
+  if (pfp) {
+    std::sort(g_pf_rows.begin(), g_pf_rows.end(),
+              [](const std::pair<Counter, Addr>& a, const std::pair<Counter, Addr>& b) {
+                return a.first < b.first;
+              });
+    fprintf(pfp, "# per-instance branch-delay prefetch triggers, sorted by seqnum\n");
+    fprintf(pfp, "# rows=%zu\n", g_pf_rows.size());
+    fprintf(pfp, "seqnum,line\n");
+    for (auto& r : g_pf_rows)
+      fprintf(pfp, "%llu,0x%llx\n", (unsigned long long)r.first,
+              (unsigned long long)r.second);
+    fclose(pfp);
   }
 }
 
