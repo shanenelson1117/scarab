@@ -737,6 +737,7 @@ static std::vector<std::pair<Counter, Addr>> g_pf_replay_rows;  // (seqnum, line
 static size_t g_pf_replay_cursor = 0;
 static std::unordered_set<Addr> g_pf_cov_set;  // coverage line-set
 static Flag g_pf_cov_gated = FALSE;            // gate prefetches by g_pf_cov_set
+static std::unordered_set<Addr> g_pf_line_set; // all distinct pf.csv lines (for feeder marking)
 
 static void br_pf_replay_load(void) {
   g_pf_replay_loaded = TRUE;
@@ -752,8 +753,10 @@ static void br_pf_replay_load(void) {
     if (buf[0] == '#' || buf[0] == '\n')
       continue;
     unsigned long long seq = 0, line = 0;
-    if (sscanf(buf, "%llu,0x%llx", &seq, &line) == 2)  // skips the seqnum,line header
+    if (sscanf(buf, "%llu,0x%llx", &seq, &line) == 2) {  // skips the seqnum,line header
       g_pf_replay_rows.push_back({(Counter)seq, (Addr)line});
+      g_pf_line_set.insert((Addr)line);
+    }
   }
   fclose(f);
   std::sort(g_pf_replay_rows.begin(), g_pf_replay_rows.end(),
@@ -853,6 +856,23 @@ void br_pf_replay_on_retire(uns8 proc_id, Counter op_num) {
       STAT_EVENT(proc_id, BLD_PF_SKIPPED_COVERAGE);
     g_pf_replay_cursor++;
   }
+}
+
+/* True if a fill of line_addr should mark the line as a branch feeder: marking is
+ * enabled and the line is one the prefetcher targets (exactly the lines it issues
+ * prefetches for -- the coverage set when gated, else all pf.csv lines). The fill
+ * site calls cache_set_feeds_branch on the appropriate cache. */
+Flag br_pf_should_mark(Addr line_addr) {
+  if (!BRANCH_LOAD_DEP_PF_MARK_FEEDER)
+    return FALSE;
+  if (!g_pf_replay_loaded) {
+    br_pf_replay_load();
+    br_pf_cov_load();
+  }
+  Addr line = br_line_of(line_addr);
+  if (g_pf_cov_gated)
+    return g_pf_cov_set.count(line) ? TRUE : FALSE;
+  return g_pf_line_set.count(line) ? TRUE : FALSE;
 }
 
 void br_exec_wait_cycle(uns8 proc_id, Counter cycle_count) {

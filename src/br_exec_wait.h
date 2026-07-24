@@ -65,6 +65,11 @@ Flag br_addr_replay_hit(Addr line_addr);
  * within BRANCH_LOAD_DEP_PF_LOOKAHEAD of that pointer. No-op unless enabled. */
 void br_pf_replay_on_retire(uns8 proc_id, Counter op_num);
 
+/* True if a prefetch fill of this line should mark it as a branch feeder (marking
+ * enabled and the line is a prefetch target). The caller then calls
+ * cache_set_feeds_branch on the L1D or MLC cache per branch_load_dep_pf_repl_level. */
+Flag br_pf_should_mark(Addr line_addr);
+
 /* Feeder-access stream profiler (branch_load_dep_feeder_access_profile). Call on
    every on-path demand-load access to a data cacheline; hit=TRUE for an L1D hit,
    FALSE for a miss. Only accesses to lines in the attribution feeder set are

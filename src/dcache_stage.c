@@ -867,6 +867,12 @@ static inline void dcache_fill_process_cacheline(Mem_Req* req, Dcache_Data* data
   if (req->type == MRT_DPRF) {  // cmp FIXME
     data->HW_prefetch = TRUE;
     data->HW_prefetched = TRUE;
+    /* BLD replay prefetcher: mark this line as a branch feeder in the L1D so the
+       feeder-aware replacement policy retains it (branch_load_dep_pf_mark_feeder,
+       repl_level 0). */
+    if (BRANCH_LOAD_DEP_PF_REPL_LEVEL == 0 && br_pf_should_mark(req->addr) &&
+        cache_set_feeds_branch(&dc->dcache, req->proc_id, req->addr))
+      STAT_EVENT(req->proc_id, BLD_PF_FEEDER_MARKED_L1);
   } else {
     data->HW_prefetch = FALSE;
     data->HW_prefetched = FALSE;

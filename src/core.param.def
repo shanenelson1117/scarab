@@ -379,6 +379,14 @@ DEF_PARAM(branch_load_dep_pf_coverage,     BRANCH_LOAD_DEP_PF_COVERAGE,     floa
 DEF_PARAM(branch_load_dep_pf_lookahead,    BRANCH_LOAD_DEP_PF_LOOKAHEAD,    uns,   uns,    0,     )
 /* Cache level the prefetch fills into: 0 = L1D (dcache), 1 = L2 (MLC), 2 = LLC (L1). */
 DEF_PARAM(branch_load_dep_pf_level,        BRANCH_LOAD_DEP_PF_LEVEL,        uns,   uns,    0,     )
+/* When set, a prefetch of a target line marks that line as a branch feeder on fill,
+   so the feeder-aware replacement policy (branch_load_dep_repl* / repl_rrip) retains
+   it without waiting for a demand hit. */
+DEF_PARAM(branch_load_dep_pf_mark_feeder,  BRANCH_LOAD_DEP_PF_MARK_FEEDER,  Flag,  Flag,   FALSE, )
+/* Which cache the prefetch marks/protects feeders in: 0 = L1D (dcache), 1 = L2 (MLC).
+   The corresponding cache's repl policy must be feeder-aware (dcache_repl /
+   mlc_cache_repl_policy + branch_load_dep_repl* knobs). */
+DEF_PARAM(branch_load_dep_pf_repl_level,    BRANCH_LOAD_DEP_PF_REPL_LEVEL,   uns,   uns,    0,     )
 
 DEF_PARAM(dcache_hit_one_cycle, DCACHE_HIT_ONE_CYCLE, Flag, Flag, FALSE, )
 DEF_PARAM(cbp_trace_r0, CBP_TRACE_R0, char*, string, NULL, )

@@ -48,6 +48,7 @@
 #include "prefetcher/pref.param.h"
 
 #include "bp/bp.h"
+#include "br_exec_wait.h"
 #include "dvfs/perf_pred.h"
 #include "prefetcher//pref_stream.h"
 #include "prefetcher/fdip.h"
@@ -4303,6 +4304,13 @@ Flag mlc_fill_line(Mem_Req* req) {
   /* Immediately set proc_id after cache_insert to avoid stale data issues.
      The data area still contains values from the evicted line until we update them. */
   data->proc_id = req->proc_id;
+
+  /* BLD replay prefetcher: mark this line as a branch feeder in the L2/MLC so the
+     feeder-aware MLC replacement policy retains it (branch_load_dep_pf_mark_feeder,
+     repl_level 1). */
+  if (req->type == MRT_DPRF && BRANCH_LOAD_DEP_PF_REPL_LEVEL == 1 && br_pf_should_mark(req->addr) &&
+      cache_set_feeds_branch(&MLC(req->proc_id)->cache, req->proc_id, req->addr))
+    STAT_EVENT(req->proc_id, BLD_PF_FEEDER_MARKED_L2);
 
   if (req->type == MRT_WB_NODIRTY || req->type == MRT_WB) {
     STAT_EVENT(req->proc_id, MLC_WB_FILL);
