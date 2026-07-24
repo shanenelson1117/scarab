@@ -387,6 +387,13 @@ DEF_PARAM(branch_load_dep_pf_mark_feeder,  BRANCH_LOAD_DEP_PF_MARK_FEEDER,  Flag
    The corresponding cache's repl policy must be feeder-aware (dcache_repl /
    mlc_cache_repl_policy + branch_load_dep_repl* knobs). */
 DEF_PARAM(branch_load_dep_pf_repl_level,    BRANCH_LOAD_DEP_PF_REPL_LEVEL,   uns,   uns,    0,     )
+/* Models an unreliable prefetcher: even though it sees the whole pf.csv/coverage
+   set, each prefetch opportunity (per instance) is actually issued only with this
+   probability (0..1); with prob 1-rate it is dropped (not issued, not marked).
+   1.0 = perfect. Isolates whether feeder retention rescues the dropped attempts on
+   recurring lines. Deterministic per run via branch_load_dep_pf_success_seed. */
+DEF_PARAM(branch_load_dep_pf_success_rate, BRANCH_LOAD_DEP_PF_SUCCESS_RATE, float, float, 1.0, )
+DEF_PARAM(branch_load_dep_pf_success_seed, BRANCH_LOAD_DEP_PF_SUCCESS_SEED, uns,   uns,   1,   )
 
 DEF_PARAM(dcache_hit_one_cycle, DCACHE_HIT_ONE_CYCLE, Flag, Flag, FALSE, )
 DEF_PARAM(cbp_trace_r0, CBP_TRACE_R0, char*, string, NULL, )

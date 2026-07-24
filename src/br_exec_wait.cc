@@ -738,6 +738,12 @@ static size_t g_pf_replay_cursor = 0;
 static std::unordered_set<Addr> g_pf_cov_set;  // coverage line-set
 static Flag g_pf_cov_gated = FALSE;            // gate prefetches by g_pf_cov_set
 static std::unordered_set<Addr> g_pf_line_set; // all distinct pf.csv lines (for feeder marking)
+static uint64_t g_pf_rng = 0;                  // RNG state for the unreliable-prefetch model
+
+/* Uniform [0,1) draw from the seeded per-run RNG (br_splitmix64). */
+static double br_pf_rand_unit(void) {
+  return (double)(br_splitmix64(&g_pf_rng) >> 11) * (1.0 / 9007199254740992.0);
+}
 
 static void br_pf_replay_load(void) {
   g_pf_replay_loaded = TRUE;
@@ -846,14 +852,24 @@ void br_pf_replay_on_retire(uns8 proc_id, Counter op_num) {
   if (!g_pf_replay_loaded) {
     br_pf_replay_load();
     br_pf_cov_load();
+    /* Seed the unreliable-prefetch RNG deterministically for reproducibility. */
+    g_pf_rng = (uint64_t)BRANCH_LOAD_DEP_PF_SUCCESS_SEED * 0x9E3779B97F4A7C15ULL + 1;
   }
+  double rate = (double)BRANCH_LOAD_DEP_PF_SUCCESS_RATE;
   Counter horizon = op_num + (Counter)BRANCH_LOAD_DEP_PF_LOOKAHEAD;
   while (g_pf_replay_cursor < g_pf_replay_rows.size() && g_pf_replay_rows[g_pf_replay_cursor].first <= horizon) {
     Addr line = g_pf_replay_rows[g_pf_replay_cursor].second;
-    if (!g_pf_cov_gated || g_pf_cov_set.count(line))
-      br_pf_issue(proc_id, line);
-    else
+    if (!g_pf_cov_gated || g_pf_cov_set.count(line)) {
+      /* Unreliable prefetcher: issue this opportunity only with probability rate;
+         otherwise drop it (not issued, not marked) so retention can be tested as
+         the rescue for the dropped attempts on recurring lines. */
+      if (rate < 1.0 && br_pf_rand_unit() >= rate)
+        STAT_EVENT(proc_id, BLD_PF_SKIPPED_UNRELIABLE);
+      else
+        br_pf_issue(proc_id, line);
+    } else {
       STAT_EVENT(proc_id, BLD_PF_SKIPPED_COVERAGE);
+    }
     g_pf_replay_cursor++;
   }
 }
