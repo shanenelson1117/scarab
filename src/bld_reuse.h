@@ -43,7 +43,7 @@ extern "C" {
 void bld_reuse_init(uns8 num_cores);
 
 /* Register a load PC as branch-delaying. Called from br_exec_wait's attribution
-   (br_charge_line) whenever a stall cycle is charged to a load (category A/B). */
+   (br_record_delay_load) whenever a stall cycle is charged to a load (cat A/B). */
 void bld_reuse_mark_delaying_pc(uns8 proc_id, Addr pc);
 
 /* Note one on-path demand memory access at the dcache stage. Always advances the

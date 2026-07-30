@@ -318,6 +318,13 @@ DEF_PARAM(branch_load_dep_profile, BRANCH_LOAD_DEP_PROFILE, Flag, Flag, FALSE, )
    category B = oldest outstanding load miss clogging the window (ROB head) when
    the cone itself has no miss. Writes branch_delay_loads.csv to the simpoint dir. */
 DEF_PARAM(branch_load_dep_attribute_record, BRANCH_LOAD_DEP_ATTRIBUTE_RECORD, Flag, Flag, FALSE, )
+/* Cap distinct delaying loads marked per dynamic mispredicted-branch instance in
+   the attribute-record CSV/pf stream. 0 = unlimited (pre-change behavior). */
+DEF_PARAM(branch_load_dep_attr_max_loads, BRANCH_LOAD_DEP_ATTR_MAX_LOADS, uns, uns, 0, )
+/* Ranking used to pick the kept loads when the cap bites:
+   0 = total stall cycles charged to the load; 1 = criticality tier
+   (ANCESTOR before WINDOW_CLOG, then deeper cone depth). */
+DEF_PARAM(branch_load_dep_attr_rank, BRANCH_LOAD_DEP_ATTR_RANK, uns, uns, 0, )
 /* Address-based replay: force an L1 hit on any load whose data cacheline is in
    the recorded branch-delay set (from branch_load_dep_attribute_record), taking
    the smallest set of lines covering branch_load_dep_addr_replay_coverage of the

@@ -242,8 +242,9 @@ static Flag br_op_is_load_miss(Op* op) {
 }
 
 /* Walk the branch's not-ready cone; return the deepest outstanding load miss
- * (longest serial tail = the load most responsible for the delay), or NULL. */
-static Op* br_find_cone_critical_miss(Op* branch_op, Counter now) {
+ * (longest serial tail = the load most responsible for the delay), or NULL.
+ * When non-NULL and out_depth is set, reports the chosen miss's cone depth. */
+static Op* br_find_cone_critical_miss(Op* branch_op, Counter now, int* out_depth) {
   std::deque<std::pair<Op*, int>> worklist;
   std::unordered_set<Op*> visited;
   for (uns i = 0; i < branch_op->num_srcs; i++) {
@@ -276,6 +277,8 @@ static Op* br_find_cone_critical_miss(Op* branch_op, Counter now) {
         worklist.push_back({p, depth + 1});
     }
   }
+  if (best && out_depth)
+    *out_depth = best_depth;
   return best;
 }
 
@@ -315,48 +318,154 @@ static std::unordered_map<Addr, Counter> g_line_miss_count;
 static std::vector<std::pair<Counter, Addr>> g_pf_rows;
 static std::unordered_set<Counter> g_pf_seen;
 
+/* Per-current-branch load buffer. The tracked branch advances monotonically in
+ * program order (oldest stalled branch stays oldest until it resolves), so only
+ * one branch's candidate loads are ever live: we accumulate them here and commit
+ * the top-N (per --branch_load_dep_attr_max_loads / _attr_rank) into the global
+ * maps + pf stream when the branch changes or at sim end. */
+struct BrDelayLoad {
+  Addr    pc = 0, line = 0;
+  Counter cycles = 0, cold = 0;  // accumulated over the branch's stall
+  Counter seqnum = 0;            // pf trigger seqnum; captured at first sighting
+  uns     cone_depth = 0;        // deepest cone depth seen (0 = window-clog)
+  uns8    category = 0;          // 0 = ANCESTOR (g_anc), 1 = WINDOW_CLOG (g_clog)
+  uns8    proc_id = 0;
+};
+static Counter g_cur_branch_uid = MAX_CTR;                 // branch unique_num
+static Addr    g_cur_branch_pc = 0;                        // branch PC (stream CSV)
+static Counter g_cur_branch_seqnum = 0;                    // branch op_num (stream order)
+static std::unordered_map<Counter, BrDelayLoad> g_cur_loads;  // key = load unique_num
+static Counter g_capped_total = 0;                         // cycles dropped by the cap
+
+/* One row per committed dynamic branch instance: its kept (top-N) load lines. */
+struct BrStreamRow {
+  Counter branch_seqnum;
+  Addr branch_pc;
+  std::vector<Addr> load_lines;
+};
+static std::vector<BrStreamRow> g_brstream_rows;
+
 void br_note_load_miss(Addr line_addr) {
   g_line_miss_count[br_line_of(line_addr)]++;
 }
 
-static void br_charge_line(std::unordered_map<Addr, std::unordered_map<Addr, BrLineRec>>& cat,
-                           Op* miss_op, Counter* cat_total) {
-  Addr pc = miss_op->inst_info->addr;
-  Addr line = br_line_of(miss_op->oracle_info.va);
-  if (BRANCH_LOAD_DEP_REUSE_STUDY)
-    bld_reuse_mark_delaying_pc(miss_op->proc_id, pc);
-  BrLineRec& r = cat[pc][line];
-  r.cycles++;
-  (*cat_total)++;
-  /* Compulsory if this is the only time the line has ever missed. */
-  if (g_line_miss_count[line] <= 1) {
-    r.cold++;
-    g_cold_total++;
-  }
+/* Fold one committed buffered load's accumulated cycles/cold into a category
+ * map (A = g_anc, B = g_clog) and totals. */
+static void br_fold_delay_load(std::unordered_map<Addr, std::unordered_map<Addr, BrLineRec>>& cat,
+                               const BrDelayLoad& e, Counter* cat_total) {
+  BrLineRec& r = cat[e.pc][e.line];
+  r.cycles += e.cycles;
+  r.cold += e.cold;
+  *cat_total += e.cycles;
+  g_cold_total += e.cold;
 }
 
-/* Emit one prefetch trigger per dynamic delaying-load instance. Deduped on
- * unique_num so a load charged over many stall cycles is written once. On-path
- * loads record their own op_num; an off-path window-clog load has no stable
- * op_num, so it anchors to the on-path branch (the consumer we are helping). */
-static void br_pf_emit(Op* m, Op* branch_op) {
-  if (!g_pf_seen.insert(m->unique_num).second)
+/* Emit one prefetch trigger per committed delaying-load instance, deduped on the
+ * load's unique_num (globally unique across recovery) so a load kept for a branch
+ * is written once even if a later branch also keeps it. */
+static void br_pf_emit(Counter load_uid, Counter seqnum, Addr line) {
+  if (!g_pf_seen.insert(load_uid).second)
     return;
-  Counter seqnum = m->off_path ? branch_op->op_num : m->op_num;
-  g_pf_rows.push_back({seqnum, br_line_of(m->oracle_info.va)});
+  g_pf_rows.push_back({seqnum, line});
+}
+
+/* Commit the current branch's buffered loads: rank by importance, keep the
+ * top-N (BRANCH_LOAD_DEP_ATTR_MAX_LOADS; 0 = keep all), fold the kept loads into
+ * the global maps + pf stream and record the branch->load stream row; push the
+ * dropped loads' cycles into g_none_total (and g_capped_total) so the per-cycle
+ * total is preserved. */
+static void br_commit_current_branch(void) {
+  if (g_cur_loads.empty())
+    return;
+
+  std::vector<std::pair<Counter, BrDelayLoad>> v;  // (load unique_num, entry)
+  v.reserve(g_cur_loads.size());
+  for (auto& kv : g_cur_loads)
+    v.push_back({kv.first, kv.second});
+
+  const uns rank = BRANCH_LOAD_DEP_ATTR_RANK;
+  std::sort(v.begin(), v.end(),
+            [rank](const std::pair<Counter, BrDelayLoad>& a,
+                   const std::pair<Counter, BrDelayLoad>& b) {
+              const BrDelayLoad& x = a.second;
+              const BrDelayLoad& y = b.second;
+              if (rank == 1) {  // criticality tier
+                if (x.category != y.category) return x.category < y.category;  // ANCESTOR first
+                if (x.cone_depth != y.cone_depth) return x.cone_depth > y.cone_depth;
+                if (x.cycles != y.cycles) return x.cycles > y.cycles;
+              } else {  // total stall cycles
+                if (x.cycles != y.cycles) return x.cycles > y.cycles;
+                if (x.category != y.category) return x.category < y.category;
+              }
+              return a.first < b.first;  // deterministic tie-break on load uid
+            });
+
+  const uns cap = BRANCH_LOAD_DEP_ATTR_MAX_LOADS;
+  const size_t keep = (cap == 0) ? v.size() : std::min((size_t)cap, v.size());
+
+  BrStreamRow row;
+  row.branch_seqnum = g_cur_branch_seqnum;
+  row.branch_pc = g_cur_branch_pc;
+  for (size_t i = 0; i < v.size(); i++) {
+    const Counter load_uid = v[i].first;
+    const BrDelayLoad& e = v[i].second;
+    if (i < keep) {
+      br_fold_delay_load(e.category ? g_clog : g_anc, e,
+                         e.category ? &g_clog_total : &g_anc_total);
+      br_pf_emit(load_uid, e.seqnum, e.line);
+      row.load_lines.push_back(e.line);
+    } else {
+      g_none_total += e.cycles;
+      g_capped_total += e.cycles;
+    }
+  }
+  if (!row.load_lines.empty())
+    g_brstream_rows.push_back(std::move(row));
 }
 
 static void br_record_delay_load(uns8 proc_id, Op* branch_op, Counter now) {
-  Op* m = br_find_cone_critical_miss(branch_op, now);
+  /* Tracked branch advanced -> commit the previous branch and start fresh. */
+  if (branch_op->unique_num != g_cur_branch_uid) {
+    br_commit_current_branch();
+    g_cur_loads.clear();
+    g_cur_branch_uid = branch_op->unique_num;
+    g_cur_branch_pc = branch_op->inst_info->addr;
+    g_cur_branch_seqnum = branch_op->op_num;
+  }
+
+  int cone_depth = 0;
+  uns8 category;
+  Op* m = br_find_cone_critical_miss(branch_op, now, &cone_depth);
   if (m) {
-    br_charge_line(g_anc, m, &g_anc_total);
-    br_pf_emit(m, branch_op);
+    category = 0;  // ANCESTOR
   } else if ((m = br_find_window_clog_miss(proc_id)) != nullptr) {
-    br_charge_line(g_clog, m, &g_clog_total);
-    br_pf_emit(m, branch_op);
+    category = 1;  // WINDOW_CLOG
+    cone_depth = 0;
   } else {
     g_none_total++;
+    return;
   }
+
+  Addr pc = m->inst_info->addr;
+  Addr line = br_line_of(m->oracle_info.va);
+  /* Reuse study marks every charged cycle, independent of the top-N cap. */
+  if (BRANCH_LOAD_DEP_REUSE_STUDY)
+    bld_reuse_mark_delaying_pc(proc_id, pc);
+
+  BrDelayLoad& e = g_cur_loads[m->unique_num];
+  if (e.cycles == 0) {  // first sighting this branch
+    e.pc = pc;
+    e.line = line;
+    e.category = category;
+    e.proc_id = proc_id;
+    e.seqnum = m->off_path ? branch_op->op_num : m->op_num;
+  }
+  e.cycles++;
+  if ((uns)cone_depth > e.cone_depth)
+    e.cone_depth = (uns)cone_depth;
+  /* Compulsory if this is the only time the line has ever missed (at this cycle). */
+  if (g_line_miss_count[line] <= 1)
+    e.cold++;
 }
 
 /* trace-dir path for the flat replay file, named <bench>_<simpt>_braddr.csv to
@@ -463,6 +572,9 @@ void br_exec_wait_finish(void) {
   if (!BRANCH_LOAD_DEP_ATTRIBUTE_RECORD)
     return;
 
+  /* Commit the last in-flight branch's top-N before flushing. */
+  br_commit_current_branch();
+
   /* Merge A+B per-line cycle totals for the flat replay file. */
   std::unordered_map<Addr, Counter> line_cycles;
   auto accumulate = [&](std::unordered_map<Addr, std::unordered_map<Addr, BrLineRec>>& cat) {
@@ -482,10 +594,11 @@ void br_exec_wait_finish(void) {
     fprintf(f, "# branch-mispredict operand-wait cycles attributed to prefetchable loads\n");
     fprintf(f,
             "# total_wait_cycles=%llu ancestor=%llu window_clog=%llu none=%llu "
-            "cold_cycles=%llu distinct_lines=%zu\n",
+            "cold_cycles=%llu capped_cycles=%llu distinct_lines=%zu\n",
             (unsigned long long)total, (unsigned long long)g_anc_total,
             (unsigned long long)g_clog_total, (unsigned long long)g_none_total,
-            (unsigned long long)g_cold_total, line_cycles.size());
+            (unsigned long long)g_cold_total, (unsigned long long)g_capped_total,
+            line_cycles.size());
     fprintf(f, "category,pc,line,cycles,cold_cycles\n");
     auto dump = [&](const char* name,
                     std::unordered_map<Addr, std::unordered_map<Addr, BrLineRec>>& cat) {
@@ -568,6 +681,30 @@ void br_exec_wait_finish(void) {
       fprintf(pfp, "%llu,0x%llx\n", (unsigned long long)r.first,
               (unsigned long long)r.second);
     fclose(pfp);
+  }
+
+  /* Branch->load stream: one row per committed dynamic branch instance listing
+   * its kept (top-N) load lines in ranked order, sorted by branch program order,
+   * for inspecting the per-branch load streams. */
+  char bspath[MAX_STR_LENGTH + 1];
+  br_trace_suffix_path(bspath, sizeof(bspath), BRANCH_LOAD_DEP_TRACE_DIR, "brstream");
+  FILE* bs = fopen(bspath, "w");
+  if (bs) {
+    std::sort(g_brstream_rows.begin(), g_brstream_rows.end(),
+              [](const BrStreamRow& a, const BrStreamRow& b) {
+                return a.branch_seqnum < b.branch_seqnum;
+              });
+    fprintf(bs, "# per-branch-instance delaying-load stream (top-N kept loads)\n");
+    fprintf(bs, "# rows=%zu\n", g_brstream_rows.size());
+    fprintf(bs, "branch_seqnum,branch_pc,num_loads,load_lines\n");
+    for (auto& r : g_brstream_rows) {
+      fprintf(bs, "%llu,0x%llx,%zu,", (unsigned long long)r.branch_seqnum,
+              (unsigned long long)r.branch_pc, r.load_lines.size());
+      for (size_t i = 0; i < r.load_lines.size(); i++)
+        fprintf(bs, "%s0x%llx", i ? " " : "", (unsigned long long)r.load_lines[i]);
+      fprintf(bs, "\n");
+    }
+    fclose(bs);
   }
 }
 
