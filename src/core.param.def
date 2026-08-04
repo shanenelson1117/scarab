@@ -120,6 +120,7 @@ DEF_PARAM(core_63_cycle_time, CORE_63_CYCLE_TIME, uns, uns, 312500, )
 /********TOP-DOWN
  * PARAMETERS********************************************************/
 DEF_PARAM(topdown_fu_exec_few, TOPDOWN_FU_EXEC_FEW, uns, uns, 0, )
+DEF_PARAM(td_load_track_enable, TD_LOAD_TRACK_ENABLE, Flag, Flag, FALSE, )
 
 /********NODE TABLE
  * PARAMETERS********************************************************/

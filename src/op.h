@@ -174,6 +174,8 @@ struct Op_struct {
   Counter pred_cycle;
   Counter precommit_cycle;  // cycle when the op is precommit (will eventually retire)
   Counter decode_cycle;     // cycle when decode completes
+  Counter td_window_cycles; // top-down per-load: cycles this load was in its dispatch->done window
+  Counter td_mem_cycles;    // top-down per-load: subset of td_window_cycles classified memory-bound
   // }}}
 
   // {{{ path and fetch info

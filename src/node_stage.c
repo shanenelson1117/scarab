@@ -61,6 +61,7 @@
 #include "node_issue_queue.h"
 #include "op_pool.h"
 #include "sim.h"
+#include "topdown.h"
 #include "statistics.h"
 #include "thread.h"
 #include "xed-iclass-enum.h"
@@ -623,6 +624,7 @@ void node_retire() {
     }
     if (op->inst_info->table_info.mem_type == MEM_LD) {
       STAT_EVENT(op->proc_id, LD_NO_DEPENDENTS + (op->wake_up_head ? 1 : 0));
+      topdown_load_retire(op->proc_id, op);
     }
     STAT_EVENT(op->proc_id, RET_OP_EXEC_COUNT_0 + MIN2(32, op->exec_count));
 

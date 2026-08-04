@@ -31,6 +31,8 @@
 
 #include "topdown.h"
 
+#include <stdio.h>
+
 #include "globals/assert.h"
 #include "globals/global_defs.h"
 #include "globals/global_types.h"
@@ -46,6 +48,10 @@
 
 const static uns64 TOPDOWN_SCALE_FACTOR = 10000;
 const static int TOPDOWN_RECOVERY_DEPTH = 2;
+
+/* per-load memory-boundness CSV outputs (opened lazily on the first retired load) */
+static FILE* td_load_pc_fp = NULL;
+static FILE* td_load_addr_fp = NULL;
 
 /**************************************************************************************/
 /* Events Update */
@@ -88,6 +94,13 @@ void topdown_bp_recovery(uns proc_id, Op* op) {
 }
 
 void topdown_idq_update(uns proc_id, int count_available, int count_issued, int count_issued_on_path) {
+  // per-load memory-boundness tracking: classify this cycle and tag every in-flight load's window
+  if (TD_LOAD_TRACK_ENABLE) {
+    Flag backend_stall = (count_issued == 0 && idq_stage_get_stage_data()->op_count > 0);
+    Flag mem_bound_cycle = backend_stall && (lsq_get_in_flight_load_num() > 0);
+    lsq_tag_inflight_loads(mem_bound_cycle);
+  }
+
   INC_STAT_EVENT(proc_id, TOPDOWN_TOTAL_SLOTS, ISSUE_WIDTH);
   INC_STAT_EVENT(proc_id, TOPDOWN_ISSUED_SLOTS, count_issued);
   INC_STAT_EVENT(proc_id, TOPDOWN_RETIRED_SLOTS, count_issued_on_path);
@@ -120,6 +133,37 @@ void topdown_exec_update(uns proc_id, uns8 fus_busy) {
   if (fus_busy <= TOPDOWN_FU_EXEC_FEW && node->node_count != 0) {
     STAT_EVENT(proc_id, TOPDOWN_EXEC_STALLS_CYCLES);
   }
+}
+
+/*
+ * Called at retirement of a load. Emits one row per retired (on-path) load to two
+ * sibling CSVs -- keyed by instruction PC and by data access address -- recording the
+ * fraction of the load's dispatch->done window that was classified memory-bound.
+ * Every load is logged unconditionally; threshold filtering happens downstream at replay.
+ */
+void topdown_load_retire(uns proc_id, Op* op) {
+  if (!TD_LOAD_TRACK_ENABLE)
+    return;
+  if (op->inst_info->table_info.mem_type != MEM_LD)
+    return;
+  if (op->td_window_cycles == 0)
+    return;
+
+  double frac = (double)op->td_mem_cycles / (double)op->td_window_cycles;
+
+  if (!td_load_pc_fp) {
+    td_load_pc_fp = fopen("mem_bound_loads_pc.csv", "w");
+    ASSERT(proc_id, td_load_pc_fp);
+    fprintf(td_load_pc_fp, "pc,mem_bound_fraction\n");
+  }
+  fprintf(td_load_pc_fp, "0x%llx,%f\n", (unsigned long long)op->inst_info->addr, frac);
+
+  if (!td_load_addr_fp) {
+    td_load_addr_fp = fopen("mem_bound_loads_addr.csv", "w");
+    ASSERT(proc_id, td_load_addr_fp);
+    fprintf(td_load_addr_fp, "addr,mem_bound_fraction\n");
+  }
+  fprintf(td_load_addr_fp, "0x%llx,%f\n", (unsigned long long)op->oracle_info.va, frac);
 }
 
 /**************************************************************************************/
@@ -215,4 +259,14 @@ void topdown_done(uns proc_id) {
                  bad_spec_bound * GET_STAT_EVENT(proc_id, TOPDOWN_BR_MISPRED_RETIRED_CYCLES) / bad_spec_cycles);
   INC_STAT_EVENT(proc_id, TOPDOWN_MACHINE_CLEARS_BOUND,
                  bad_spec_bound - GET_STAT_EVENT(proc_id, TOPDOWN_BR_MISPREDICTS_BOUND));
+
+  /* Flush per-load memory-boundness CSVs */
+  if (td_load_pc_fp) {
+    fclose(td_load_pc_fp);
+    td_load_pc_fp = NULL;
+  }
+  if (td_load_addr_fp) {
+    fclose(td_load_addr_fp);
+    td_load_addr_fp = NULL;
+  }
 }

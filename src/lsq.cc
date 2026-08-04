@@ -331,3 +331,21 @@ int lsq_get_in_flight_load_num() {
 
   return in_flight_num;
 }
+
+void lsq_tag_inflight_loads(Flag mem_bound_cycle) {
+  if (!LSQ_ENABLE)
+    return;
+
+  const auto& load_entries = lsq_unit->get_queue(MEM_LD)->get_entries();
+  for (const auto& entry : load_entries) {
+    Op* op = entry.op;
+    // window = dispatch -> done; done_cycle == 0 means the load has not completed yet
+    Flag in_window = (op->done_cycle == 0) || (cycle_count < op->done_cycle);
+    if (!in_window)
+      continue;
+
+    op->td_window_cycles++;
+    if (mem_bound_cycle)
+      op->td_mem_cycles++;
+  }
+}
