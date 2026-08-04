@@ -121,6 +121,10 @@ DEF_PARAM(core_63_cycle_time, CORE_63_CYCLE_TIME, uns, uns, 312500, )
  * PARAMETERS********************************************************/
 DEF_PARAM(topdown_fu_exec_few, TOPDOWN_FU_EXEC_FEW, uns, uns, 0, )
 DEF_PARAM(td_load_track_enable, TD_LOAD_TRACK_ENABLE, Flag, Flag, FALSE, )
+DEF_PARAM(td_load_dir, TD_LOAD_DIR, char*, string, ".", )
+DEF_PARAM(td_load_replay, TD_LOAD_REPLAY, Flag, Flag, FALSE, )
+DEF_PARAM(td_load_replay_key, TD_LOAD_REPLAY_KEY, char*, string, "pc", )
+DEF_PARAM(td_load_replay_thresh, TD_LOAD_REPLAY_THRESH, float, float, 0.0, )
 
 /********NODE TABLE
  * PARAMETERS********************************************************/

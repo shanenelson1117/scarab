@@ -226,6 +226,8 @@ DEF_STAT(  DCACHE_MISS_ST_OFFPATH	   , DIST  , NO_RATIO  )
 
 DEF_STAT(  DCACHE_MISS_WAITMEM             , COUNT , NO_RATIO  ) // DCACHE could not insert request into L2
 
+DEF_STAT(  TD_LOAD_FORCED_L1_HIT           , COUNT , NO_RATIO  ) // load miss forced to L1-hit latency by td_load_replay
+
 //Page mode row buffer hit or miss
 DEF_STAT(  MEM_REQ_ROW_BUFFER_HITS	       , DIST  , NO_RATIO  )
 DEF_STAT(  MEM_REQ_ROW_BUFFER_MISSES	   , COUNT , NO_RATIO  )  

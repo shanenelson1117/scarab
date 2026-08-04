@@ -45,6 +45,7 @@
 #include "map_stage.h"
 #include "node_stage.h"
 #include "op.h"
+#include "td_load_replay.h"
 
 const static uns64 TOPDOWN_SCALE_FACTOR = 10000;
 const static int TOPDOWN_RECOVERY_DEPTH = 2;
@@ -151,15 +152,20 @@ void topdown_load_retire(uns proc_id, Op* op) {
 
   double frac = (double)op->td_mem_cycles / (double)op->td_window_cycles;
 
+  char path[MAX_STR_LENGTH + 1];
+
   if (!td_load_pc_fp) {
-    td_load_pc_fp = fopen("mem_bound_loads_pc.csv", "w");
+    td_load_mkdir_p(TD_LOAD_DIR);
+    td_load_derive_csv_path(TD_LOAD_DIR, "mem_bound_loads_pc", path, sizeof(path));
+    td_load_pc_fp = fopen(path, "w");
     ASSERT(proc_id, td_load_pc_fp);
     fprintf(td_load_pc_fp, "pc,mem_bound_fraction\n");
   }
   fprintf(td_load_pc_fp, "0x%llx,%f\n", (unsigned long long)op->inst_info->addr, frac);
 
   if (!td_load_addr_fp) {
-    td_load_addr_fp = fopen("mem_bound_loads_addr.csv", "w");
+    td_load_derive_csv_path(TD_LOAD_DIR, "mem_bound_loads_addr", path, sizeof(path));
+    td_load_addr_fp = fopen(path, "w");
     ASSERT(proc_id, td_load_addr_fp);
     fprintf(td_load_addr_fp, "addr,mem_bound_fraction\n");
   }

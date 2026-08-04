@@ -54,6 +54,7 @@
 #include "map.h"
 #include "model.h"
 #include "statistics.h"
+#include "td_load_replay.h"
 #include "thread.h"
 
 /**************************************************************************************/
@@ -638,6 +639,18 @@ static inline void dcache_cacheline_miss(Op* op, Addr line_addr) {
         STAT_EVENT(op->proc_id, DCACHE_MISS_LD_OFFPATH);
         wrongpath_dcmiss = FALSE;
       }
+
+      // td_load_replay: force a persistently memory-bound load to complete at L1-hit
+      // latency (the memory request above is still issued, so memory traffic is unchanged).
+      if (TD_LOAD_REPLAY && !op->off_path && td_load_should_force_l1_hit(op)) {
+        STAT_EVENT(op->proc_id, TD_LOAD_FORCED_L1_HIT);
+        op->done_cycle = cycle_count + DCACHE_CYCLES + op->inst_info->extra_ld_latency;
+        op->state = OS_SCHEDULED;
+        op->wake_cycle = op->done_cycle;
+        wake_up_ops(op, REG_DATA_DEP, model->wake_hook);
+        break;
+      }
+
       op->state = OS_MISS;
       op->engine_info.dcmiss = TRUE;
       break;
