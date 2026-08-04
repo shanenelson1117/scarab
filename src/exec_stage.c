@@ -49,8 +49,6 @@
 #include "bp/bp.h"
 #include "dvfs/perf_pred.h"
 
-#include "br_exec_wait.h"
-#include "branch_load_dep.h"
 #include "cmp_model.h"
 #include "exec_ports.h"
 #include "map.h"
@@ -371,8 +369,6 @@ void update_exec_stage(Stage_Data* src_sd) {
 
   topdown_exec_update(exec->proc_id, fu_busy_num);
   memview_fus_busy(exec->proc_id, exec->fus_busy);
-
-  br_exec_wait_cycle(exec->proc_id, cycle_count);
 }
 
 /**************************************************************************************/
@@ -560,22 +556,6 @@ static inline void exec_stage_bp_resolve(Op* op) {
 
     bp_resolve_op(g_bp_data, op);
   }
-
-  // Track resolve events (cycle savings are counted per-cycle in br_exec_wait_cycle).
-    if(!op->off_path && op->bp_pred_info->recover_at_exec &&
-    (op->bp_pred_info->mispred || op->bp_pred_info->misfetch)) {
-      STAT_EVENT(op->proc_id, BR_EXEC_RESOLVE_COUNT);
-
-      if(op->bp_pred_info->mispred) {
-        STAT_EVENT(op->proc_id, BR_EXEC_RESOLVE_COUNT_MISPRED);
-      } else {
-        STAT_EVENT(op->proc_id, BR_EXEC_RESOLVE_COUNT_MISFETCH);
-      }
-
-      if(op->bp_pred_info->mispred && op->bp_pred_info->misfetch) {
-        STAT_EVENT(op->proc_id, BR_EXEC_RESOLVE_COUNT_BOTH);
-      }
-    }
 
   if (op->bp_pred_info->recover_at_exec) {
     DEBUG(exec->proc_id, "Exec schedules recovery for op_num:%llu at cycle:%llu\n", (unsigned long long)op->op_num,
