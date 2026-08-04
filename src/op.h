@@ -176,6 +176,7 @@ struct Op_struct {
   Counter decode_cycle;     // cycle when decode completes
   Counter td_window_cycles; // top-down per-load: cycles this load was in its dispatch->done window
   Counter td_mem_cycles;    // top-down per-load: subset of td_window_cycles classified memory-bound
+  Flag td_forced_l1_hit;    // td_load_replay: load was force-completed at L1 latency; fill must not re-wake it
   // }}}
 
   // {{{ path and fetch info

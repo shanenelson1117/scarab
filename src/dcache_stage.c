@@ -644,6 +644,9 @@ static inline void dcache_cacheline_miss(Op* op, Addr line_addr) {
       // latency (the memory request above is still issued, so memory traffic is unchanged).
       if (TD_LOAD_REPLAY && !op->off_path && td_load_should_force_l1_hit(op)) {
         STAT_EVENT(op->proc_id, TD_LOAD_FORCED_L1_HIT);
+        // The mem request above is still outstanding ("still fetch"); mark the op so the
+        // returning fill (dcache_fill_process_cacheline) does not wake it a second time.
+        op->td_forced_l1_hit = TRUE;
         op->done_cycle = cycle_count + DCACHE_CYCLES + op->inst_info->extra_ld_latency;
         op->state = OS_SCHEDULED;
         op->wake_cycle = op->done_cycle;
@@ -838,6 +841,12 @@ static inline void dcache_fill_process_cacheline(Mem_Req* req, Dcache_Data* data
     ASSERT(dc->proc_id, op_unique);
 
     if (op->unique_num != *op_unique || !op->op_pool_valid) {
+      continue;
+    }
+
+    // td_load_replay: this load was already force-completed at L1 latency and its dependents
+    // woken; the fetch was still issued (so the line fills), but we must not re-wake the op.
+    if (op->td_forced_l1_hit) {
       continue;
     }
 
