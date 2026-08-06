@@ -36,7 +36,7 @@ static std::unordered_map<uns64, double> g_ratio;  // key (PC or va) -> mean mem
  * count how many distinct lines were filled into set(l) between two consecutive exceeding
  * accesses to line l. A line with an open interval is "tracked" (frozen: its own refills
  * do not move it) so its index = cumulative distinct-other-line fills since it was pinned. */
-static const size_t TD_EVICT_CAP_MULT = 8;  // per-set list capped at TD_EVICT_CAP_MULT * assoc
+static const size_t TD_EVICT_CAP_MULT = 64;  // per-set list capped at TD_EVICT_CAP_MULT * assoc
 
 struct EvictState {
   std::list<uns64> lru;                                        // distinct line addrs, MRU front
