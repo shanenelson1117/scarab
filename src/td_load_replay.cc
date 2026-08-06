@@ -171,6 +171,14 @@ Flag td_load_should_force_l1_hit(Op* op) {
   return (it->second > (double)TD_LOAD_REPLAY_THRESH) ? TRUE : FALSE;
 }
 
+Flag td_load_is_marked_key(uns64 key) {
+  td_load_replay_init();
+  if (g_ratio.empty())
+    return FALSE;
+  auto it = g_ratio.find(key);
+  return (it != g_ratio.end() && it->second > (double)TD_LOAD_REPLAY_THRESH) ? TRUE : FALSE;
+}
+
 /**************************************************************************************/
 /* Eviction tracking: distinct lines filled into set(l) between consecutive exceeding
  * accesses to the same line l (line/address-keyed; self-contained, no record CSV). */
@@ -216,8 +224,21 @@ void td_load_evict_note_fill(Addr fill_addr) {
   }
 }
 
-/* Called at retirement of an exceeding load: emit S (distinct fills into set(l) since the
- * line's previous exceeding access) and W, then re-pin the line to open the next interval. */
+/* Effective start/end thresholds: an interval OPENS at an access whose instance fraction
+ * exceeds the start threshold (access x) and CLOSES at the next same-line access whose
+ * fraction exceeds the end threshold (access x+1). Each defaults to TD_LOAD_REPLAY_THRESH
+ * when its param is left negative, so start==end reproduces the original single-threshold
+ * behavior. */
+static double td_evict_start_thresh(void) {
+  return (TD_LOAD_EVICT_START_THRESH >= 0.0) ? (double)TD_LOAD_EVICT_START_THRESH : (double)TD_LOAD_REPLAY_THRESH;
+}
+static double td_evict_end_thresh(void) {
+  return (TD_LOAD_EVICT_END_THRESH >= 0.0) ? (double)TD_LOAD_EVICT_END_THRESH : (double)TD_LOAD_REPLAY_THRESH;
+}
+
+/* Called at retirement of a load. Closes an open interval (emits S,W) when the access
+ * clears the end threshold, and opens/re-opens an interval when it clears the start
+ * threshold. S = distinct fills into set(l) since the opening access. */
 void td_load_evict_note_access(Op* op) {
   if (!TD_LOAD_EVICT_TRACK)
     return;
@@ -226,9 +247,10 @@ void td_load_evict_note_access(Op* op) {
   if (op->td_window_cycles == 0)
     return;
 
-  // only accesses whose own instance memory-bound fraction exceeds the threshold
   double frac = (double)op->td_mem_cycles / (double)op->td_window_cycles;
-  if (frac <= (double)TD_LOAD_REPLAY_THRESH)
+  Flag is_opener = frac > td_evict_start_thresh();  // qualifies as access x
+  Flag is_closer = frac > td_evict_end_thresh();    // qualifies as access x+1
+  if (!is_opener && !is_closer)
     return;
 
   td_evict_lazy_init();
@@ -240,9 +262,9 @@ void td_load_evict_note_access(Op* op) {
   EvictState& s = g_evict[set];
   uns ways = dcache_get_assoc();
 
-  // If this line already had an open interval, this is its x+1: measure and emit.
+  // CLOSE: if the line has an open interval and this access clears the end threshold, it is x+1.
   auto ti = s.tracked.find(line_addr);
-  if (ti != s.tracked.end() && ti->second) {
+  if (ti != s.tracked.end() && ti->second && is_closer) {
     size_t S;
     auto pi = s.pos.find(line_addr);
     if (pi == s.pos.end()) {
@@ -253,7 +275,8 @@ void td_load_evict_note_access(Op* op) {
 
     if (!g_evict_fp) {
       char suffix[64];
-      snprintf(suffix, sizeof(suffix), "line_evict_p%02d", (int)(100.0 * (double)TD_LOAD_REPLAY_THRESH + 0.5));
+      snprintf(suffix, sizeof(suffix), "line_evict_s%02d_e%02d", (int)(100.0 * td_evict_start_thresh() + 0.5),
+               (int)(100.0 * td_evict_end_thresh() + 0.5));
       char path[MAX_STR_LENGTH + 1];
       td_load_mkdir_p(TD_LOAD_DIR);
       td_load_derive_csv_path(TD_LOAD_DIR, suffix, path, sizeof(path));
@@ -265,15 +288,19 @@ void td_load_evict_note_access(Op* op) {
     }
     if (g_evict_fp)
       fprintf(g_evict_fp, "0x%llx,%llu,%u\n", (unsigned long long)line_addr, (unsigned long long)S, ways);
+
+    ti->second = FALSE;  // interval closed; line unfrozen until the next opener
   }
 
-  // (Re-)pin this line at MRU and mark tracked -> opens the next interval from here.
-  auto pi = s.pos.find(line_addr);
-  if (pi != s.pos.end())
-    s.lru.erase(pi->second);
-  s.lru.push_front(line_addr);
-  s.pos[line_addr] = s.lru.begin();
-  s.tracked[line_addr] = true;
+  // OPEN: if this access clears the start threshold, (re-)pin the line at MRU to begin an interval.
+  if (is_opener) {
+    auto pi = s.pos.find(line_addr);
+    if (pi != s.pos.end())
+      s.lru.erase(pi->second);
+    s.lru.push_front(line_addr);
+    s.pos[line_addr] = s.lru.begin();
+    s.tracked[line_addr] = TRUE;
+  }
 }
 
 void td_load_evict_finish(void) {

@@ -35,6 +35,11 @@ void td_load_replay_init(void);
  * recorded map with a mean memory-bound ratio strictly above TD_LOAD_REPLAY_THRESH. */
 Flag td_load_should_force_l1_hit(Op* op);
 
+/* TRUE iff `key` (a PC or data address, matching TD_LOAD_REPLAY_KEY) is present in the
+ * recorded averaged map with mean memory-bound ratio > TD_LOAD_REPLAY_THRESH. Used by the
+ * marked-RRIP dcache policy to protect memory-bound lines at insertion. */
+Flag td_load_is_marked_key(uns64 key);
+
 /* td_load_evict_track mode (line/address-keyed, self-contained). Measures, between two
  * consecutive exceeding accesses to the same L1D line l, the number of DISTINCT lines
  * filled into set(l) (S) vs. the associativity (W); eviction <=> S >= W. */

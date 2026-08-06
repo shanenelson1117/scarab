@@ -1527,6 +1527,24 @@ void srrip_update_insert(Cache* cache, uns8 proc_id, uns set, uns way, void* arg
   cache_debug_print_set(cache, set, way, CACHE_EVENT_INSERT);
 }
 
+/* MARKED_RRIP: crude SRRIP variant. Marked (memory-bound) lines insert at RRPV 0
+ * (near-immediate re-reference -> evicted last); everything else inserts at the standard
+ * SRRIP distant value. Marking is signalled one-shot via cache_set_marked_next_insert().
+ * Hits and eviction/aging reuse the SRRIP behavior (nru_update_hit, srrip_update_evict). */
+static Flag g_marked_rrip_next_insert = FALSE;
+
+void cache_set_marked_next_insert(Flag marked) {
+  g_marked_rrip_next_insert = marked;
+}
+
+void marked_rrip_update_insert(Cache* cache, uns8 proc_id, uns set, uns way, void* arg);
+void marked_rrip_update_insert(Cache* cache, uns8 proc_id, uns set, uns way, void* arg) {
+  cache->entries[set][way].reference_val = g_marked_rrip_next_insert ? 0 : (RRIP_DISTANT_VAL - 1);
+  g_marked_rrip_next_insert = FALSE;  // consume the one-shot mark
+
+  cache_debug_print_set(cache, set, way, CACHE_EVENT_INSERT);
+}
+
 Cache_Entry* srrip_update_evict(Cache* cache, uns8 proc_id, uns set, uns* way, void* arg, Flag if_external) {
   int ii;
   Flag found = FALSE;
@@ -1783,6 +1801,7 @@ struct repl_policy_func repl_policy_func_table[NUM_REPL] = {
   { REPL_BRRIP,   brrip_action_init,    general_action_repl,  nru_update_hit,     brrip_update_insert,  srrip_update_evict  },
   { REPL_DRRIP,   drrip_action_init,    general_action_repl,  nru_update_hit,     drrip_update_insert,  drrip_update_evict  },
   { REPL_SHIP,    ship_action_init,     general_action_repl,  ship_update_hit,    ship_update_insert,   ship_update_evict   },
+  { REPL_MARKED_RRIP, general_action_init, general_action_repl, nru_update_hit,   marked_rrip_update_insert, srrip_update_evict },
   { REPL_VOID,    NULL,                 NULL,                 NULL,               NULL,                 NULL                },
 };
 // clang-format on

@@ -20,8 +20,8 @@ partial aggregates -- a Counter of (S,W) pairs and a per-line (evicted,total) di
 are merged in the parent, so large row data never crosses the process boundary.
 
 Usage:
-    td_load_evict_cdf.py <file-or-dir> [...] --thresh 0.5 --out evict.png --jobs 16
-    td_load_evict_cdf.py /home/shanen/samsung/td_load_traces --thresh 0.5
+    td_load_evict_cdf.py <file-or-dir> [...] --start-thresh 0.5 --end-thresh 0.5 --out evict.png -j 16
+    td_load_evict_cdf.py /home/shanen/samsung/td_load_traces --start-thresh 0.7 --end-thresh 0.5
 """
 
 import argparse
@@ -33,9 +33,12 @@ from collections import Counter, defaultdict
 from concurrent.futures import ProcessPoolExecutor
 
 
-def gather_inputs(paths, thresh):
-    pnn = f"p{int(100.0 * thresh + 0.5):02d}"
-    pat = f"*line_evict_{pnn}.csv"
+def thresh_tag(start_thresh, end_thresh):
+    return f"s{int(100.0 * start_thresh + 0.5):02d}_e{int(100.0 * end_thresh + 0.5):02d}"
+
+
+def gather_inputs(paths, start_thresh, end_thresh):
+    pat = f"*line_evict_{thresh_tag(start_thresh, end_thresh)}.csv"
     out = []
     for p in paths:
         if os.path.isdir(p):
@@ -131,7 +134,7 @@ def decimate(xs, ys, max_points=2000):
     return [xs[i] for i in idx], [ys[i] for i in idx]
 
 
-def plot(ratio_counts, p_evict, n_intervals, line_rates, thresh, min_intervals, out_path):
+def plot(ratio_counts, p_evict, n_intervals, line_rates, tag, min_intervals, out_path):
     try:
         import matplotlib
 
@@ -152,7 +155,7 @@ def plot(ratio_counts, p_evict, n_intervals, line_rates, thresh, min_intervals, 
     ax.set_ylim(0, 1)
     ax.set_xlabel("S / W  (distinct set-fills per way)")
     ax.set_ylabel("CDF (event-weighted)")
-    ax.set_title(f"Pooled S/W  |  P(S≥W)={p_evict:.1%}  (p={thresh}, n={n_intervals})")
+    ax.set_title(f"Pooled S/W  |  P(S≥W)={p_evict:.1%}  ({tag}, n={n_intervals})")
     ax.grid(True, alpha=0.3)
     ax.legend(fontsize=9)
 
@@ -183,7 +186,7 @@ def plot(ratio_counts, p_evict, n_intervals, line_rates, thresh, min_intervals, 
     ax.set_title("S/W tail (CCDF)")
     ax.grid(True, alpha=0.3, which="both")
 
-    fig.suptitle(f"td_load_evict — set-conflict between memory-bound line reuses (p={thresh})")
+    fig.suptitle(f"td_load_evict — set-conflict between memory-bound line reuses ({tag})")
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
     print(f"chart written to {out_path}")
@@ -192,15 +195,19 @@ def plot(ratio_counts, p_evict, n_intervals, line_rates, thresh, min_intervals, 
 def main():
     ap = argparse.ArgumentParser(description="CDF of distinct set-fills vs ways between memory-bound line reuses.")
     ap.add_argument("inputs", nargs="+", help="line_evict CSV file(s) or directory(ies)")
-    ap.add_argument("--thresh", type=float, default=0.5, help="threshold p used at record time (default 0.5)")
+    ap.add_argument("--start-thresh", type=float, default=0.5, help="opener threshold for access x (default 0.5)")
+    ap.add_argument("--end-thresh", type=float, default=None, help="closer threshold for access x+1 (default: = start-thresh)")
     ap.add_argument("--min-intervals", type=int, default=5, help="min intervals per line for per-line CDF (default 5)")
     ap.add_argument("--jobs", "-j", type=int, default=os.cpu_count() or 1, help="parallel parse workers (default: #CPUs)")
-    ap.add_argument("--out", default=None, help="output PNG (default: evict_cdf_p<NN>.png next to first input)")
+    ap.add_argument("--out", default=None, help="output PNG (default: evict_cdf_<tag>.png next to first input)")
     args = ap.parse_args()
 
-    files = gather_inputs(args.inputs, args.thresh)
+    end_thresh = args.end_thresh if args.end_thresh is not None else args.start_thresh
+    tag = thresh_tag(args.start_thresh, end_thresh)
+
+    files = gather_inputs(args.inputs, args.start_thresh, end_thresh)
     if not files:
-        sys.exit(f"error: no line_evict CSVs found for p={args.thresh}.")
+        sys.exit(f"error: no line_evict CSVs found for {tag}.")
 
     sw_total, per_line = load_parallel(files, args.jobs)
     n_intervals = sum(sw_total.values())
@@ -219,11 +226,10 @@ def main():
     line_rates = [ev / tot for (ev, tot) in per_line.values() if tot >= args.min_intervals]
 
     print(f"files={len(files)} jobs={min(args.jobs, len(files))}  intervals={n_intervals}  "
-          f"distinct lines={len(per_line)}  P(S>=W)={p_evict:.3f}  (p={args.thresh})")
+          f"distinct lines={len(per_line)}  P(S>=W)={p_evict:.3f}  (start={args.start_thresh}, end={end_thresh})")
 
-    pnn = f"p{int(100.0 * args.thresh + 0.5):02d}"
-    out = args.out or os.path.join(os.path.dirname(os.path.abspath(files[0])), f"evict_cdf_{pnn}.png")
-    plot(ratio_counts, p_evict, n_intervals, line_rates, args.thresh, args.min_intervals, out)
+    out = args.out or os.path.join(os.path.dirname(os.path.abspath(files[0])), f"evict_cdf_{tag}.png")
+    plot(ratio_counts, p_evict, n_intervals, line_rates, tag, args.min_intervals, out)
 
 
 if __name__ == "__main__":

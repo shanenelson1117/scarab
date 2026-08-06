@@ -126,6 +126,9 @@ DEF_PARAM(td_load_replay, TD_LOAD_REPLAY, Flag, Flag, FALSE, )
 DEF_PARAM(td_load_replay_key, TD_LOAD_REPLAY_KEY, char*, string, "pc", )
 DEF_PARAM(td_load_replay_thresh, TD_LOAD_REPLAY_THRESH, float, float, 0.0, )
 DEF_PARAM(td_load_evict_track, TD_LOAD_EVICT_TRACK, Flag, Flag, FALSE, )
+DEF_PARAM(td_load_evict_start_thresh, TD_LOAD_EVICT_START_THRESH, float, float, -1.0, )
+DEF_PARAM(td_load_evict_end_thresh, TD_LOAD_EVICT_END_THRESH, float, float, -1.0, )
+DEF_PARAM(td_load_rrip_mark, TD_LOAD_RRIP_MARK, Flag, Flag, FALSE, )
 
 /********NODE TABLE
  * PARAMETERS********************************************************/

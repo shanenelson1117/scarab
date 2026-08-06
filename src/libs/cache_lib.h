@@ -67,6 +67,7 @@ typedef enum Repl_Policy_enum {
   REPL_BRRIP,   /* bimodal re-reference interval prediction */
   REPL_DRRIP,   /* dynamic re-reference interval prediction */
   REPL_SHIP,    /* signature-based hit predictor */
+  REPL_MARKED_RRIP, /* SRRIP variant: marked (memory-bound) lines insert at RRPV 0 */
 
   NUM_REPL
 } Repl_Policy;
@@ -181,6 +182,10 @@ const static Flag CACHE_DEBUG_ENABLE = FALSE;  // To be Changed into DEBUG_PARA
 void init_cache(Cache*, const char*, uns, uns, uns, uns, Repl_Policy);
 void* cache_access(Cache*, Addr, Addr*, Flag);
 void* cache_insert(Cache*, uns8, Addr, Addr*, Addr*);
+/* REPL_MARKED_RRIP: set right before a cache_insert to control the inserted line's RRPV
+ * (TRUE -> reference_val 0 / protected, FALSE -> normal SRRIP distant). One-shot: consumed
+ * and cleared by the next marked_rrip insert. */
+void cache_set_marked_next_insert(Flag marked);
 void* cache_insert_replpos(Cache* cache, uns8 proc_id, Addr addr, Addr* line_addr, Addr* repl_line_addr,
                            Cache_Insert_Repl insert_repl_policy, Flag isPrefetch);
 void* cache_insert_lru(Cache*, uns8, Addr, Addr*, Addr*);
