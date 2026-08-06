@@ -35,6 +35,20 @@ void td_load_replay_init(void);
  * recorded map with a mean memory-bound ratio strictly above TD_LOAD_REPLAY_THRESH. */
 Flag td_load_should_force_l1_hit(Op* op);
 
+/* td_load_evict_track mode (line/address-keyed, self-contained). Measures, between two
+ * consecutive exceeding accesses to the same L1D line l, the number of DISTINCT lines
+ * filled into set(l) (S) vs. the associativity (W); eviction <=> S >= W. */
+
+/* Feed the per-set shadow LRU on every L1D fill. */
+void td_load_evict_note_fill(Addr fill_addr);
+
+/* At a retiring exceeding load: emit (line,S,W) if the line had a prior exceeding access,
+ * then re-pin to open the next interval. Writes <td_load_dir>/<trace>_line_evict_p<NN>.csv. */
+void td_load_evict_note_access(Op* op);
+
+/* Close the eviction log at end of simulation. */
+void td_load_evict_finish(void);
+
 #ifdef __cplusplus
 }
 #endif

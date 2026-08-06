@@ -96,7 +96,8 @@ void topdown_bp_recovery(uns proc_id, Op* op) {
 
 void topdown_idq_update(uns proc_id, int count_available, int count_issued, int count_issued_on_path) {
   // per-load memory-boundness tracking: classify this cycle and tag every in-flight load's window
-  if (TD_LOAD_TRACK_ENABLE) {
+  // (needed by the record pass and by the in-sim gap-tracking mode)
+  if (TD_LOAD_TRACK_ENABLE || TD_LOAD_EVICT_TRACK) {
     Flag backend_stall = (count_issued == 0 && idq_stage_get_stage_data()->op_count > 0);
     Flag mem_bound_cycle = backend_stall && (lsq_get_in_flight_load_num() > 0);
     lsq_tag_inflight_loads(mem_bound_cycle);
@@ -143,11 +144,16 @@ void topdown_exec_update(uns proc_id, uns8 fus_busy) {
  * Every load is logged unconditionally; threshold filtering happens downstream at replay.
  */
 void topdown_load_retire(uns proc_id, Op* op) {
-  if (!TD_LOAD_TRACK_ENABLE)
-    return;
   if (op->inst_info->table_info.mem_type != MEM_LD)
     return;
   if (op->td_window_cycles == 0)
+    return;
+
+  // in-sim eviction tracking: distinct fills into set(l) between exceeding reuses of line l
+  if (TD_LOAD_EVICT_TRACK)
+    td_load_evict_note_access(op);
+
+  if (!TD_LOAD_TRACK_ENABLE)
     return;
 
   double frac = (double)op->td_mem_cycles / (double)op->td_window_cycles;
@@ -275,4 +281,7 @@ void topdown_done(uns proc_id) {
     fclose(td_load_addr_fp);
     td_load_addr_fp = NULL;
   }
+
+  /* Close the in-sim eviction-tracking log (td_load_evict_track mode) */
+  td_load_evict_finish();
 }

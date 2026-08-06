@@ -68,6 +68,20 @@
 
 Dcache_Stage* dc = NULL;
 
+/* L1D geometry accessors for td_load_evict_track (set-conflict eviction tracking). */
+uns dcache_get_assoc(void) {
+  return dc->dcache.assoc;
+}
+
+uns dcache_get_num_sets(void) {
+  return dc->dcache.num_sets;
+}
+
+uns dcache_get_set_index(Addr va, Addr* line_addr_out) {
+  Addr tag;
+  return ext_cache_index(&dc->dcache, va, line_addr_out, &tag);
+}
+
 /**************************************************************************************/
 /* Prototypes for Inline Methods */
 
@@ -806,6 +820,10 @@ static inline Dcache_Data* dcache_fill_get_cacheline(Mem_Req* req) {
 }
 
 static inline void dcache_fill_process_cacheline(Mem_Req* req, Dcache_Data* data) {
+  /* feed the per-set shadow LRU used by td_load_evict_track (set-conflict eviction) */
+  if (TD_LOAD_EVICT_TRACK)
+    td_load_evict_note_fill(req->addr);
+
   /* collect wp stat */
   dcache_fill_wp_collect_stats(data, req);
 

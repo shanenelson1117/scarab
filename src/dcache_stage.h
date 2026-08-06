@@ -95,6 +95,11 @@ void update_dcache_stage(Stage_Data*);
 Flag dcache_fill_line(Mem_Req*);
 Flag do_oracle_dcache_access(Op*, Addr*);
 
+/* L1D geometry accessors for td_load_evict_track (set-conflict eviction tracking). */
+uns dcache_get_assoc(void);
+uns dcache_get_num_sets(void);
+uns dcache_get_set_index(Addr va, Addr* line_addr_out);  /* returns set index, fills *line_addr_out */
+
 /**************************************************************************************/
 
 #endif /* #ifndef __DCACHE_STAGE_H__ */
