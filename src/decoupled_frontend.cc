@@ -441,10 +441,13 @@ void Decoupled_FE::update() {
 
   while (1) {
     state = next_state;
-    ASSERT(proc_id, ftq.size() <= ftq_max_size());
+    // FDIP_ADJUSTABLE_FTQ (UFTQ) can shrink ftq_max_size() below the current occupancy, so the
+    // FTQ may transiently exceed the (reduced) max until it drains -- only enforce the invariant
+    // when the FTQ size is static.
+    ASSERT(proc_id, FDIP_ADJUSTABLE_FTQ || ftq.size() <= ftq_max_size());
     ASSERT(proc_id, cfs_taken_this_cycle <= FE_FTQ_TAKEN_CFS_PER_CYCLE);
 
-    if (ftq.size() == ftq_max_size()) {
+    if (ftq.size() >= ftq_max_size()) {
       DEBUG(proc_id, "[DFE%u] Break due to full FTQ\n", bp_id);
       STAT_EVENT(proc_id, FTQ_BREAK_FULL_FT_ONPATH + is_off_path_state());
       break;
