@@ -129,6 +129,19 @@ DEF_PARAM(td_load_evict_track, TD_LOAD_EVICT_TRACK, Flag, Flag, FALSE, )
 DEF_PARAM(td_load_evict_start_thresh, TD_LOAD_EVICT_START_THRESH, float, float, -1.0, )
 DEF_PARAM(td_load_evict_end_thresh, TD_LOAD_EVICT_END_THRESH, float, float, -1.0, )
 DEF_PARAM(td_load_rrip_mark, TD_LOAD_RRIP_MARK, Flag, Flag, FALSE, )
+/* Most-protected (minimum) initial RRPV for marked memory-bound lines under
+   REPL_MARKED_RRIP. May be negative (reference_val is stored signed; each unit below 0
+   buys one extra global aging round of protection). When extrapolation is off, every
+   marked line inserts at exactly this value. Default 0 reproduces the pre-change
+   marked=RRPV-0 behavior. */
+DEF_PARAM(td_load_rrip_min_rrpv, TD_LOAD_RRIP_MIN_RRPV, int, int, 0, )
+/* Gate: when TRUE, linearly map a marked load's mean memory-bound fraction to an initial
+   RRPV in [td_load_rrip_min_rrpv, RRIP_DISTANT_VAL-1] (fraction 1.0 -> min, most
+   protected). When FALSE, all marked lines get td_load_rrip_min_rrpv. */
+DEF_PARAM(td_load_rrip_extrapolate, TD_LOAD_RRIP_EXTRAPOLATE, Flag, Flag, FALSE, )
+/* Low fraction anchor of the extrapolation ramp (the fraction that maps to the basic
+   non-prioritized insert value). Negative => fall back to TD_LOAD_REPLAY_THRESH. */
+DEF_PARAM(td_load_rrip_extrap_anchor, TD_LOAD_RRIP_EXTRAP_ANCHOR, float, float, -1.0, )
 
 /********NODE TABLE
  * PARAMETERS********************************************************/

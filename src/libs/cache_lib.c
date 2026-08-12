@@ -70,6 +70,12 @@ static inline void invalidate_unsure_line(Cache*, uns, Addr);
 
 char rand_repl_state[31];
 
+/* RRIP re-reference prediction value width / max (used by SRRIP/BRRIP/DRRIP/MARKED_RRIP).
+   Defined at file scope so the Cache_Entry fill paths above the RRIP policy functions can
+   reference RRIP_DISTANT_VAL when initializing marked_promote_rrpv. */
+const static uns8 RRIP_M = 2;
+const static uns8 RRIP_DISTANT_VAL = (1 << RRIP_M) - 1;
+
 /**************************************************************************************/
 
 static inline uns cache_index(Cache* cache, Addr addr, Addr* tag, Addr* line_addr) {
@@ -324,6 +330,7 @@ void* cache_insert_replpos(Cache* cache, uns8 proc_id, Addr addr, Addr* line_add
   new_line->pref = isPrefetch;
 
   new_line->pw_start_addr = addr;  // only means anything for uop cache
+  new_line->marked_promote_rrpv = RRIP_DISTANT_VAL - 1;  // neutral; set at marked-RRIP insert
 
   switch (insert_repl_policy) {
     case INSERT_REPL_DEFAULT:
@@ -1391,7 +1398,7 @@ Cache_Entry* lru_update_evict(Cache* cache, uns8 proc_id, uns set, uns* way, voi
 
 void lru_update_hit(Cache* cache, uns set, uns way, void* arg) {
   int ii;
-  uns8 ref_orig = cache->entries[set][way].reference_val;
+  int ref_orig = cache->entries[set][way].reference_val;
 
   // promotion
   cache->entries[set][way].reference_val = 0;
@@ -1437,7 +1444,7 @@ void lru_update_insert(Cache* cache, uns8 proc_id, uns set, uns way, void* arg) 
 
 Cache_Entry* lru_update_evict(Cache* cache, uns8 proc_id, uns set, uns* way, void* arg, Flag if_external) {
   int ii;
-  uns8 oldest_ref = 0;
+  int oldest_ref = 0;
 
   // search the oldest line
   for (ii = 0; ii < cache->assoc; ii++) {
@@ -1511,9 +1518,7 @@ Cache_Entry* nru_update_evict(Cache* cache, uns8 proc_id, uns set, uns* way, voi
 }
 
 /**************************************************************************************/
-/* RRIP: SRRIP, BRRIP, DRRIP */
-const static uns8 RRIP_M = 2;
-const static uns8 RRIP_DISTANT_VAL = (1 << RRIP_M) - 1;
+/* RRIP: SRRIP, BRRIP, DRRIP (RRIP_M / RRIP_DISTANT_VAL defined at file top) */
 
 /**************************************************************************************/
 /* SRRIP */
@@ -1527,22 +1532,68 @@ void srrip_update_insert(Cache* cache, uns8 proc_id, uns set, uns way, void* arg
   cache_debug_print_set(cache, set, way, CACHE_EVENT_INSERT);
 }
 
-/* MARKED_RRIP: crude SRRIP variant. Marked (memory-bound) lines insert at RRPV 0
- * (near-immediate re-reference -> evicted last); everything else inserts at the standard
- * SRRIP distant value. Marking is signalled one-shot via cache_set_marked_next_insert().
- * Hits and eviction/aging reuse the SRRIP behavior (nru_update_hit, srrip_update_evict). */
-static Flag g_marked_rrip_next_insert = FALSE;
+/* MARKED_RRIP: SRRIP variant that protects memory-bound lines. A marked line inserts at a
+ * configurable minimum RRPV (TD_LOAD_RRIP_MIN_RRPV, which may be negative for protection
+ * stronger than RRPV 0); when TD_LOAD_RRIP_EXTRAPOLATE is set, the load's mean membound
+ * fraction is linearly mapped to an RRPV in [min, RRIP_DISTANT_VAL-1] (fraction 1.0 -> min).
+ * Everything else inserts at the standard SRRIP distant value. Marking + fraction are
+ * signalled one-shot via cache_set_marked_next_insert(). On a hit the line is promoted to
+ * min(0, its inserted RRPV) (marked_rrip_update_hit) so aging can't erase the protection;
+ * eviction/aging reuse SRRIP (srrip_update_evict). */
+static Flag   g_marked_rrip_next_insert = FALSE;
+static double g_marked_rrip_next_frac   = 0.0;
 
-void cache_set_marked_next_insert(Flag marked) {
+void cache_set_marked_next_insert(Flag marked, double frac) {
   g_marked_rrip_next_insert = marked;
+  g_marked_rrip_next_frac   = frac;
 }
 
 void marked_rrip_update_insert(Cache* cache, uns8 proc_id, uns set, uns way, void* arg);
 void marked_rrip_update_insert(Cache* cache, uns8 proc_id, uns set, uns way, void* arg) {
-  cache->entries[set][way].reference_val = g_marked_rrip_next_insert ? 0 : (RRIP_DISTANT_VAL - 1);
-  g_marked_rrip_next_insert = FALSE;  // consume the one-shot mark
+  const int basic = RRIP_DISTANT_VAL - 1;
+  int rrpv;
+  if (!g_marked_rrip_next_insert) {
+    rrpv = basic;
+  } else if (!TD_LOAD_RRIP_EXTRAPOLATE) {
+    rrpv = TD_LOAD_RRIP_MIN_RRPV;  // signed; may be < 0
+  } else {
+    const int lo_min = TD_LOAD_RRIP_MIN_RRPV;
+    double lo = (TD_LOAD_RRIP_EXTRAP_ANCHOR >= 0.0) ? (double)TD_LOAD_RRIP_EXTRAP_ANCHOR
+                                                    : (double)TD_LOAD_REPLAY_THRESH;
+    double denom = 1.0 - lo;
+    if (denom < 1e-9)
+      denom = 1e-9;
+    double f = g_marked_rrip_next_frac;
+    if (f < lo)
+      f = lo;  // clamp fraction into [lo, 1]
+    if (f > 1.0)
+      f = 1.0;
+    // fraction lo -> basic (least protected marked), fraction 1.0 -> lo_min (most protected)
+    double v = (double)basic - (f - lo) / denom * (double)(basic - lo_min);
+    rrpv = (int)(v >= 0.0 ? v + 0.5 : v - 0.5);  // round to nearest (sign-symmetric)
+    if (rrpv < lo_min)
+      rrpv = lo_min;
+    if (rrpv > basic)
+      rrpv = basic;
+  }
+  cache->entries[set][way].reference_val       = rrpv;
+  cache->entries[set][way].marked_promote_rrpv = rrpv;  // remember for hit promotion
+  g_marked_rrip_next_insert = FALSE;                    // consume the one-shot mark
+  g_marked_rrip_next_frac   = 0.0;
 
   cache_debug_print_set(cache, set, way, CACHE_EVENT_INSERT);
+}
+
+/* Hit promotion for REPL_MARKED_RRIP: restore the line to min(0, its inserted RRPV) so a
+ * membound line protected below 0 stays protected on reuse (plain SRRIP would flatten it
+ * to 0). A non-marked line has marked_promote_rrpv == basic (>0), so it promotes to 0,
+ * exactly as under standard SRRIP. */
+void marked_rrip_update_hit(Cache* cache, uns set, uns way, void* arg);
+void marked_rrip_update_hit(Cache* cache, uns set, uns way, void* arg) {
+  int target = cache->entries[set][way].marked_promote_rrpv;
+  cache->entries[set][way].reference_val = (target < 0) ? target : 0;  // min(0, target)
+
+  cache_debug_print_set(cache, set, way, CACHE_EVENT_HIT);
 }
 
 Cache_Entry* srrip_update_evict(Cache* cache, uns8 proc_id, uns set, uns* way, void* arg, Flag if_external) {
@@ -1801,7 +1852,7 @@ struct repl_policy_func repl_policy_func_table[NUM_REPL] = {
   { REPL_BRRIP,   brrip_action_init,    general_action_repl,  nru_update_hit,     brrip_update_insert,  srrip_update_evict  },
   { REPL_DRRIP,   drrip_action_init,    general_action_repl,  nru_update_hit,     drrip_update_insert,  drrip_update_evict  },
   { REPL_SHIP,    ship_action_init,     general_action_repl,  ship_update_hit,    ship_update_insert,   ship_update_evict   },
-  { REPL_MARKED_RRIP, general_action_init, general_action_repl, nru_update_hit,   marked_rrip_update_insert, srrip_update_evict },
+  { REPL_MARKED_RRIP, general_action_init, general_action_repl, marked_rrip_update_hit, marked_rrip_update_insert, srrip_update_evict },
   { REPL_VOID,    NULL,                 NULL,                 NULL,               NULL,                 NULL                },
 };
 // clang-format on
