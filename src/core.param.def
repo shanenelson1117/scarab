@@ -135,12 +135,16 @@ DEF_PARAM(td_load_rrip_mark, TD_LOAD_RRIP_MARK, Flag, Flag, FALSE, )
    marked line inserts at exactly this value. Default 0 reproduces the pre-change
    marked=RRPV-0 behavior. */
 DEF_PARAM(td_load_rrip_min_rrpv, TD_LOAD_RRIP_MIN_RRPV, int, int, 0, )
-/* Gate: when TRUE, linearly map a marked load's mean memory-bound fraction to an initial
-   RRPV in [td_load_rrip_min_rrpv, RRIP_DISTANT_VAL-1] (fraction 1.0 -> min, most
-   protected). When FALSE, all marked lines get td_load_rrip_min_rrpv. */
+/* Gate: when TRUE, derive a recorded load's initial RRPV from its mean memory-bound
+   fraction, interpolating in [td_load_rrip_min_rrpv, RRIP_DISTANT_VAL-1] (fraction 1.0 ->
+   min, most protected); the ramp's lower bound is td_load_rrip_extrap_anchor, and any
+   fraction below the anchor inserts at basic. When FALSE, a recorded load gets
+   td_load_rrip_min_rrpv iff its fraction exceeds TD_LOAD_REPLAY_THRESH, else basic. */
 DEF_PARAM(td_load_rrip_extrapolate, TD_LOAD_RRIP_EXTRAPOLATE, Flag, Flag, FALSE, )
-/* Low fraction anchor of the extrapolation ramp (the fraction that maps to the basic
-   non-prioritized insert value). Negative => fall back to TD_LOAD_REPLAY_THRESH. */
+/* Extrapolation mode only: the SOLE lower bound of the ramp (the fraction that maps to the
+   basic non-prioritized insert value). Fractions below the anchor insert at basic; the
+   replay threshold is NOT consulted in extrapolate mode. Negative => fall back to
+   TD_LOAD_REPLAY_THRESH. */
 DEF_PARAM(td_load_rrip_extrap_anchor, TD_LOAD_RRIP_EXTRAP_ANCHOR, float, float, -1.0, )
 
 /********NODE TABLE

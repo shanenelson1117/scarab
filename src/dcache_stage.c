@@ -800,12 +800,13 @@ static inline Dcache_Data* dcache_fill_get_cacheline(Mem_Req* req) {
         req->off_path, hexstr64s(req->addr), (int)req->addr, (int)(req->addr >> LOG2(DCACHE_LINE_SIZE)), req->op_count,
         (req->op_count ? req->oldest_op_unique_num : -1));
 
-  // marked-RRIP: protect this line if the triggering PC/addr is a recorded memory-bound
-  // load. Pass the recorded membound fraction so the insert path can extrapolate the RRPV.
+  // marked-RRIP: look up the triggering PC/addr's recorded membound fraction on demand and
+  // hand it to the insert path, which derives the initial RRPV from the fraction (gated by
+  // the anchor in extrapolate mode, or the replay threshold in fixed-min mode).
   if (TD_LOAD_RRIP_MARK) {
     double frac = 0.0;
-    Flag   marked = td_load_key_fraction(req->oldest_op_addr, &frac);
-    cache_set_marked_next_insert(marked, frac);
+    Flag   recorded = td_load_key_fraction(req->oldest_op_addr, &frac);
+    cache_set_marked_next_insert(recorded, frac);
   }
 
   data = (Dcache_Data*)cache_insert(&dc->dcache, dc->proc_id, req->addr, &line_addr, &repl_line_addr);

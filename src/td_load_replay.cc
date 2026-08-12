@@ -179,9 +179,10 @@ Flag td_load_is_marked_key(uns64 key) {
   return (it != g_ratio.end() && it->second > (double)TD_LOAD_REPLAY_THRESH) ? TRUE : FALSE;
 }
 
-/* Like td_load_is_marked_key, but also reports the recorded mean memory-bound fraction so
- * the marked-RRIP insert path can extrapolate an initial RRPV. Returns TRUE (and sets
- * *out_frac) when the key is recorded and above threshold; FALSE otherwise (*out_frac 0). */
+/* Report a key's recorded mean memory-bound fraction (looked up on demand). Returns TRUE
+ * (and sets *out_frac) iff the key is recorded, WITHOUT applying any threshold -- the
+ * marked-RRIP insert path decides how to gate the fraction (anchor in extrapolate mode,
+ * replay threshold in fixed-min mode). FALSE (and *out_frac 0) when the key is unrecorded. */
 Flag td_load_key_fraction(uns64 key, double* out_frac) {
   if (out_frac)
     *out_frac = 0.0;
@@ -189,7 +190,7 @@ Flag td_load_key_fraction(uns64 key, double* out_frac) {
   if (g_ratio.empty())
     return FALSE;
   auto it = g_ratio.find(key);
-  if (it == g_ratio.end() || it->second <= (double)TD_LOAD_REPLAY_THRESH)
+  if (it == g_ratio.end())
     return FALSE;
   if (out_frac)
     *out_frac = it->second;

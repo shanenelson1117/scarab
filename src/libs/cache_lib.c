@@ -1532,54 +1532,64 @@ void srrip_update_insert(Cache* cache, uns8 proc_id, uns set, uns way, void* arg
   cache_debug_print_set(cache, set, way, CACHE_EVENT_INSERT);
 }
 
-/* MARKED_RRIP: SRRIP variant that protects memory-bound lines. A marked line inserts at a
- * configurable minimum RRPV (TD_LOAD_RRIP_MIN_RRPV, which may be negative for protection
- * stronger than RRPV 0); when TD_LOAD_RRIP_EXTRAPOLATE is set, the load's mean membound
- * fraction is linearly mapped to an RRPV in [min, RRIP_DISTANT_VAL-1] (fraction 1.0 -> min).
- * Everything else inserts at the standard SRRIP distant value. Marking + fraction are
- * signalled one-shot via cache_set_marked_next_insert(). On a hit the line is promoted to
- * min(0, its inserted RRPV) (marked_rrip_update_hit) so aging can't erase the protection;
- * eviction/aging reuse SRRIP (srrip_update_evict). */
-static Flag   g_marked_rrip_next_insert = FALSE;
-static double g_marked_rrip_next_frac   = 0.0;
+/* MARKED_RRIP: SRRIP variant that protects memory-bound lines. The next line's recorded
+ * mean membound fraction is looked up on demand and signalled one-shot via
+ * cache_set_marked_next_insert(recorded, frac); marked_rrip_update_insert then derives the
+ * initial RRPV from it:
+ *   - key not recorded            -> basic (standard SRRIP distant, unprotected);
+ *   - fixed-min (extrapolate off) -> min RRPV if fraction > replay threshold, else basic;
+ *   - extrapolate on              -> the ANCHOR (not the replay threshold) is the sole ramp
+ *                                    bound: fraction < anchor -> basic; from anchor (-> basic)
+ *                                    up to 1.0 (-> min) the RRPV is interpolated from the
+ *                                    fraction. min may be negative (protection stronger than
+ *                                    RRPV 0). Anchor < 0 defaults to the replay threshold.
+ * On a hit the line is promoted to min(0, its inserted RRPV) (marked_rrip_update_hit) so
+ * aging can't erase the protection; eviction/aging reuse SRRIP (srrip_update_evict). */
+static Flag   g_marked_rrip_recorded  = FALSE;  // was the next-inserted line's key recorded?
+static double g_marked_rrip_next_frac = 0.0;    // that key's recorded mean membound fraction
 
-void cache_set_marked_next_insert(Flag marked, double frac) {
-  g_marked_rrip_next_insert = marked;
-  g_marked_rrip_next_frac   = frac;
+void cache_set_marked_next_insert(Flag recorded, double frac) {
+  g_marked_rrip_recorded  = recorded;
+  g_marked_rrip_next_frac = frac;
 }
 
 void marked_rrip_update_insert(Cache* cache, uns8 proc_id, uns set, uns way, void* arg);
 void marked_rrip_update_insert(Cache* cache, uns8 proc_id, uns set, uns way, void* arg) {
-  const int basic = RRIP_DISTANT_VAL - 1;
+  const int    basic = RRIP_DISTANT_VAL - 1;
+  const double f     = g_marked_rrip_next_frac;  // recorded fraction, determined on demand
   int rrpv;
-  if (!g_marked_rrip_next_insert) {
-    rrpv = basic;
+  if (!g_marked_rrip_recorded) {
+    rrpv = basic;  // key not recorded -> unprotected
   } else if (!TD_LOAD_RRIP_EXTRAPOLATE) {
-    rrpv = TD_LOAD_RRIP_MIN_RRPV;  // signed; may be < 0
+    // fixed-min mode: protect keys above the replay threshold at the minimum RRPV.
+    rrpv = (f > (double)TD_LOAD_REPLAY_THRESH) ? TD_LOAD_RRIP_MIN_RRPV : basic;
   } else {
+    // extrapolate mode: the anchor is the SOLE lower bound of the ramp (the replay
+    // threshold is not consulted). A fraction below the anchor inserts at basic; from the
+    // anchor (-> basic) up to 1.0 (-> min) the RRPV is interpolated from the fraction.
     const int lo_min = TD_LOAD_RRIP_MIN_RRPV;
     double lo = (TD_LOAD_RRIP_EXTRAP_ANCHOR >= 0.0) ? (double)TD_LOAD_RRIP_EXTRAP_ANCHOR
                                                     : (double)TD_LOAD_REPLAY_THRESH;
-    double denom = 1.0 - lo;
-    if (denom < 1e-9)
-      denom = 1e-9;
-    double f = g_marked_rrip_next_frac;
-    if (f < lo)
-      f = lo;  // clamp fraction into [lo, 1]
-    if (f > 1.0)
-      f = 1.0;
-    // fraction lo -> basic (least protected marked), fraction 1.0 -> lo_min (most protected)
-    double v = (double)basic - (f - lo) / denom * (double)(basic - lo_min);
-    rrpv = (int)(v >= 0.0 ? v + 0.5 : v - 0.5);  // round to nearest (sign-symmetric)
-    if (rrpv < lo_min)
-      rrpv = lo_min;
-    if (rrpv > basic)
-      rrpv = basic;
+    if (f < lo) {
+      rrpv = basic;  // below the anchor -> not protected
+    } else {
+      double denom = 1.0 - lo;
+      if (denom < 1e-9)
+        denom = 1e-9;
+      double ff = (f > 1.0) ? 1.0 : f;
+      // fraction lo -> basic (least protected), fraction 1.0 -> lo_min (most protected)
+      double v = (double)basic - (ff - lo) / denom * (double)(basic - lo_min);
+      rrpv = (int)(v >= 0.0 ? v + 0.5 : v - 0.5);  // round to nearest (sign-symmetric)
+      if (rrpv < lo_min)
+        rrpv = lo_min;
+      if (rrpv > basic)
+        rrpv = basic;
+    }
   }
   cache->entries[set][way].reference_val       = rrpv;
   cache->entries[set][way].marked_promote_rrpv = rrpv;  // remember for hit promotion
-  g_marked_rrip_next_insert = FALSE;                    // consume the one-shot mark
-  g_marked_rrip_next_frac   = 0.0;
+  g_marked_rrip_recorded  = FALSE;                      // consume the one-shot
+  g_marked_rrip_next_frac = 0.0;
 
   cache_debug_print_set(cache, set, way, CACHE_EVENT_INSERT);
 }
