@@ -96,8 +96,9 @@ void topdown_bp_recovery(uns proc_id, Op* op) {
 
 void topdown_idq_update(uns proc_id, int count_available, int count_issued, int count_issued_on_path) {
   // per-load memory-boundness tracking: classify this cycle and tag every in-flight load's window
-  // (needed by the record pass and by the in-sim gap-tracking mode)
-  if (TD_LOAD_TRACK_ENABLE || TD_LOAD_EVICT_TRACK) {
+  // (needed by the record pass, the in-sim gap-tracking mode, and the on-demand marked-RRIP
+  // policy which reads td_mem_cycles/td_window_cycles at fill time -- no record CSV)
+  if (TD_LOAD_TRACK_ENABLE || TD_LOAD_EVICT_TRACK || TD_LOAD_RRIP_MARK) {
     Flag backend_stall = (count_issued == 0 && idq_stage_get_stage_data()->op_count > 0);
     Flag mem_bound_cycle = backend_stall && (lsq_get_in_flight_load_num() > 0);
     lsq_tag_inflight_loads(mem_bound_cycle);

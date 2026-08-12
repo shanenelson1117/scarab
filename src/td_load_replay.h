@@ -40,12 +40,6 @@ Flag td_load_should_force_l1_hit(Op* op);
  * marked-RRIP dcache policy to protect memory-bound lines at insertion. */
 Flag td_load_is_marked_key(uns64 key);
 
-/* Report a key's recorded mean memory-bound fraction via *out_frac (0 when unrecorded),
- * WITHOUT applying any threshold. Returns TRUE iff the key is recorded. The marked-RRIP
- * insert path gates the fraction itself (anchor in extrapolate mode, replay threshold in
- * fixed-min mode). */
-Flag td_load_key_fraction(uns64 key, double* out_frac);
-
 /* td_load_evict_track mode (line/address-keyed, self-contained). Measures, between two
  * consecutive exceeding accesses to the same L1D line l, the number of DISTINCT lines
  * filled into set(l) (S) vs. the associativity (W); eviction <=> S >= W. */

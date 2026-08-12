@@ -187,11 +187,11 @@ void init_cache(Cache*, const char*, uns, uns, uns, uns, Repl_Policy);
 void* cache_access(Cache*, Addr, Addr*, Flag);
 void* cache_insert(Cache*, uns8, Addr, Addr*, Addr*);
 /* REPL_MARKED_RRIP: set right before a cache_insert to control the inserted line's RRPV.
- * marked==TRUE selects the memory-bound insertion path (RRPV derived from td_load_rrip_*
- * params and, when extrapolating, the load's membound fraction); FALSE inserts at the
+ * have_frac==TRUE selects the memory-bound insertion path (RRPV derived from td_load_rrip_*
+ * params and the demanding load's on-demand membound fraction `frac`); FALSE inserts at the
  * normal SRRIP distant value. One-shot: consumed and cleared by the next marked_rrip
  * insert. */
-void cache_set_marked_next_insert(Flag marked, double frac);
+void cache_set_marked_next_insert(Flag have_frac, double frac);
 void* cache_insert_replpos(Cache* cache, uns8 proc_id, Addr addr, Addr* line_addr, Addr* repl_line_addr,
                            Cache_Insert_Repl insert_repl_policy, Flag isPrefetch);
 void* cache_insert_lru(Cache*, uns8, Addr, Addr*, Addr*);

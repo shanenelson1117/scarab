@@ -1532,11 +1532,12 @@ void srrip_update_insert(Cache* cache, uns8 proc_id, uns set, uns way, void* arg
   cache_debug_print_set(cache, set, way, CACHE_EVENT_INSERT);
 }
 
-/* MARKED_RRIP: SRRIP variant that protects memory-bound lines. The next line's recorded
- * mean membound fraction is looked up on demand and signalled one-shot via
- * cache_set_marked_next_insert(recorded, frac); marked_rrip_update_insert then derives the
+/* MARKED_RRIP: SRRIP variant that protects memory-bound lines. The demanding load's
+ * memory-bound fraction is computed ON DEMAND at fill time (td_mem_cycles/td_window_cycles,
+ * the same quantity the record pass measures -- no CSV) and signalled one-shot via
+ * cache_set_marked_next_insert(have_frac, frac); marked_rrip_update_insert then derives the
  * initial RRPV from it:
- *   - key not recorded            -> basic (standard SRRIP distant, unprotected);
+ *   - no fraction (prefetch/off-path) -> basic (standard SRRIP distant, unprotected);
  *   - fixed-min (extrapolate off) -> min RRPV if fraction > replay threshold, else basic;
  *   - extrapolate on              -> the ANCHOR (not the replay threshold) is the sole ramp
  *                                    bound: fraction < anchor -> basic; from anchor (-> basic)
@@ -1545,21 +1546,21 @@ void srrip_update_insert(Cache* cache, uns8 proc_id, uns set, uns way, void* arg
  *                                    RRPV 0). Anchor < 0 defaults to the replay threshold.
  * On a hit the line is promoted to min(0, its inserted RRPV) (marked_rrip_update_hit) so
  * aging can't erase the protection; eviction/aging reuse SRRIP (srrip_update_evict). */
-static Flag   g_marked_rrip_recorded  = FALSE;  // was the next-inserted line's key recorded?
-static double g_marked_rrip_next_frac = 0.0;    // that key's recorded mean membound fraction
+static Flag   g_marked_rrip_have_frac = FALSE;  // is a membound fraction available for the next insert?
+static double g_marked_rrip_next_frac = 0.0;    // the demanding load's on-demand membound fraction
 
-void cache_set_marked_next_insert(Flag recorded, double frac) {
-  g_marked_rrip_recorded  = recorded;
+void cache_set_marked_next_insert(Flag have_frac, double frac) {
+  g_marked_rrip_have_frac = have_frac;
   g_marked_rrip_next_frac = frac;
 }
 
 void marked_rrip_update_insert(Cache* cache, uns8 proc_id, uns set, uns way, void* arg);
 void marked_rrip_update_insert(Cache* cache, uns8 proc_id, uns set, uns way, void* arg) {
   const int    basic = RRIP_DISTANT_VAL - 1;
-  const double f     = g_marked_rrip_next_frac;  // recorded fraction, determined on demand
+  const double f     = g_marked_rrip_next_frac;  // on-demand membound fraction for this fill
   int rrpv;
-  if (!g_marked_rrip_recorded) {
-    rrpv = basic;  // key not recorded -> unprotected
+  if (!g_marked_rrip_have_frac) {
+    rrpv = basic;  // no fraction available (e.g. prefetch fill, off-path) -> unprotected
   } else if (!TD_LOAD_RRIP_EXTRAPOLATE) {
     // fixed-min mode: protect keys above the replay threshold at the minimum RRPV.
     rrpv = (f > (double)TD_LOAD_REPLAY_THRESH) ? TD_LOAD_RRIP_MIN_RRPV : basic;
@@ -1588,7 +1589,7 @@ void marked_rrip_update_insert(Cache* cache, uns8 proc_id, uns set, uns way, voi
   }
   cache->entries[set][way].reference_val       = rrpv;
   cache->entries[set][way].marked_promote_rrpv = rrpv;  // remember for hit promotion
-  g_marked_rrip_recorded  = FALSE;                      // consume the one-shot
+  g_marked_rrip_have_frac = FALSE;                      // consume the one-shot
   g_marked_rrip_next_frac = 0.0;
 
   cache_debug_print_set(cache, set, way, CACHE_EVENT_INSERT);

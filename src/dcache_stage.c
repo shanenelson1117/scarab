@@ -800,13 +800,30 @@ static inline Dcache_Data* dcache_fill_get_cacheline(Mem_Req* req) {
         req->off_path, hexstr64s(req->addr), (int)req->addr, (int)(req->addr >> LOG2(DCACHE_LINE_SIZE)), req->op_count,
         (req->op_count ? req->oldest_op_unique_num : -1));
 
-  // marked-RRIP: look up the triggering PC/addr's recorded membound fraction on demand and
-  // hand it to the insert path, which derives the initial RRPV from the fraction (gated by
-  // the anchor in extrapolate mode, or the replay threshold in fixed-min mode).
+  // marked-RRIP: compute the demanding load's memory-bound fraction ON DEMAND (no record
+  // CSV), the same way the record pass does -- td_mem_cycles / td_window_cycles accumulated
+  // by lsq_tag_inflight_loads over the load's in-flight window. Use the oldest still-valid
+  // load waiting on this fill; the insert path derives the initial RRPV from the fraction
+  // (gated by the anchor in extrapolate mode, or the replay threshold in fixed-min mode).
   if (TD_LOAD_RRIP_MARK) {
     double frac = 0.0;
-    Flag   recorded = td_load_key_fraction(req->oldest_op_addr, &frac);
-    cache_set_marked_next_insert(recorded, frac);
+    Flag   have_frac = FALSE;
+    Op** op_p = (Op**)list_start_head_traversal(&req->op_ptrs);
+    Counter* op_u = (Counter*)list_start_head_traversal(&req->op_uniques);
+    for (; op_p; op_p = (Op**)list_next_element(&req->op_ptrs),
+                 op_u = (Counter*)list_next_element(&req->op_uniques)) {
+      Op* op = *op_p;
+      if (!op || !op_u || op->unique_num != *op_u || !op->op_pool_valid)
+        continue;  // stale/freed op slot
+      // on-path loads only, mirroring the record pass (off-path ops never retire there)
+      if (op->off_path || op->inst_info->table_info.mem_type != MEM_LD ||
+          op->td_window_cycles == 0)
+        continue;
+      frac = (double)op->td_mem_cycles / (double)op->td_window_cycles;
+      have_frac = TRUE;
+      break;  // oldest valid on-path demanding load
+    }
+    cache_set_marked_next_insert(have_frac, frac);
   }
 
   data = (Dcache_Data*)cache_insert(&dc->dcache, dc->proc_id, req->addr, &line_addr, &repl_line_addr);
