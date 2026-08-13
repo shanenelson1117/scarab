@@ -1,0 +1,252 @@
+# File         : PARAMS.mockingjay
+# Description  : Core/memory configuration matching the Mockingjay (HPCA'22) evaluation
+#                machine, expressed in Scarab parameters.
+#
+# Requested spec -> Scarab mapping:
+#   OoO 352-entry ROB            -> --node_table_size 352
+#   128-entry LQ                 -> --load_queue_entry_num 128   (--lsq_enable 1)
+#   72-entry SQ                  -> --store_queue_entry_num 72
+#   FetchWidth  = 6              -> --decode_width 6   (IC_ISSUE_WIDTH == DECODE_WIDTH)
+#   ExecWidth   = 4              -> --issue_width 4
+#   RetireWidth = 4              -> --node_ret_width 4
+#   L1 I$ 32KB 8-way, 4cyc, 8MSHR   -> --icache_size 32768  --icache_assoc 8  --icache_latency 4
+#   L1 D$ 32KB 8-way, 4cyc, 16MSHR  -> --dcache_size 32768  --dcache_assoc 8  --dcache_cycles 4
+#   L2   256KB 8-way, 8cyc, 32MSHR  -> --mlc_size 262144    --mlc_assoc 8    --mlc_cycles 8
+#   LLC  2MB 16-way, 20cyc, 64MSHR  -> --l1_size 2097152    --l1_assoc 16    --l1_cycles 20
+#   DRAM tRP/tRCD/tCAS = 12.5ns  -> --ramulator_tRP/tRCD/tCL 10 (at tCK = 1.25ns)
+#   DRAM 800 MHz, 25.6 GB/s      -> --ramulator_tCK 1250000 (800MHz clk, 1600 MT/s),
+#                                   2 channels x 8B x 1600 MT/s = 25.6 GB/s
+#
+# IMPORTANT Scarab-vs-spec caveats:
+#   * Cache-level naming is INVERTED in Scarab: icache/dcache = L1, mlc = L2, l1_* = LLC.
+#   * FetchWidth and decode width share one knob (IC_ISSUE_WIDTH == DECODE_WIDTH), so
+#     --decode_width 6 sets BOTH the fetch and decode bandwidth to 6.
+#   * Scarab has no per-cache MSHR count. Requested MSHRs are APPROXIMATED:
+#       L1D=16 -> --mem_req_buffer_entries 16 ; L2=32 -> --queue_mlc_size 32 ;
+#       LLC=64 -> --queue_l1_size 64 ; L1I=8 has no separate knob (unmodeled).
+#   * DRAM secondary timings (tRAS/tCWL/tWTR/...) are reasonable DDR4 approximations;
+#     only tRP/tRCD/tCAS (=12.5ns), the 800MHz clock, and 25.6 GB/s peak are pinned.
+#   * Core frequency (4 GHz) is assumed (not given in the Mockingjay core table); it sets
+#     the ns<->cycle bridge to DRAM. Change --chip_cycle_time to rescale.
+#   * The branch predictor and the RS/FU execution topology are NOT part of the Mockingjay
+#     spec; they are inherited from PARAMS.kmhv3 (known-good, aggressive) and are tunable.
+#   * Prefetching is DISABLED by default to isolate the replacement policy (Mockingjay's
+#     usual no-prefetch setting). Flip --pref_framework_on 1 to enable the stream prefetcher.
+
+## Simulation Parameters
+--mode                          full
+--model                         cmp
+--sim_limit                     none
+
+## Core Parameters
+
+# Femtoseconds; 4.0 GHz assumed (Mockingjay core frequency unspecified). Used for energy
+# and as the core<->DRAM cycle bridge.
+--chip_cycle_time               250000
+
+### Fetch Stage
+--fetch_off_path_ops            1
+
+# Decoupled frontend FTQ
+--fe_ftq_block_num              64
+
+#### ICache -- Mockingjay L1 I$: 32 KB, 8-way, 4-cycle
+--icache_size                   32768
+--icache_assoc                  8
+--icache_line_size              64
+--icache_latency                4
+--icache_read_ports             2
+
+### Uop Cache -- not modeled
+--uop_cache_enable              0
+--uop_cache_width               8
+--uop_cache_lines               512
+--uop_cache_assoc               8
+--iprf_on_uop_cache_hit         1
+
+### Branch Predictor  (inherited from PARAMS.kmhv3; not part of the Mockingjay spec)
+--cfs_per_cycle                 6
+--bp_update_at_retire           0
+--update_bp_off_path            1
+--bp_mech                       tage64k
+
+#### BTB
+--btb_mech                      generic
+--btb_entries                   12288
+--btb_assoc                     4
+--btb_main_latency              3
+--btb_l0_present                1
+--btb_l0_entries                128
+--btb_l0_assoc                  4
+--btb_l0_latency                1
+--btb_l1_present                1
+--btb_l1_entries                6144
+--btb_l1_assoc                  4
+--btb_l1_latency                2
+--btb_off_path_writes           1
+--perfect_nt_btb                0
+
+#### CRS (RAS)
+--enable_crs                    1
+--crs_entries                   128
+--crs_realistic                 1
+
+### iBP (ITTAGE)
+--enable_ibp                    1
+--ibtb_mech                     tc_tagged
+--ibtb_off_path_writes          1
+--tc_entries                    4096
+--tc_assoc                      4
+
+### Decode Stage
+# FetchWidth = 6 (IC_ISSUE_WIDTH == DECODE_WIDTH sets both fetch and decode bandwidth)
+--decode_width                  6
+--decode_cycles                 5
+
+### Instruction Decode Queue
+--idq_size                      64
+
+### Map Stage
+--map_cycles                    5
+--reg_renaming_scheme               1
+--reg_table_integer_physical_size   224
+--reg_table_vector_physical_size    256
+
+### Issue Stage
+# ExecWidth = 4
+--issue_width                   4
+
+--rs_fill_width                 0
+# RS / FU topology inherited from PARAMS.kmhv3 (not specified by Mockingjay). issue_width
+# above caps dispatch to 4/cycle regardless of the port count below.
+--rs_sizes                      97 70 19
+--rs_connections                b0100110011 b1000001100 b0011000000
+--fu_types                      b00100100111111100111001001111110010010011111110011100100111111 b10010000110111100011111001110111001000011011110001111100111011 b00000001000000001000000010000010000000100000000100000001000001 b00000001000000001000000010000010000000100000000100000001000001 b00000000110111100011011001110110000000011011110001101100111011 b01001000000000000111001001111110100100000000000011100100111111 b00000010000000010000000100000010000001000000001000000010000001 b00000010000000010000000100000010000001000000001000000010000001 b00000000000000000011001001110110000000000000000001100100111011 b00000001000000001000000010000010000000100000000100000001000001
+
+### Exec Stage
+
+### Load/Store Queue -- Mockingjay: 128-entry LQ, 72-entry SQ
+--lsq_enable                    1
+--load_queue_entry_num          128
+--store_queue_entry_num         72
+
+### DCache -- Mockingjay L1 D$: 32 KB, 8-way, 4-cycle, 16 MSHRs
+--dcache_size                   32768
+--dcache_assoc                  8
+--dcache_line_size              64
+--dcache_cycles                 4
+--dcache_read_ports             2
+--dcache_write_ports            1
+--dcache_banks                  8
+
+### Reorder/Retire Stage
+# RetireWidth = 4
+--node_ret_width                4
+# ROB = 352 entries
+--node_table_size               352
+
+--stores_do_not_block_window    1
+--prefs_do_not_block_window     1
+
+
+## Uncore  (Scarab naming: mlc = L2, l1_* = LLC)
+
+### L2  (mlc) -- Mockingjay L2: 256 KB, 8-way, 8-cycle, 32 MSHRs
+--mlc_present                   1
+--mlc_size                      262144
+--mlc_assoc                     8
+--mlc_line_size                 64
+--mlc_cycles                    8
+--mlc_banks                     8
+
+### LLC  (l1_*) -- Mockingjay LLC: 2 MB per core, 16-way, 20-cycle, 64 MSHRs
+--l1_size                       2097152
+--l1_assoc                      16
+--l1_line_size                  64
+--l1_cycles                     20
+--l1_banks                      8
+--l1_interleave_factor          64
+
+
+### Prefetcher -- disabled to isolate the replacement policy (flip to 1 to enable)
+--pref_framework_on             0
+--pref_stream_on                0
+
+
+### Memory
+--addr_translation              random
+
+--mem_priority_ifetch           0
+--mem_priority_dfetch           1
+--mem_priority_dstore           2
+--mem_priority_iprf             3
+--mem_priority_dprf             4
+--mem_priority_wb               5
+--mem_priority_wb_nodirty       5
+
+# Per-cache MSHR approximation (Scarab has no explicit per-cache MSHR knob):
+#   L1D = 16 outstanding
+--mem_req_buffer_entries        16
+#   L2  = 32 outstanding
+--queue_mlc_size                32
+#   LLC = 64 outstanding
+--queue_l1_size                 64
+--bus_width_in_bytes            8
+
+### DRAM (ramulator): DDR4, 800 MHz command clock (1600 MT/s), tRP=tRCD=tCAS=12.5ns,
+### 2 channels x 8B x 1600 MT/s = 25.6 GB/s peak.
+--ramulator_standard            DDR4
+--ramulator_speed               DDR4_2400R
+--ramulator_org                 DDR4_8Gb_x8
+--ramulator_channels            2
+--ramulator_ranks               1
+--ramulator_bankgroups          4
+--ramulator_banks               4
+--ramulator_chip_width          8
+--ramulator_rows                65536
+--ramulator_cols                1024
+--ramulator_scheduling_policy   FRFCFS_Cap
+--ramulator_readq_entries       64
+--ramulator_writeq_entries      64
+--ramulator_record_cmd_trace    FALSE
+--ramulator_print_cmd_trace     FALSE
+# tCK = 1.25 ns (800 MHz)
+--ramulator_tCK                 1250000
+# tRP = tRCD = tCAS = 12.5 ns = 10 cycles @ 1.25 ns/cycle
+--ramulator_tCL                 10
+--ramulator_tRCD                10
+--ramulator_tRCDR               10
+--ramulator_tRCDW               10
+--ramulator_tRP                 10
+--ramulator_tRPpb               10
+--ramulator_tRPab               10
+# secondary timings (DDR4 approximations; not pinned by the spec)
+--ramulator_tCWL                9
+--ramulator_tBL                 4
+--ramulator_tCCD                4
+--ramulator_tCCDS               4
+--ramulator_tCCDL               6
+--ramulator_tWTR                6
+--ramulator_tWTRS               3
+--ramulator_tWTRL               6
+--ramulator_tRAS                28
+--dram_tech_in_nm               32
+
+## Other
+
+### Debug
+--debug_inst_start              0
+--debug_inst_stop              -1
+--debug_cycle_start             0
+--debug_cycle_stop             -1
+
+## Stats and Params
+--dump_params                   1
+--dump_stats                    1
+--dump_trace                    0
+
+####################################
+--set_off_path_confirmed        1
+--order_beyond_bus              1
+--mem_ooo_stores                1
+--mem_obey_store_dep            1
