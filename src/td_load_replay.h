@@ -40,6 +40,12 @@ Flag td_load_should_force_l1_hit(Op* op);
  * marked-RRIP dcache policy to protect memory-bound lines at insertion. */
 Flag td_load_is_marked_key(uns64 key);
 
+/* Marked-RRIP hit predictor (--td_load_rrip_hit_predict): a load-PC-indexed EWMA of measured
+ * miss memory-bound fractions. `update` folds one on-path demand miss's fraction into the
+ * PC's estimate; `lookup` returns TRUE (and sets *out_frac) if the PC has an estimate yet. */
+void td_load_pc_pred_update(Addr pc, double frac);
+Flag td_load_pc_pred_lookup(Addr pc, double* out_frac);
+
 /* td_load_evict_track mode (line/address-keyed, self-contained). Measures, between two
  * consecutive exceeding accesses to the same L1D line l, the number of DISTINCT lines
  * filled into set(l) (S) vs. the associativity (W); eviction <=> S >= W. */

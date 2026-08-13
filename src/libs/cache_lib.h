@@ -192,6 +192,11 @@ void* cache_insert(Cache*, uns8, Addr, Addr*, Addr*);
  * normal SRRIP distant value. One-shot: consumed and cleared by the next marked_rrip
  * insert. */
 void cache_set_marked_next_insert(Flag have_frac, double frac);
+/* REPL_MARKED_RRIP hit predictor (--td_load_rrip_hit_predict): stage the accessing load's
+ * PC-predicted membound fraction so the next hit re-derives its RRPV from it. have==FALSE
+ * (or never called) keeps the legacy min(0, inserted RRPV) hit behavior. One-shot: consumed
+ * by the next marked_rrip hit. */
+void cache_set_hit_promote_frac(Flag have, double frac);
 void* cache_insert_replpos(Cache* cache, uns8 proc_id, Addr addr, Addr* line_addr, Addr* repl_line_addr,
                            Cache_Insert_Repl insert_repl_policy, Flag isPrefetch);
 void* cache_insert_lru(Cache*, uns8, Addr, Addr*, Addr*);

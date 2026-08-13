@@ -148,6 +148,16 @@ DEF_PARAM(td_load_rrip_extrapolate, TD_LOAD_RRIP_EXTRAPOLATE, Flag, Flag, FALSE,
    replay threshold is NOT consulted in extrapolate mode. Negative => fall back to
    TD_LOAD_REPLAY_THRESH. */
 DEF_PARAM(td_load_rrip_extrap_anchor, TD_LOAD_RRIP_EXTRAP_ANCHOR, float, float, -1.0, )
+/* Marked-RRIP hit-promotion predictor. When TRUE, a hit re-derives the line's RRPV from a
+   PC-indexed EWMA of the accessing load's measured miss memory-bound fraction (its
+   counterfactual "how membound it would have been if it had missed") via the same
+   min/anchor/extrapolate math, instead of restoring min(0, the inserted RRPV). Warmup (a PC
+   with no recorded miss) falls back to that legacy behavior. FALSE = legacy behavior for
+   every hit. Requires td_load_rrip_mark. */
+DEF_PARAM(td_load_rrip_hit_predict, TD_LOAD_RRIP_HIT_PREDICT, Flag, Flag, FALSE, )
+/* EWMA weight for the per-PC membound predictor, in (0,1]: pred = (1-a)*pred + a*measured.
+   Larger = tracks recent misses faster. Values <=0 or >1 are clamped to the 0.25 default. */
+DEF_PARAM(td_load_rrip_pred_alpha, TD_LOAD_RRIP_PRED_ALPHA, float, float, 0.25, )
 
 /********NODE TABLE
  * PARAMETERS********************************************************/

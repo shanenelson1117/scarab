@@ -270,7 +270,21 @@ void update_dcache_stage(Stage_Data* src_sd) {
 
     /* now access the dcache with it */
     Addr line_addr;
+    // marked-RRIP hit predictor: stage this load's PC-predicted membound fraction so a hit
+    // re-derives the RRPV from it. Tightly scoped to this one access and cleared right after
+    // so it can't leak to store/prefetch hits (they keep the legacy min(0,target) promotion).
+    Flag td_hit_pred_staged = FALSE;
+    if (TD_LOAD_RRIP_MARK && TD_LOAD_RRIP_HIT_PREDICT && !op->off_path &&
+        op->inst_info->table_info.mem_type == MEM_LD) {
+      double pf = 0.0;
+      if (td_load_pc_pred_lookup(op->inst_info->addr, &pf)) {
+        cache_set_hit_promote_frac(TRUE, pf);
+        td_hit_pred_staged = TRUE;
+      }
+    }
     Dcache_Data* line = (Dcache_Data*)cache_access(&dc->dcache, op->oracle_info.va, &line_addr, TRUE);
+    if (td_hit_pred_staged)
+      cache_set_hit_promote_frac(FALSE, 0.0);  // clear one-shot (consumed on hit; drop on miss)
     op->dcache_cycle = cycle_count;
     dc->idle_cycle = MAX2(dc->idle_cycle, cycle_count + DCACHE_CYCLES);
 
@@ -808,6 +822,7 @@ static inline Dcache_Data* dcache_fill_get_cacheline(Mem_Req* req) {
   if (TD_LOAD_RRIP_MARK) {
     double frac = 0.0;
     Flag   have_frac = FALSE;
+    Addr   frac_pc = 0;
     Op** op_p = (Op**)list_start_head_traversal(&req->op_ptrs);
     Counter* op_u = (Counter*)list_start_head_traversal(&req->op_uniques);
     for (; op_p; op_p = (Op**)list_next_element(&req->op_ptrs),
@@ -820,10 +835,14 @@ static inline Dcache_Data* dcache_fill_get_cacheline(Mem_Req* req) {
           op->td_window_cycles == 0)
         continue;
       frac = (double)op->td_mem_cycles / (double)op->td_window_cycles;
+      frac_pc = op->inst_info->addr;
       have_frac = TRUE;
       break;  // oldest valid on-path demanding load
     }
     cache_set_marked_next_insert(have_frac, frac);
+    // hit predictor: teach this load PC how membound it is when it actually misses
+    if (have_frac && TD_LOAD_RRIP_HIT_PREDICT)
+      td_load_pc_pred_update(frac_pc, frac);
   }
 
   data = (Dcache_Data*)cache_insert(&dc->dcache, dc->proc_id, req->addr, &line_addr, &repl_line_addr);

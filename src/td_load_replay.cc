@@ -32,6 +32,12 @@ extern "C" {
 static bool g_replay_loaded = false;
 static std::unordered_map<uns64, double> g_ratio;  // key (PC or va) -> mean mem-bound fraction
 
+/* Marked-RRIP hit predictor (--td_load_rrip_hit_predict): load PC -> EWMA of the load's
+ * measured miss memory-bound fraction. Updated at each on-path demand miss; queried at each
+ * on-path demand load hit to estimate that load's counterfactual "how membound if a miss".
+ * In-sim only (no CSV); the hardware analog is a SHiP-style PC-indexed counter table. */
+static std::unordered_map<Addr, double> g_pc_membound_pred;
+
 /* td_load_evict_track: per-set shadow LRU of distinct filled lines (MRU front), used to
  * count how many distinct lines were filled into set(l) between two consecutive exceeding
  * accesses to line l. A line with an open interval is "tracked" (frozen: its own refills
@@ -177,6 +183,27 @@ Flag td_load_is_marked_key(uns64 key) {
     return FALSE;
   auto it = g_ratio.find(key);
   return (it != g_ratio.end() && it->second > (double)TD_LOAD_REPLAY_THRESH) ? TRUE : FALSE;
+}
+
+/**************************************************************************************/
+/* Marked-RRIP hit predictor: per-PC EWMA of measured miss memory-bound fraction. */
+
+void td_load_pc_pred_update(Addr pc, double frac) {
+  double a = (double)TD_LOAD_RRIP_PRED_ALPHA;
+  if (a <= 0.0 || a > 1.0)
+    a = 0.25;
+  auto it = g_pc_membound_pred.find(pc);
+  g_pc_membound_pred[pc] =
+      (it == g_pc_membound_pred.end()) ? frac : (1.0 - a) * it->second + a * frac;
+}
+
+Flag td_load_pc_pred_lookup(Addr pc, double* out_frac) {
+  auto it = g_pc_membound_pred.find(pc);
+  if (it == g_pc_membound_pred.end())
+    return FALSE;
+  if (out_frac)
+    *out_frac = it->second;
+  return TRUE;
 }
 
 /**************************************************************************************/
