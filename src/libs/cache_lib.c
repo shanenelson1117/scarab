@@ -1532,11 +1532,11 @@ void srrip_update_insert(Cache* cache, uns8 proc_id, uns set, uns way, void* arg
   cache_debug_print_set(cache, set, way, CACHE_EVENT_INSERT);
 }
 
-/* MARKED_RRIP: SRRIP variant that protects memory-bound lines. The demanding load's
- * memory-bound fraction is computed ON DEMAND at fill time (td_mem_cycles/td_window_cycles,
- * the same quantity the record pass measures -- no CSV) and signalled one-shot via
- * cache_set_marked_next_insert(have_frac, frac); marked_rrip_update_insert then derives the
- * initial RRPV from it:
+/* MARKED_RRIP: SRRIP variant that protects "important" lines. Each caller precomputes the
+ * inserted line's RRPV from its own signal + knob set (L1D/L2: the demanding load's on-demand
+ * membound fraction td_mem_cycles/td_window_cycles; L1I: the fetch miss's front-end-bound
+ * fraction) via marked_rrip_rrpv_from_frac, then signals it one-shot via
+ * cache_set_marked_next_insert(have_rrpv, rrpv). marked_rrip_update_insert applies it:
  *   - no fraction (prefetch/off-path) -> basic (standard SRRIP distant, unprotected);
  *   - fixed-min (extrapolate off) -> min RRPV if fraction > replay threshold, else basic;
  *   - extrapolate on              -> the ANCHOR (not the replay threshold) is the sole ramp
@@ -1546,16 +1546,18 @@ void srrip_update_insert(Cache* cache, uns8 proc_id, uns set, uns way, void* arg
  *                                    RRPV 0). Anchor < 0 defaults to the replay threshold.
  * On a hit the line is promoted to min(0, its inserted RRPV) (marked_rrip_update_hit) so
  * aging can't erase the protection; eviction/aging reuse SRRIP (srrip_update_evict). */
-static Flag   g_marked_rrip_have_frac = FALSE;  // is a membound fraction available for the next insert?
-static double g_marked_rrip_next_frac = 0.0;    // the demanding load's on-demand membound fraction
+/* Insert one-shot: the caller precomputes the RRPV (from whichever signal / knob set applies
+   to its cache -- L1D/L2 membound, L1I front-end-bound, ...) so the policy stays agnostic. */
+static Flag g_marked_rrip_have_rrpv = FALSE;
+static int  g_marked_rrip_next_rrpv = 0;
 /* Optional one-shot override for the next hit's promotion RRPV (--td_load_rrip_hit_predict):
    the PC-predicted counterfactual membound fraction of the load doing the reuse. */
 static Flag   g_marked_rrip_hit_have_frac = FALSE;
 static double g_marked_rrip_hit_frac      = 0.0;
 
-void cache_set_marked_next_insert(Flag have_frac, double frac) {
-  g_marked_rrip_have_frac = have_frac;
-  g_marked_rrip_next_frac = frac;
+void cache_set_marked_next_insert(Flag have_rrpv, int rrpv) {
+  g_marked_rrip_have_rrpv = have_rrpv;
+  g_marked_rrip_next_rrpv = rrpv;
 }
 
 void cache_set_hit_promote_frac(Flag have, double frac) {
@@ -1563,28 +1565,27 @@ void cache_set_hit_promote_frac(Flag have, double frac) {
   g_marked_rrip_hit_frac      = frac;
 }
 
-/* Map a membound fraction to an initial RRPV using the td_load_rrip_* params. Shared by the
- * insert path and the predictor-driven hit path so both use identical math.
- *   - fixed-min (extrapolate off): min RRPV iff fraction > replay threshold, else basic;
+/* Map a fraction to an initial RRPV using an explicit knob set (min / extrapolate / anchor /
+ * threshold). Shared by every marked-RRIP caller so all cache levels use identical math on
+ * their own signal.
+ *   - fixed-min (extrapolate off): min RRPV iff fraction > thresh, else basic;
  *   - extrapolate on: fraction < anchor -> basic; anchor (-> basic) .. 1.0 (-> min). */
-static int marked_rrip_rrpv_from_frac(double f) {
+int marked_rrip_rrpv_from_frac(double f, int min_rrpv, Flag extrapolate, double anchor, double thresh) {
   const int basic = RRIP_DISTANT_VAL - 1;
-  if (!TD_LOAD_RRIP_EXTRAPOLATE)
-    return (f > (double)TD_LOAD_REPLAY_THRESH) ? TD_LOAD_RRIP_MIN_RRPV : basic;
-  const int lo_min = TD_LOAD_RRIP_MIN_RRPV;
-  double lo = (TD_LOAD_RRIP_EXTRAP_ANCHOR >= 0.0) ? (double)TD_LOAD_RRIP_EXTRAP_ANCHOR
-                                                  : (double)TD_LOAD_REPLAY_THRESH;
+  if (!extrapolate)
+    return (f > thresh) ? min_rrpv : basic;
+  double lo = (anchor >= 0.0) ? anchor : thresh;
   if (f < lo)
     return basic;  // below the anchor -> not protected
   double denom = 1.0 - lo;
   if (denom < 1e-9)
     denom = 1e-9;
   double ff = (f > 1.0) ? 1.0 : f;
-  // fraction lo -> basic (least protected), fraction 1.0 -> lo_min (most protected)
-  double v = (double)basic - (ff - lo) / denom * (double)(basic - lo_min);
+  // fraction lo -> basic (least protected), fraction 1.0 -> min_rrpv (most protected)
+  double v = (double)basic - (ff - lo) / denom * (double)(basic - min_rrpv);
   int rrpv = (int)(v >= 0.0 ? v + 0.5 : v - 0.5);  // round to nearest (sign-symmetric)
-  if (rrpv < lo_min)
-    rrpv = lo_min;
+  if (rrpv < min_rrpv)
+    rrpv = min_rrpv;
   if (rrpv > basic)
     rrpv = basic;
   return rrpv;
@@ -1593,12 +1594,12 @@ static int marked_rrip_rrpv_from_frac(double f) {
 void marked_rrip_update_insert(Cache* cache, uns8 proc_id, uns set, uns way, void* arg);
 void marked_rrip_update_insert(Cache* cache, uns8 proc_id, uns set, uns way, void* arg) {
   const int basic = RRIP_DISTANT_VAL - 1;
-  // no fraction available (e.g. prefetch fill, off-path) -> unprotected
-  int rrpv = g_marked_rrip_have_frac ? marked_rrip_rrpv_from_frac(g_marked_rrip_next_frac) : basic;
+  // no RRPV staged (e.g. prefetch fill, off-path, unmarked cache) -> unprotected
+  int rrpv = g_marked_rrip_have_rrpv ? g_marked_rrip_next_rrpv : basic;
   cache->entries[set][way].reference_val       = rrpv;
   cache->entries[set][way].marked_promote_rrpv = rrpv;  // remember for hit promotion
-  g_marked_rrip_have_frac = FALSE;                      // consume the one-shot
-  g_marked_rrip_next_frac = 0.0;
+  g_marked_rrip_have_rrpv = FALSE;                      // consume the one-shot
+  g_marked_rrip_next_rrpv = 0;
 
   cache_debug_print_set(cache, set, way, CACHE_EVENT_INSERT);
 }
@@ -1615,7 +1616,9 @@ void marked_rrip_update_hit(Cache* cache, uns set, uns way, void* arg);
 void marked_rrip_update_hit(Cache* cache, uns set, uns way, void* arg) {
   int rrpv;
   if (g_marked_rrip_hit_have_frac) {
-    rrpv = marked_rrip_rrpv_from_frac(g_marked_rrip_hit_frac);
+    // load-side hit predictor uses the L1D/L2 (td_load_rrip_*) knob set
+    rrpv = marked_rrip_rrpv_from_frac(g_marked_rrip_hit_frac, TD_LOAD_RRIP_MIN_RRPV, TD_LOAD_RRIP_EXTRAPOLATE,
+                                      (double)TD_LOAD_RRIP_EXTRAP_ANCHOR, (double)TD_LOAD_REPLAY_THRESH);
   } else {
     int target = cache->entries[set][way].marked_promote_rrpv;
     rrpv = (target < 0) ? target : 0;  // min(0, inserted RRPV)

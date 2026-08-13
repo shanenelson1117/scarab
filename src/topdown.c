@@ -40,6 +40,7 @@
 #include "globals/utils.h"
 
 #include "dcache_stage.h"
+#include "icache_stage.h"
 #include "idq_stage.h"
 #include "lsq.h"
 #include "map_stage.h"
@@ -102,6 +103,14 @@ void topdown_idq_update(uns proc_id, int count_available, int count_issued, int 
     Flag backend_stall = (count_issued == 0 && idq_stage_get_stage_data()->op_count > 0);
     Flag mem_bound_cycle = backend_stall && (lsq_get_in_flight_load_num() > 0);
     lsq_tag_inflight_loads(mem_bound_cycle);
+  }
+
+  // td_fe_rrip_mark: credit the demand icache miss the front end is blocked on. A front-end-
+  // bound cycle = the machine took no ops and it is NOT a backend stall (miss on crit path).
+  if (TD_FE_RRIP_MARK) {
+    Flag backend_stall = (count_issued == 0 && idq_stage_get_stage_data()->op_count > 0);
+    Flag fe_bound_cycle = !backend_stall && (count_available == 0);
+    icache_tag_inflight_miss(proc_id, fe_bound_cycle);
   }
 
   INC_STAT_EVENT(proc_id, TOPDOWN_TOTAL_SLOTS, ISSUE_WIDTH);

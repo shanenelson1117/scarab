@@ -187,11 +187,13 @@ void init_cache(Cache*, const char*, uns, uns, uns, uns, Repl_Policy);
 void* cache_access(Cache*, Addr, Addr*, Flag);
 void* cache_insert(Cache*, uns8, Addr, Addr*, Addr*);
 /* REPL_MARKED_RRIP: set right before a cache_insert to control the inserted line's RRPV.
- * have_frac==TRUE selects the memory-bound insertion path (RRPV derived from td_load_rrip_*
- * params and the demanding load's on-demand membound fraction `frac`); FALSE inserts at the
- * normal SRRIP distant value. One-shot: consumed and cleared by the next marked_rrip
- * insert. */
-void cache_set_marked_next_insert(Flag have_frac, double frac);
+ * have_rrpv==TRUE inserts the line at the caller-supplied `rrpv` (each cache computes it from
+ * its own signal + knob set via marked_rrip_rrpv_from_frac); FALSE inserts at the normal
+ * SRRIP distant value. One-shot: consumed and cleared by the next marked_rrip insert. */
+void cache_set_marked_next_insert(Flag have_rrpv, int rrpv);
+/* Map a fraction (membound, front-end-bound, ...) to an initial RRPV using an explicit knob
+ * set. Callers precompute the RRPV so REPL_MARKED_RRIP stays signal-agnostic. */
+int marked_rrip_rrpv_from_frac(double f, int min_rrpv, Flag extrapolate, double anchor, double thresh);
 /* REPL_MARKED_RRIP hit predictor (--td_load_rrip_hit_predict): stage the accessing load's
  * PC-predicted membound fraction so the next hit re-derives its RRPV from it. have==FALSE
  * (or never called) keeps the legacy min(0, inserted RRPV) hit behavior. One-shot: consumed

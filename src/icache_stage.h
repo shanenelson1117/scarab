@@ -97,6 +97,11 @@ typedef struct Icache_Stage_struct {
   Icache_State state;           /* state that the ICACHE is in */
   Icache_State next_state;      /* state that the ICACHE is going to be in next cycle */
   uint64_t wait_for_miss_start; /* time when cache miss was observed */
+  /* td_fe_rrip_mark: for the current on-path demand icache miss, cycles it has been
+     outstanding (window) and the front-end-bound subset (fe_bound / window sets its L1I
+     insert RRPV at fill). Reset when a new demand miss is issued. */
+  Counter fe_miss_window_cycles;
+  Counter fe_miss_bound_cycles;
   Flag icache_miss_fulfilled;
   Flag icache_stage_resteer_signaled;
   Flag fetch_barrier_pending;
@@ -155,6 +160,10 @@ Flag icache_fill_line(Mem_Req*);
 Flag icache_off_path(void);
 Flag instr_fill_line(Mem_Req* req);
 Flag in_icache(Addr addr);  // For branch stat collection
+
+/* td_fe_rrip_mark: called once per cycle (from topdown) to accumulate the current on-path
+ * demand icache miss's outstanding window and its front-end-bound subset. */
+void icache_tag_inflight_miss(uns8 proc_id, Flag fe_bound_cycle);
 
 /**************************************************************************************/
 

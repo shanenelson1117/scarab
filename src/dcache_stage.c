@@ -841,7 +841,10 @@ static inline Dcache_Data* dcache_fill_get_cacheline(Mem_Req* req) {
       have_frac = TRUE;
       break;  // oldest valid on-path demanding load
     }
-    cache_set_marked_next_insert(have_frac, frac);
+    int rrpv = have_frac ? marked_rrip_rrpv_from_frac(frac, TD_LOAD_RRIP_MIN_RRPV, TD_LOAD_RRIP_EXTRAPOLATE,
+                                                      (double)TD_LOAD_RRIP_EXTRAP_ANCHOR, (double)TD_LOAD_REPLAY_THRESH)
+                         : 0;
+    cache_set_marked_next_insert(have_frac, rrpv);
     // hit predictor: teach this load PC how membound it is when it actually misses
     if (have_frac && TD_LOAD_RRIP_HIT_PREDICT)
       td_load_pc_pred_update(frac_pc, frac);

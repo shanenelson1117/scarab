@@ -165,6 +165,26 @@ DEF_PARAM(td_load_rrip_hit_predict, TD_LOAD_RRIP_HIT_PREDICT, Flag, Flag, FALSE,
    Larger = tracks recent misses faster. Values <=0 or >1 are clamped to the 0.25 default. */
 DEF_PARAM(td_load_rrip_pred_alpha, TD_LOAD_RRIP_PRED_ALPHA, float, float, 0.25, )
 
+/* ---- L1I front-end-bound marked-RRIP (analogous to the L1D/L2 membound policy) ---------
+   Apply REPL_MARKED_RRIP to the L1 instruction cache, protecting lines whose fetch miss
+   actually stalled the front end. Per demand icache miss the fill derives an initial RRPV
+   from the FE-bound fraction = fe_bound_cycles / fe_window_cycles (of the cycles the miss
+   was outstanding, how many the front end was starving the machine). Own knob set so the
+   L1I can be tuned independently of the L1D/L2 policy (they merge later). */
+DEF_PARAM(td_fe_rrip_mark, TD_FE_RRIP_MARK, Flag, Flag, FALSE, )
+/* Most-protected (minimum) initial RRPV for a front-end-bound icache line; may be negative
+   (signed reference_val). extrapolate off => a miss above td_fe_rrip_thresh inserts here. */
+DEF_PARAM(td_fe_rrip_min_rrpv, TD_FE_RRIP_MIN_RRPV, int, int, 0, )
+/* Gate: when TRUE, interpolate the FE-bound fraction to an RRPV in [min, RRIP_DISTANT_VAL-1]
+   with the ramp anchored at td_fe_rrip_extrap_anchor. When FALSE, a miss whose FE-bound
+   fraction exceeds td_fe_rrip_thresh inserts at min, else basic. */
+DEF_PARAM(td_fe_rrip_extrapolate, TD_FE_RRIP_EXTRAPOLATE, Flag, Flag, FALSE, )
+/* Extrapolation mode only: sole lower bound of the ramp; FE-bound fractions below the anchor
+   insert at basic. Negative => fall back to td_fe_rrip_thresh. */
+DEF_PARAM(td_fe_rrip_extrap_anchor, TD_FE_RRIP_EXTRAP_ANCHOR, float, float, -1.0, )
+/* Fixed-min gate / default anchor for the L1I FE-bound policy. */
+DEF_PARAM(td_fe_rrip_thresh, TD_FE_RRIP_THRESH, float, float, 0.5, )
+
 /********NODE TABLE
  * PARAMETERS********************************************************/
 DEF_PARAM(issue_width, ISSUE_WIDTH, uns, uns, 4, )

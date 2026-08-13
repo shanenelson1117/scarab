@@ -4318,7 +4318,10 @@ Flag mlc_fill_line(Mem_Req* req) {
     double frac = 0.0;
     Addr   frac_pc = 0;
     Flag   have_frac = td_mlc_req_load_frac(req, &frac, &frac_pc);
-    cache_set_marked_next_insert(have_frac, frac);
+    int    rrpv = have_frac ? marked_rrip_rrpv_from_frac(frac, TD_LOAD_RRIP_MIN_RRPV, TD_LOAD_RRIP_EXTRAPOLATE,
+                                                         (double)TD_LOAD_RRIP_EXTRAP_ANCHOR, (double)TD_LOAD_REPLAY_THRESH)
+                            : 0;
+    cache_set_marked_next_insert(have_frac, rrpv);
     if (have_frac && TD_LOAD_RRIP_HIT_PREDICT)
       td_load_pc_pred_update(frac_pc, frac);
   }
