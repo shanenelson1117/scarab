@@ -148,6 +148,12 @@ DEF_PARAM(td_load_rrip_extrapolate, TD_LOAD_RRIP_EXTRAPOLATE, Flag, Flag, FALSE,
    replay threshold is NOT consulted in extrapolate mode. Negative => fall back to
    TD_LOAD_REPLAY_THRESH. */
 DEF_PARAM(td_load_rrip_extrap_anchor, TD_LOAD_RRIP_EXTRAP_ANCHOR, float, float, -1.0, )
+/* Apply the marked-RRIP policy (and all td_load_rrip_* knobs) to the L2 / MLC instead of the
+   L1 D-cache. When TRUE (with td_load_rrip_mark), the MLC uses REPL_MARKED_RRIP -- its fills
+   derive the initial RRPV from the demanding load's on-demand membound fraction and its hits
+   use the predictor -- and the L1 D-cache reverts to its normal DCACHE_REPL policy. FALSE =
+   the policy stays on the L1 D-cache (default). */
+DEF_PARAM(td_load_rrip_on_mlc, TD_LOAD_RRIP_ON_MLC, Flag, Flag, FALSE, )
 /* Marked-RRIP hit-promotion predictor. When TRUE, a hit re-derives the line's RRPV from a
    PC-indexed EWMA of the accessing load's measured miss memory-bound fraction (its
    counterfactual "how membound it would have been if it had missed") via the same

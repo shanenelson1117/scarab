@@ -62,11 +62,40 @@
 #include "mem_req.h"
 #include "op.h"
 #include "statistics.h"
+#include "libs/cache_lib.h"
+#include "td_load_replay.h"
 // #include "dram.h"
 // #include "dram.param.h"
 #include "ramulator.param.h"
 
 #include "ramulator.h"
+
+/**************************************************************************************/
+/* Marked-RRIP on the MLC (--td_load_rrip_on_mlc): oldest valid on-path demanding load
+ * waiting on `req` -> its on-demand memory-bound fraction (td_mem_cycles/td_window_cycles)
+ * and PC. Mirrors the L1D fill logic in dcache_stage.c. */
+static inline Flag td_mlc_req_load_frac(Mem_Req* req, double* out_frac, Addr* out_pc) {
+  if (out_frac)
+    *out_frac = 0.0;
+  if (out_pc)
+    *out_pc = 0;
+  Op** op_p = (Op**)list_start_head_traversal(&req->op_ptrs);
+  Counter* op_u = (Counter*)list_start_head_traversal(&req->op_uniques);
+  for (; op_p; op_p = (Op**)list_next_element(&req->op_ptrs),
+               op_u = (Counter*)list_next_element(&req->op_uniques)) {
+    Op* op = *op_p;
+    if (!op || !op_u || op->unique_num != *op_u || !op->op_pool_valid)
+      continue;  // stale/freed op slot
+    if (op->off_path || op->inst_info->table_info.mem_type != MEM_LD || op->td_window_cycles == 0)
+      continue;  // on-path loads only
+    if (out_frac)
+      *out_frac = (double)op->td_mem_cycles / (double)op->td_window_cycles;
+    if (out_pc)
+      *out_pc = op->inst_info->addr;
+    return TRUE;
+  }
+  return FALSE;
+}
 
 /**************************************************************************************/
 /* Macros */
@@ -366,7 +395,10 @@ void init_uncores(void) {
 
   /* Initialize MLC cache (shared only for now) */
   Ported_Cache* mlc = (Ported_Cache*)malloc(sizeof(Ported_Cache));
-  init_cache(&mlc->cache, "MLC_CACHE", MLC_SIZE, MLC_ASSOC, MLC_LINE_SIZE, sizeof(MLC_Data), MLC_CACHE_REPL_POLICY);
+  /* td_load_rrip_on_mlc redirects the marked-line SRRIP policy from the L1D to the MLC */
+  Repl_Policy mlc_repl =
+      (TD_LOAD_RRIP_MARK && TD_LOAD_RRIP_ON_MLC) ? REPL_MARKED_RRIP : (Repl_Policy)MLC_CACHE_REPL_POLICY;
+  init_cache(&mlc->cache, "MLC_CACHE", MLC_SIZE, MLC_ASSOC, MLC_LINE_SIZE, sizeof(MLC_Data), mlc_repl);
   mlc->num_banks = MLC_BANKS;
   mlc->ports = (Ports*)malloc(sizeof(Ports) * mlc->num_banks);
   for (uns ii = 0; ii < mlc->num_banks; ii++) {
@@ -1627,7 +1659,20 @@ static Flag mem_complete_mlc_access(Mem_Req* req, Mem_Queue_Entry* mlc_queue_ent
   if (!PREFETCH_UPDATE_LRU_MLC && (req->type == MRT_DPRF || req->type == MRT_IPRF || req->type == MRT_UOCPRF ||
                                    req->type == MRT_FDIPPRFON || req->type == MRT_FDIPPRFOFF))
     update_mlc_lru = FALSE;
+  // marked-RRIP on MLC hit predictor: stage the demanding load's PC-predicted membound
+  // fraction so an MLC hit re-derives its RRPV from it (cleared right after the access).
+  Flag td_mlc_pred_staged = FALSE;
+  if (TD_LOAD_RRIP_MARK && TD_LOAD_RRIP_ON_MLC && TD_LOAD_RRIP_HIT_PREDICT && update_mlc_lru) {
+    double meas = 0.0, pf = 0.0;
+    Addr   pc = 0;
+    if (td_mlc_req_load_frac(req, &meas, &pc) && td_load_pc_pred_lookup(pc, &pf)) {
+      cache_set_hit_promote_frac(TRUE, pf);
+      td_mlc_pred_staged = TRUE;
+    }
+  }
   data = (MLC_Data*)cache_access(&MLC(req->proc_id)->cache, req->addr, &line_addr, update_mlc_lru);  // access MLC
+  if (td_mlc_pred_staged)
+    cache_set_hit_promote_frac(FALSE, 0.0);  // clear one-shot (consumed on hit; drop on miss)
   req->mlc_hit = data ? TRUE : FALSE;
 
   if (data || PERFECT_MLC) { /* mlc hit */
@@ -4266,6 +4311,17 @@ Flag mlc_fill_line(Mem_Req* req) {
   /* if it can't get a write port, fail */
   /* if (!get_write_port(&MLC(req->proc_id)->ports[req->mlc_bank])) return
    * FAILURE; */
+
+  // marked-RRIP on MLC: derive the fill's initial RRPV from the demanding load's on-demand
+  // membound fraction (no CSV), and teach the hit predictor how membound this PC is on a miss.
+  if (TD_LOAD_RRIP_MARK && TD_LOAD_RRIP_ON_MLC) {
+    double frac = 0.0;
+    Addr   frac_pc = 0;
+    Flag   have_frac = td_mlc_req_load_frac(req, &frac, &frac_pc);
+    cache_set_marked_next_insert(have_frac, frac);
+    if (have_frac && TD_LOAD_RRIP_HIT_PREDICT)
+      td_load_pc_pred_update(frac_pc, frac);
+  }
 
   // Put prefetches in the right position for replacement
   // cmp FIXME prefetchers
