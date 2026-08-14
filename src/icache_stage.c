@@ -449,7 +449,7 @@ Flag mem_req_on_icache_miss() {
       // a new on-path demand icache miss starts here -> reset its FE-bound accounting so
       // icache_tag_inflight_miss accumulates fresh over this miss's window (needed whether the
       // FE policy targets the L1I or the L2).
-      if ((TD_FE_RRIP_MARK || TD_FE_RRIP_ON_MLC) && !ic->off_path) {
+      if ((TD_FE_RRIP_MARK || TD_FE_RRIP_ON_MLC || TD_COMBINED_ON_MLC) && !ic->off_path) {
         ic->fe_miss_window_cycles = 0;
         ic->fe_miss_bound_cycles = 0;
       }

@@ -178,6 +178,16 @@ DEF_PARAM(td_fe_rrip_mark, TD_FE_RRIP_MARK, Flag, Flag, FALSE, )
    instruction prefetches -- insert at basic. Mutually exclusive with td_load_rrip_on_mlc
    (that one puts the data membound policy on the L2). Uses the same td_fe_rrip_* knobs. */
 DEF_PARAM(td_fe_rrip_on_mlc, TD_FE_RRIP_ON_MLC, Flag, Flag, FALSE, )
+/* COMBINED L2 policy: apply the marked-RRIP policy to the L2/MLC for BOTH classes at once,
+   each with its own knob set --
+     data lines        -> membound fraction (td_mem_cycles/td_window_cycles), td_load_rrip_*
+                          knobs (min td_load_rrip_min_rrpv, gate td_load_replay_thresh);
+     instruction lines -> front-end-bound fraction (measured at the L1I), td_fe_rrip_* knobs
+                          (min td_fe_rrip_min_rrpv, gate td_fe_rrip_thresh).
+   Prefetches / anything without a demanding op insert at basic. Set both extrapolate flags
+   to 0 to statically assign per-class minimum RRPVs and thresholds. Supersedes / is mutually
+   exclusive with td_load_rrip_on_mlc and td_fe_rrip_on_mlc. */
+DEF_PARAM(td_combined_on_mlc, TD_COMBINED_ON_MLC, Flag, Flag, FALSE, )
 /* Most-protected (minimum) initial RRPV for a front-end-bound icache line; may be negative
    (signed reference_val). extrapolate off => a miss above td_fe_rrip_thresh inserts here. */
 DEF_PARAM(td_fe_rrip_min_rrpv, TD_FE_RRIP_MIN_RRPV, int, int, 0, )

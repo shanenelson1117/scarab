@@ -395,11 +395,12 @@ void init_uncores(void) {
 
   /* Initialize MLC cache (shared only for now) */
   Ported_Cache* mlc = (Ported_Cache*)malloc(sizeof(Ported_Cache));
-  /* td_load_rrip_on_mlc (data membound) or td_fe_rrip_on_mlc (instruction FE-bound) redirect a
-     marked-line SRRIP policy onto the MLC */
-  Repl_Policy mlc_repl = ((TD_LOAD_RRIP_MARK && TD_LOAD_RRIP_ON_MLC) || TD_FE_RRIP_ON_MLC)
-                             ? REPL_MARKED_RRIP
-                             : (Repl_Policy)MLC_CACHE_REPL_POLICY;
+  /* td_load_rrip_on_mlc (data membound), td_fe_rrip_on_mlc (instruction FE-bound), or
+     td_combined_on_mlc (both) redirect a marked-line SRRIP policy onto the MLC */
+  Repl_Policy mlc_repl =
+      ((TD_LOAD_RRIP_MARK && TD_LOAD_RRIP_ON_MLC) || TD_FE_RRIP_ON_MLC || TD_COMBINED_ON_MLC)
+          ? REPL_MARKED_RRIP
+          : (Repl_Policy)MLC_CACHE_REPL_POLICY;
   init_cache(&mlc->cache, "MLC_CACHE", MLC_SIZE, MLC_ASSOC, MLC_LINE_SIZE, sizeof(MLC_Data), mlc_repl);
   mlc->num_banks = MLC_BANKS;
   mlc->ports = (Ports*)malloc(sizeof(Ports) * mlc->num_banks);
@@ -4314,9 +4315,34 @@ Flag mlc_fill_line(Mem_Req* req) {
   /* if (!get_write_port(&MLC(req->proc_id)->ports[req->mlc_bank])) return
    * FAILURE; */
 
+  // COMBINED L2 policy: instruction demand fetches get an RRPV from the L1I fetch miss's
+  // front-end-bound fraction (td_fe_rrip_* knobs); everything else uses the demanding load's
+  // membound fraction (td_load_rrip_* knobs). No demanding op (prefetch/store) -> basic. Each
+  // class keeps its own minimum RRPV and threshold.
+  if (TD_COMBINED_ON_MLC) {
+    Flag   have_rrpv = FALSE;
+    int    rrpv = 0;
+    if (req->type == MRT_IFETCH) {
+      double fe_frac = 0.0;
+      if (icache_fe_frac_for_line(req->proc_id, req->addr, &fe_frac)) {
+        rrpv = marked_rrip_rrpv_from_frac(fe_frac, TD_FE_RRIP_MIN_RRPV, TD_FE_RRIP_EXTRAPOLATE,
+                                          (double)TD_FE_RRIP_EXTRAP_ANCHOR, (double)TD_FE_RRIP_THRESH);
+        have_rrpv = TRUE;
+      }
+    } else {
+      double frac = 0.0;
+      Addr   frac_pc = 0;
+      if (td_mlc_req_load_frac(req, &frac, &frac_pc)) {
+        rrpv = marked_rrip_rrpv_from_frac(frac, TD_LOAD_RRIP_MIN_RRPV, TD_LOAD_RRIP_EXTRAPOLATE,
+                                          (double)TD_LOAD_RRIP_EXTRAP_ANCHOR, (double)TD_LOAD_REPLAY_THRESH);
+        have_rrpv = TRUE;
+      }
+    }
+    cache_set_marked_next_insert(have_rrpv, rrpv);
+  }
   // marked-RRIP on MLC: derive the fill's initial RRPV from the demanding load's on-demand
   // membound fraction (no CSV), and teach the hit predictor how membound this PC is on a miss.
-  if (TD_LOAD_RRIP_MARK && TD_LOAD_RRIP_ON_MLC) {
+  else if (TD_LOAD_RRIP_MARK && TD_LOAD_RRIP_ON_MLC) {
     double frac = 0.0;
     Addr   frac_pc = 0;
     Flag   have_frac = td_mlc_req_load_frac(req, &frac, &frac_pc);
