@@ -160,8 +160,10 @@ void init_icache_stage(uns8 proc_id, const char* name) {
     //           sizeof(Icache_Data), REPL_TRUE_LRU);
     /*init_cache(&ic->icache_line_info, "IC LI", ICACHE_SIZE, ICACHE_ASSOC,*/
     /*ICACHE_LINE_SIZE, sizeof(Icache_Data), ICACHE_REPL);*/
+    // Must match ic->icache's policy: FDIP's eviction tracking is driven by this shadow's
+    // victim (repl_line_addr2), so the two caches have to evict in lockstep.
     init_cache(&ic->icache_line_info, "IC LI", ICACHE_SIZE, ICACHE_ASSOC, ICACHE_LINE_SIZE, sizeof(Icache_Data),
-               REPL_TRUE_LRU);
+               icache_repl);
   }
 
   // moved the init code from here to reset
@@ -1051,22 +1053,26 @@ Flag icache_fill_line(Mem_Req* req)  // cmp FIXME maybe needed to be optimized
     // on. Derive its L1I insert RRPV from the FE-bound fraction of the miss's outstanding
     // window (fe_bound / window) using the td_fe_rrip_* knob set; unmeasured (window==0) or
     // off-path fills insert at basic.
+    Flag td_fe_have_rrpv = FALSE;
+    int  td_fe_rrpv = 0;
     if (TD_FE_RRIP_MARK) {
-      Flag have_rrpv = FALSE;
-      int  rrpv = 0;
       if (!ic->off_path && ic->fe_miss_window_cycles > 0) {
         double fe_frac = (double)ic->fe_miss_bound_cycles / (double)ic->fe_miss_window_cycles;
-        rrpv = marked_rrip_rrpv_from_frac(fe_frac, TD_FE_RRIP_MIN_RRPV, TD_FE_RRIP_EXTRAPOLATE,
-                                          (double)TD_FE_RRIP_EXTRAP_ANCHOR, (double)TD_FE_RRIP_THRESH);
-        have_rrpv = TRUE;
+        td_fe_rrpv = marked_rrip_rrpv_from_frac(fe_frac, TD_FE_RRIP_MIN_RRPV, TD_FE_RRIP_EXTRAPOLATE,
+                                                (double)TD_FE_RRIP_EXTRAP_ANCHOR, (double)TD_FE_RRIP_THRESH);
+        td_fe_have_rrpv = TRUE;
       }
-      cache_set_marked_next_insert(have_rrpv, rrpv);
+      cache_set_marked_next_insert(td_fe_have_rrpv, td_fe_rrpv);
     }
     ic->line = (Inst_Info**)cache_insert(&ic->icache, ic->proc_id, ic->fetch_addr, &ic->line_addr, &repl_line_addr);
     DEBUG(ic->proc_id, "Got line switch into ic fetch %llx\n", ic->line_addr);
     STAT_EVENT(ic->proc_id, ICACHE_FILL);
 
     if (WP_COLLECT_STATS) {  // cmp IGNORE
+      // keep the icache_line_info shadow in lockstep with the icache: same RRPV -> same
+      // eviction victim, so FDIP's eviction tracking (repl_line_addr2) stays correct.
+      if (TD_FE_RRIP_MARK)
+        cache_set_marked_next_insert(td_fe_have_rrpv, td_fe_rrpv);
       line_info = (Icache_Data*)cache_insert(&ic->icache_line_info, ic->proc_id, ic->fetch_addr, &dummy_addr2,
                                              &repl_line_addr2);
       if (line_info) {
@@ -1129,9 +1135,14 @@ Flag icache_fill_line(Mem_Req* req)  // cmp FIXME maybe needed to be optimized
       return TRUE;
     }
 
+    // prefetch fill: no FE-bound measurement -> both caches insert at basic, in lockstep.
+    if (TD_FE_RRIP_MARK)
+      cache_set_marked_next_insert(FALSE, 0);
     line = (Inst_Info**)cache_insert(&ic->icache, ic->proc_id, req->addr, &dummy_addr, &repl_line_addr);
 
     if (WP_COLLECT_STATS) {  // cmp IGNORE
+      if (TD_FE_RRIP_MARK)
+        cache_set_marked_next_insert(FALSE, 0);
       line_info =
           (Icache_Data*)cache_insert(&ic->icache_line_info, ic->proc_id, req->addr, &dummy_addr2, &repl_line_addr2);
       if (line_info) {
