@@ -64,6 +64,7 @@
 #include "statistics.h"
 #include "libs/cache_lib.h"
 #include "td_load_replay.h"
+#include "topdown.h"
 // #include "dram.h"
 // #include "dram.param.h"
 #include "ramulator.param.h"
@@ -4320,12 +4321,31 @@ Flag mlc_fill_line(Mem_Req* req) {
   // membound fraction (td_load_rrip_* knobs). No demanding op (prefetch/store) -> basic. Each
   // class keeps its own minimum RRPV and threshold.
   if (TD_COMBINED_ON_MLC) {
+    // per-class depths: static (td_fe/td_load_rrip_min_rrpv) or, under dynamic mode, chosen by
+    // the running front-end-bound vs mem-bound balance -- the dominant class stays deep, the
+    // other drops to basic; a balanced window keeps BOTH deep (the non-zero-sum region).
+    const int basic_rrpv = 2;  // RRIP_DISTANT_VAL-1 = basic (unprotected); min_rrpv=2 -> insert at basic
+    int instr_depth = TD_FE_RRIP_MIN_RRPV;
+    int data_depth = TD_LOAD_RRIP_MIN_RRPV;
+    if (TD_COMBINED_DYNAMIC_DEPTH) {
+      double fe = topdown_fe_bound_fraction(req->proc_id);
+      if (fe >= (double)TD_COMBINED_DYN_FE_HI) {
+        // front-end-dominated: instructions go past the suite max (deeper), data -> basic
+        instr_depth = TD_COMBINED_DYN_INSTR_EXTREME;
+        data_depth = basic_rrpv;
+      } else if (fe <= (double)TD_COMBINED_DYN_FE_LO) {
+        // memory-dominated: data goes past the suite max (deeper), instructions -> basic
+        instr_depth = basic_rrpv;
+        data_depth = TD_COMBINED_DYN_DATA_EXTREME;
+      }
+      // else balanced -> both keep their suite-max depth
+    }
     Flag   have_rrpv = FALSE;
     int    rrpv = 0;
     if (req->type == MRT_IFETCH) {
       double fe_frac = 0.0;
       if (icache_fe_frac_for_line(req->proc_id, req->addr, &fe_frac)) {
-        rrpv = marked_rrip_rrpv_from_frac(fe_frac, TD_FE_RRIP_MIN_RRPV, TD_FE_RRIP_EXTRAPOLATE,
+        rrpv = marked_rrip_rrpv_from_frac(fe_frac, instr_depth, TD_FE_RRIP_EXTRAPOLATE,
                                           (double)TD_FE_RRIP_EXTRAP_ANCHOR, (double)TD_FE_RRIP_THRESH);
         have_rrpv = TRUE;
       }
@@ -4333,7 +4353,7 @@ Flag mlc_fill_line(Mem_Req* req) {
       double frac = 0.0;
       Addr   frac_pc = 0;
       if (td_mlc_req_load_frac(req, &frac, &frac_pc)) {
-        rrpv = marked_rrip_rrpv_from_frac(frac, TD_LOAD_RRIP_MIN_RRPV, TD_LOAD_RRIP_EXTRAPOLATE,
+        rrpv = marked_rrip_rrpv_from_frac(frac, data_depth, TD_LOAD_RRIP_EXTRAPOLATE,
                                           (double)TD_LOAD_RRIP_EXTRAP_ANCHOR, (double)TD_LOAD_REPLAY_THRESH);
         have_rrpv = TRUE;
       }

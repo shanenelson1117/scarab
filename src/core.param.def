@@ -188,6 +188,30 @@ DEF_PARAM(td_fe_rrip_on_mlc, TD_FE_RRIP_ON_MLC, Flag, Flag, FALSE, )
    to 0 to statically assign per-class minimum RRPVs and thresholds. Supersedes / is mutually
    exclusive with td_load_rrip_on_mlc and td_fe_rrip_on_mlc. */
 DEF_PARAM(td_combined_on_mlc, TD_COMBINED_ON_MLC, Flag, Flag, FALSE, )
+/* Combined L2 DYNAMIC depth: instead of static per-class depths, bucket by the running
+   balance of front-end-bound vs mem-bound cycles and pick which class is protected deep.
+   fe_frac = fe_bound_cycles / (fe_bound_cycles + mem_bound_cycles) over a window:
+     fe_frac >= td_combined_dyn_fe_hi -> front-end-dominated: instructions deep
+                                         (td_fe_rrip_min_rrpv), data basic;
+     fe_frac <= td_combined_dyn_fe_lo -> memory-dominated:   data deep
+                                         (td_load_rrip_min_rrpv), instructions basic;
+     in between                       -> balanced: BOTH deep (the non-zero-sum region).
+   Requires td_combined_on_mlc. */
+DEF_PARAM(td_combined_dynamic_depth, TD_COMBINED_DYNAMIC_DEPTH, Flag, Flag, FALSE, )
+/* Window (cycles) over which the fe-vs-mem balance is measured; the bucket updates once per
+   window from the just-completed window. 0 = cumulative (whole run, computed live). */
+DEF_PARAM(td_combined_dyn_window, TD_COMBINED_DYN_WINDOW, uns, uns, 100000, )
+/* Bucket boundaries on fe_frac (in [0,1]). <= lo -> memory-dominated; >= hi -> front-end-
+   dominated; strictly between -> balanced (both classes deep). */
+DEF_PARAM(td_combined_dyn_fe_lo, TD_COMBINED_DYN_FE_LO, float, float, 0.33, )
+DEF_PARAM(td_combined_dyn_fe_hi, TD_COMBINED_DYN_FE_HI, float, float, 0.66, )
+/* Depth for the DOMINANT class in an extreme window. The balanced window uses the suite-wide
+   max (td_fe_rrip_min_rrpv / td_load_rrip_min_rrpv). In a strongly one-sided window the
+   dominant class may go BELOW (deeper than) that max -- a heavily front-end- or memory-bound
+   phase can justify more protection than the suite average -- while the other class drops to
+   basic. Set these more negative than the balanced depths. */
+DEF_PARAM(td_combined_dyn_instr_extreme, TD_COMBINED_DYN_INSTR_EXTREME, int, int, -64, )
+DEF_PARAM(td_combined_dyn_data_extreme, TD_COMBINED_DYN_DATA_EXTREME, int, int, -48, )
 /* Most-protected (minimum) initial RRPV for a front-end-bound icache line; may be negative
    (signed reference_val). extrapolate off => a miss above td_fe_rrip_thresh inserts here. */
 DEF_PARAM(td_fe_rrip_min_rrpv, TD_FE_RRIP_MIN_RRPV, int, int, 0, )

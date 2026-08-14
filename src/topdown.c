@@ -55,6 +55,23 @@ const static int TOPDOWN_RECOVERY_DEPTH = 2;
 static FILE* td_load_pc_fp = NULL;
 static FILE* td_load_addr_fp = NULL;
 
+/* Dynamic combined-depth: per-proc front-end-bound vs mem-bound accounting over a window. */
+static Counter g_dyn_fe_cur[MAX_NUM_PROCS];    // fe-bound cycles this window
+static Counter g_dyn_mem_cur[MAX_NUM_PROCS];   // mem-bound cycles this window
+static double  g_dyn_fe_frac[MAX_NUM_PROCS];   // last completed window's fe/(fe+mem)
+static Flag    g_dyn_valid[MAX_NUM_PROCS];     // has a window completed yet?
+static Counter g_dyn_win_start[MAX_NUM_PROCS]; // cycle the current window opened
+
+/* Front-end-bound fraction of "bound" cycles (fe/(fe+mem)) used to bucket the dynamic
+ * combined-L2 depths. Neutral (0.5) until the first window completes. */
+double topdown_fe_bound_fraction(uns8 proc_id) {
+  if (TD_COMBINED_DYN_WINDOW == 0) {  // cumulative: compute live from the running counts
+    Counter tot = g_dyn_fe_cur[proc_id] + g_dyn_mem_cur[proc_id];
+    return tot ? (double)g_dyn_fe_cur[proc_id] / (double)tot : 0.5;
+  }
+  return g_dyn_valid[proc_id] ? g_dyn_fe_frac[proc_id] : 0.5;
+}
+
 /**************************************************************************************/
 /* Events Update */
 
@@ -112,6 +129,24 @@ void topdown_idq_update(uns proc_id, int count_available, int count_issued, int 
     Flag backend_stall = (count_issued == 0 && idq_stage_get_stage_data()->op_count > 0);
     Flag fe_bound_cycle = !backend_stall && (count_available == 0);
     icache_tag_inflight_miss(proc_id, fe_bound_cycle);
+  }
+
+  // dynamic combined-L2 depth: accumulate the fe-vs-mem balance and snapshot it each window
+  if (TD_COMBINED_ON_MLC && TD_COMBINED_DYNAMIC_DEPTH) {
+    Flag backend_stall = (count_issued == 0 && idq_stage_get_stage_data()->op_count > 0);
+    if (!backend_stall && count_available == 0)
+      g_dyn_fe_cur[proc_id]++;  // front-end-bound cycle
+    else if (backend_stall && lsq_get_in_flight_load_num() > 0)
+      g_dyn_mem_cur[proc_id]++;  // memory-bound cycle
+    uns win = TD_COMBINED_DYN_WINDOW;
+    if (win > 0 && (cycle_count - g_dyn_win_start[proc_id]) >= (Counter)win) {
+      Counter tot = g_dyn_fe_cur[proc_id] + g_dyn_mem_cur[proc_id];
+      g_dyn_fe_frac[proc_id] = tot ? (double)g_dyn_fe_cur[proc_id] / (double)tot : 0.5;
+      g_dyn_valid[proc_id] = TRUE;
+      g_dyn_fe_cur[proc_id] = 0;
+      g_dyn_mem_cur[proc_id] = 0;
+      g_dyn_win_start[proc_id] = cycle_count;
+    }
   }
 
   INC_STAT_EVENT(proc_id, TOPDOWN_TOTAL_SLOTS, ISSUE_WIDTH);
