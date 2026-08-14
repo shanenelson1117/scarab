@@ -131,8 +131,8 @@ void topdown_idq_update(uns proc_id, int count_available, int count_issued, int 
     icache_tag_inflight_miss(proc_id, fe_bound_cycle);
   }
 
-  // dynamic combined-L2 depth: accumulate the fe-vs-mem balance and snapshot it each window
-  if (TD_COMBINED_ON_MLC && TD_COMBINED_DYNAMIC_DEPTH) {
+  // dynamic combined-L2 (depth or threshold): accumulate the fe-vs-mem balance, snapshot/window
+  if (TD_COMBINED_ON_MLC && (TD_COMBINED_DYNAMIC_DEPTH || TD_COMBINED_DYNAMIC_THRESH)) {
     Flag backend_stall = (count_issued == 0 && idq_stage_get_stage_data()->op_count > 0);
     if (!backend_stall && count_available == 0)
       g_dyn_fe_cur[proc_id]++;  // front-end-bound cycle

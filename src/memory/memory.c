@@ -4324,21 +4324,37 @@ Flag mlc_fill_line(Mem_Req* req) {
     // per-class depths: static (td_fe/td_load_rrip_min_rrpv) or, under dynamic mode, chosen by
     // the running front-end-bound vs mem-bound balance -- the dominant class stays deep, the
     // other drops to basic; a balanced window keeps BOTH deep (the non-zero-sum region).
-    const int basic_rrpv = 2;  // RRIP_DISTANT_VAL-1 = basic (unprotected); min_rrpv=2 -> insert at basic
-    int instr_depth = TD_FE_RRIP_MIN_RRPV;
-    int data_depth = TD_LOAD_RRIP_MIN_RRPV;
-    if (TD_COMBINED_DYNAMIC_DEPTH) {
+    const int    basic_rrpv = 2;    // RRIP_DISTANT_VAL-1 = basic; min_rrpv=2 -> insert at basic
+    const double off_thr = 1.0;     // fraction can't exceed 1 -> nothing qualifies -> all basic
+    int    instr_depth = TD_FE_RRIP_MIN_RRPV;
+    int    data_depth = TD_LOAD_RRIP_MIN_RRPV;
+    double instr_thr = (double)TD_FE_RRIP_THRESH;
+    double data_thr = (double)TD_LOAD_REPLAY_THRESH;
+    if (TD_COMBINED_DYNAMIC_DEPTH || TD_COMBINED_DYNAMIC_THRESH) {
       double fe = topdown_fe_bound_fraction(req->proc_id);
-      if (fe >= (double)TD_COMBINED_DYN_FE_HI) {
-        // front-end-dominated: instructions go past the suite max (deeper), data -> basic
-        instr_depth = TD_COMBINED_DYN_INSTR_EXTREME;
-        data_depth = basic_rrpv;
-      } else if (fe <= (double)TD_COMBINED_DYN_FE_LO) {
-        // memory-dominated: data goes past the suite max (deeper), instructions -> basic
-        instr_depth = basic_rrpv;
-        data_depth = TD_COMBINED_DYN_DATA_EXTREME;
+      Flag fe_dom = (fe >= (double)TD_COMBINED_DYN_FE_HI);   // front-end-dominated window
+      Flag mem_dom = (fe <= (double)TD_COMBINED_DYN_FE_LO);  // memory-dominated window
+      if (TD_COMBINED_DYNAMIC_DEPTH) {
+        // move DEPTH: dominant class past the suite max (deeper), the other -> basic
+        if (fe_dom) {
+          instr_depth = TD_COMBINED_DYN_INSTR_EXTREME;
+          data_depth = basic_rrpv;
+        } else if (mem_dom) {
+          instr_depth = basic_rrpv;
+          data_depth = TD_COMBINED_DYN_DATA_EXTREME;
+        }
+      } else {
+        // move THRESHOLD: depths stay at the suite max; dominant class gets a lower threshold
+        // (broader coverage), the other is turned off (threshold above 1 -> nothing qualifies)
+        if (fe_dom) {
+          instr_thr = (double)TD_COMBINED_DYN_INSTR_THR_EXTREME;
+          data_thr = off_thr;
+        } else if (mem_dom) {
+          instr_thr = off_thr;
+          data_thr = (double)TD_COMBINED_DYN_DATA_THR_EXTREME;
+        }
       }
-      // else balanced -> both keep their suite-max depth
+      // else balanced -> suite-max depths and nominal thresholds for both
     }
     Flag   have_rrpv = FALSE;
     int    rrpv = 0;
@@ -4346,7 +4362,7 @@ Flag mlc_fill_line(Mem_Req* req) {
       double fe_frac = 0.0;
       if (icache_fe_frac_for_line(req->proc_id, req->addr, &fe_frac)) {
         rrpv = marked_rrip_rrpv_from_frac(fe_frac, instr_depth, TD_FE_RRIP_EXTRAPOLATE,
-                                          (double)TD_FE_RRIP_EXTRAP_ANCHOR, (double)TD_FE_RRIP_THRESH);
+                                          (double)TD_FE_RRIP_EXTRAP_ANCHOR, instr_thr);
         have_rrpv = TRUE;
       }
     } else {
@@ -4354,7 +4370,7 @@ Flag mlc_fill_line(Mem_Req* req) {
       Addr   frac_pc = 0;
       if (td_mlc_req_load_frac(req, &frac, &frac_pc)) {
         rrpv = marked_rrip_rrpv_from_frac(frac, data_depth, TD_LOAD_RRIP_EXTRAPOLATE,
-                                          (double)TD_LOAD_RRIP_EXTRAP_ANCHOR, (double)TD_LOAD_REPLAY_THRESH);
+                                          (double)TD_LOAD_RRIP_EXTRAP_ANCHOR, data_thr);
         have_rrpv = TRUE;
       }
     }
