@@ -165,6 +165,10 @@ Flag in_icache(Addr addr);  // For branch stat collection
  * demand icache miss's outstanding window and its front-end-bound subset. */
 void icache_tag_inflight_miss(uns8 proc_id, Flag fe_bound_cycle);
 
+/* td_fe_rrip_on_mlc: FE-bound fraction of the demand icache miss the L1I is blocked on, if it
+ * matches line_addr (used at the L2 fill to prioritize an instruction line). */
+Flag icache_fe_frac_for_line(uns8 proc_id, Addr line_addr, double* out_frac);
+
 /**************************************************************************************/
 
 #ifdef __cplusplus

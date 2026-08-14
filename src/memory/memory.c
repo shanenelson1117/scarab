@@ -395,9 +395,11 @@ void init_uncores(void) {
 
   /* Initialize MLC cache (shared only for now) */
   Ported_Cache* mlc = (Ported_Cache*)malloc(sizeof(Ported_Cache));
-  /* td_load_rrip_on_mlc redirects the marked-line SRRIP policy from the L1D to the MLC */
-  Repl_Policy mlc_repl =
-      (TD_LOAD_RRIP_MARK && TD_LOAD_RRIP_ON_MLC) ? REPL_MARKED_RRIP : (Repl_Policy)MLC_CACHE_REPL_POLICY;
+  /* td_load_rrip_on_mlc (data membound) or td_fe_rrip_on_mlc (instruction FE-bound) redirect a
+     marked-line SRRIP policy onto the MLC */
+  Repl_Policy mlc_repl = ((TD_LOAD_RRIP_MARK && TD_LOAD_RRIP_ON_MLC) || TD_FE_RRIP_ON_MLC)
+                             ? REPL_MARKED_RRIP
+                             : (Repl_Policy)MLC_CACHE_REPL_POLICY;
   init_cache(&mlc->cache, "MLC_CACHE", MLC_SIZE, MLC_ASSOC, MLC_LINE_SIZE, sizeof(MLC_Data), mlc_repl);
   mlc->num_banks = MLC_BANKS;
   mlc->ports = (Ports*)malloc(sizeof(Ports) * mlc->num_banks);
@@ -4324,6 +4326,21 @@ Flag mlc_fill_line(Mem_Req* req) {
     cache_set_marked_next_insert(have_frac, rrpv);
     if (have_frac && TD_LOAD_RRIP_HIT_PREDICT)
       td_load_pc_pred_update(frac_pc, frac);
+  } else if (TD_FE_RRIP_ON_MLC) {
+    // FE-bound policy on the MLC: an instruction demand-fetch fill gets an RRPV from the L1I
+    // fetch miss's front-end-bound fraction; ALL data lines (and instruction prefetches)
+    // insert at basic.
+    Flag   have_rrpv = FALSE;
+    int    rrpv = 0;
+    if (req->type == MRT_IFETCH) {
+      double fe_frac = 0.0;
+      if (icache_fe_frac_for_line(req->proc_id, req->addr, &fe_frac)) {
+        rrpv = marked_rrip_rrpv_from_frac(fe_frac, TD_FE_RRIP_MIN_RRPV, TD_FE_RRIP_EXTRAPOLATE,
+                                          (double)TD_FE_RRIP_EXTRAP_ANCHOR, (double)TD_FE_RRIP_THRESH);
+        have_rrpv = TRUE;
+      }
+    }
+    cache_set_marked_next_insert(have_rrpv, rrpv);
   }
 
   // Put prefetches in the right position for replacement

@@ -446,9 +446,10 @@ Flag mem_req_on_icache_miss() {
       DEBUG(ic->proc_id, "from IC_STAGE for cl 0x%llx at cycle %llu\n", ic->line_addr, cycle_count);
       STAT_EVENT(ic->proc_id, ICACHE_STAGE_MISS);
 
-      // td_fe_rrip_mark: a new on-path demand icache miss starts here -> reset its FE-bound
-      // accounting so icache_tag_inflight_miss accumulates fresh over this miss's window.
-      if (TD_FE_RRIP_MARK && !ic->off_path) {
+      // a new on-path demand icache miss starts here -> reset its FE-bound accounting so
+      // icache_tag_inflight_miss accumulates fresh over this miss's window (needed whether the
+      // FE policy targets the L1I or the L2).
+      if ((TD_FE_RRIP_MARK || TD_FE_RRIP_ON_MLC) && !ic->off_path) {
         ic->fe_miss_window_cycles = 0;
         ic->fe_miss_bound_cycles = 0;
       }
@@ -1004,6 +1005,21 @@ void icache_tag_inflight_miss(uns8 proc_id, Flag fe_bound_cycle) {
   ics->fe_miss_window_cycles++;
   if (fe_bound_cycle)
     ics->fe_miss_bound_cycles++;
+}
+
+/* td_fe_rrip_on_mlc: report the front-end-bound fraction of the demand icache miss the L1I is
+ * currently blocked on, if it matches `line_addr` (used at the L2 fill to set an instruction
+ * line's RRPV). Returns TRUE (and sets *out_frac) only for the awaited on-path demand line. */
+Flag icache_fe_frac_for_line(uns8 proc_id, Addr line_addr, double* out_frac) {
+  if (out_frac)
+    *out_frac = 0.0;
+  Icache_Stage* ics = &cmp_model.icache_stage[proc_id];
+  if (ics->off_path || ics->state != ICACHE_WAIT_FOR_MISS || ics->line_addr != line_addr ||
+      ics->fe_miss_window_cycles == 0)
+    return FALSE;
+  if (out_frac)
+    *out_frac = (double)ics->fe_miss_bound_cycles / (double)ics->fe_miss_window_cycles;
+  return TRUE;
 }
 
 /**************************************************************************************/

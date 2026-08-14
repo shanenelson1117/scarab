@@ -172,6 +172,12 @@ DEF_PARAM(td_load_rrip_pred_alpha, TD_LOAD_RRIP_PRED_ALPHA, float, float, 0.25, 
    was outstanding, how many the front end was starving the machine). Own knob set so the
    L1I can be tuned independently of the L1D/L2 policy (they merge later). */
 DEF_PARAM(td_fe_rrip_mark, TD_FE_RRIP_MARK, Flag, Flag, FALSE, )
+/* Apply the front-end-bound (instruction) marked-RRIP policy to the L2/MLC instead of the
+   L1I: an instruction demand-fetch fill (MRT_IFETCH) derives its L2 RRPV from the fetch
+   miss's front-end-bound fraction (measured at the L1I), while ALL DATA lines -- and
+   instruction prefetches -- insert at basic. Mutually exclusive with td_load_rrip_on_mlc
+   (that one puts the data membound policy on the L2). Uses the same td_fe_rrip_* knobs. */
+DEF_PARAM(td_fe_rrip_on_mlc, TD_FE_RRIP_ON_MLC, Flag, Flag, FALSE, )
 /* Most-protected (minimum) initial RRPV for a front-end-bound icache line; may be negative
    (signed reference_val). extrapolate off => a miss above td_fe_rrip_thresh inserts here. */
 DEF_PARAM(td_fe_rrip_min_rrpv, TD_FE_RRIP_MIN_RRPV, int, int, 0, )

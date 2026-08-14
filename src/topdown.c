@@ -105,9 +105,10 @@ void topdown_idq_update(uns proc_id, int count_available, int count_issued, int 
     lsq_tag_inflight_loads(mem_bound_cycle);
   }
 
-  // td_fe_rrip_mark: credit the demand icache miss the front end is blocked on. A front-end-
+  // td_fe_rrip_*: credit the demand icache miss the front end is blocked on. A front-end-
   // bound cycle = the machine took no ops and it is NOT a backend stall (miss on crit path).
-  if (TD_FE_RRIP_MARK) {
+  // Needed whether the FE policy targets the L1I (td_fe_rrip_mark) or the L2 (td_fe_rrip_on_mlc).
+  if (TD_FE_RRIP_MARK || TD_FE_RRIP_ON_MLC) {
     Flag backend_stall = (count_issued == 0 && idq_stage_get_stage_data()->op_count > 0);
     Flag fe_bound_cycle = !backend_stall && (count_available == 0);
     icache_tag_inflight_miss(proc_id, fe_bound_cycle);
