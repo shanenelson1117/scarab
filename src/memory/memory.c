@@ -4334,8 +4334,38 @@ Flag mlc_fill_line(Mem_Req* req) {
       double fe = topdown_fe_bound_fraction(req->proc_id);
       Flag fe_dom = (fe >= (double)TD_COMBINED_DYN_FE_HI);   // front-end-dominated window
       Flag mem_dom = (fe <= (double)TD_COMBINED_DYN_FE_LO);  // memory-dominated window
-      if (TD_COMBINED_DYNAMIC_DEPTH) {
-        // move DEPTH: dominant class past the suite max (deeper), the other -> basic
+      if (TD_COMBINED_DYNAMIC_DEPTH && TD_COMBINED_DYN_BUCKETS >= 2) {
+        // GRADUATED depth: quantize fe_frac into N buckets and interpolate each class's depth.
+        // instr: basic (fe=0) -> suite max (fe=0.5) -> instr_extreme (fe=1); data is the mirror.
+        // Each bucket toward an end pushes that class more extreme, the other toward basic.
+        // The N buckets span the [fe_lo, fe_hi] WINDOW (not raw [0,1]): fe<=fe_lo pins to bucket 0
+        // (most memory-extreme), fe>=fe_hi to the top bucket (most fe-extreme), linear between.
+        // Set the window over the observed fe_frac range so all buckets resolve the real
+        // population and the most memory-bound workload lands in bucket 0.
+        uns    N = TD_COMBINED_DYN_BUCKETS;
+        double lo = (double)TD_COMBINED_DYN_FE_LO, hi = (double)TD_COMBINED_DYN_FE_HI;
+        double fe_n = (hi > lo) ? (fe - lo) / (hi - lo) : fe;  // normalize into the window
+        if (fe_n < 0.0)
+          fe_n = 0.0;
+        if (fe_n > 1.0)
+          fe_n = 1.0;
+        uns bi = (uns)(fe_n * (double)N);
+        if (bi >= N)
+          bi = N - 1;
+        // map bucket -> position so the END buckets sit ON the endpoints: bucket 0 -> p=0 (data
+        // at its full extreme, instr basic), bucket N-1 -> p=1 (instr full extreme, data basic).
+        double p = (double)bi / (double)(N - 1);  // [0,1], hits both extremes exactly
+        double bp = (double)basic_rrpv;
+        double sm_i = (double)TD_FE_RRIP_MIN_RRPV, ex_i = (double)TD_COMBINED_DYN_INSTR_EXTREME;
+        double sm_d = (double)TD_LOAD_RRIP_MIN_RRPV, ex_d = (double)TD_COMBINED_DYN_DATA_EXTREME;
+        double id = (p >= 0.5) ? sm_i + (ex_i - sm_i) * (p - 0.5) / 0.5   // suite max -> instr extreme
+                               : bp + (sm_i - bp) * p / 0.5;              // basic -> suite max
+        double dd = (p <= 0.5) ? ex_d + (sm_d - ex_d) * p / 0.5           // data extreme -> suite max
+                               : sm_d + (bp - sm_d) * (p - 0.5) / 0.5;    // suite max -> basic
+        instr_depth = (int)(id >= 0.0 ? id + 0.5 : id - 0.5);
+        data_depth = (int)(dd >= 0.0 ? dd + 0.5 : dd - 0.5);
+      } else if (TD_COMBINED_DYNAMIC_DEPTH) {
+        // 3-bucket DEPTH: dominant class past the suite max (deeper), the other -> basic
         if (fe_dom) {
           instr_depth = TD_COMBINED_DYN_INSTR_EXTREME;
           data_depth = basic_rrpv;

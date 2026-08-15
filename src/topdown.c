@@ -55,20 +55,26 @@ const static int TOPDOWN_RECOVERY_DEPTH = 2;
 static FILE* td_load_pc_fp = NULL;
 static FILE* td_load_addr_fp = NULL;
 
-/* Dynamic combined-depth: per-proc front-end-bound vs mem-bound accounting over a window. */
-static Counter g_dyn_fe_cur[MAX_NUM_PROCS];    // fe-bound cycles this window
-static Counter g_dyn_mem_cur[MAX_NUM_PROCS];   // mem-bound cycles this window
-static double  g_dyn_fe_frac[MAX_NUM_PROCS];   // last completed window's fe/(fe+mem)
-static Flag    g_dyn_valid[MAX_NUM_PROCS];     // has a window completed yet?
+/* Dynamic combined-L2 depth/threshold: the GLOBAL policy dynamics bucket on the top-down
+ * SLOT breakdown (Frontend Bound vs Memory Bound) -- the signal that best characterizes the
+ * workload -- while each line's RRPV still uses its own cycle-level fe/mem fraction (which
+ * best localizes that line's effect). We derive the top-down ratio per window by snapshotting
+ * the already-accumulated component counters at each window boundary. */
+static double  g_dyn_fe_frac[MAX_NUM_PROCS];   // last window's frontend/(frontend+mem) slot ratio
+static Flag    g_dyn_valid[MAX_NUM_PROCS];     // has a window been computed yet?
 static Counter g_dyn_win_start[MAX_NUM_PROCS]; // cycle the current window opened
+/* snapshots of cumulative top-down counters at the last window boundary */
+static Counter g_snap_fb[MAX_NUM_PROCS];  // TOPDOWN_FETCH_BUBBLES_SLOTS
+static Counter g_snap_ts[MAX_NUM_PROCS];  // TOPDOWN_TOTAL_SLOTS
+static Counter g_snap_is[MAX_NUM_PROCS];  // TOPDOWN_ISSUED_SLOTS
+static Counter g_snap_rb[MAX_NUM_PROCS];  // TOPDOWN_RECOVERY_BUBBLES_SLOTS
+static Counter g_snap_bs[MAX_NUM_PROCS];  // TOPDOWN_BACKEND_STALLS_CYCLES
+static Counter g_snap_ml[MAX_NUM_PROCS];  // TOPDOWN_MEM_LOAD_STALLS_CYCLES
+static Counter g_snap_ms[MAX_NUM_PROCS];  // TOPDOWN_MEM_STORE_STALLS_CYCLES
 
-/* Front-end-bound fraction of "bound" cycles (fe/(fe+mem)) used to bucket the dynamic
- * combined-L2 depths. Neutral (0.5) until the first window completes. */
+/* Top-down Frontend-Bound share of (Frontend + Memory) bound slots over the window, used to
+ * bucket the dynamic combined-L2 depths/thresholds. Neutral (0.5) until the first window. */
 double topdown_fe_bound_fraction(uns8 proc_id) {
-  if (TD_COMBINED_DYN_WINDOW == 0) {  // cumulative: compute live from the running counts
-    Counter tot = g_dyn_fe_cur[proc_id] + g_dyn_mem_cur[proc_id];
-    return tot ? (double)g_dyn_fe_cur[proc_id] / (double)tot : 0.5;
-  }
   return g_dyn_valid[proc_id] ? g_dyn_fe_frac[proc_id] : 0.5;
 }
 
@@ -131,20 +137,45 @@ void topdown_idq_update(uns proc_id, int count_available, int count_issued, int 
     icache_tag_inflight_miss(proc_id, fe_bound_cycle);
   }
 
-  // dynamic combined-L2 (depth or threshold): accumulate the fe-vs-mem balance, snapshot/window
+  // dynamic combined-L2 (depth or threshold): recompute the top-down Frontend-vs-Memory-Bound
+  // slot ratio from the accumulated counters each window (window 0 = cumulative, snapshots
+  // stay 0 so deltas equal the running totals; recomputed periodically to stay fresh).
   if (TD_COMBINED_ON_MLC && (TD_COMBINED_DYNAMIC_DEPTH || TD_COMBINED_DYNAMIC_THRESH)) {
-    Flag backend_stall = (count_issued == 0 && idq_stage_get_stage_data()->op_count > 0);
-    if (!backend_stall && count_available == 0)
-      g_dyn_fe_cur[proc_id]++;  // front-end-bound cycle
-    else if (backend_stall && lsq_get_in_flight_load_num() > 0)
-      g_dyn_mem_cur[proc_id]++;  // memory-bound cycle
     uns win = TD_COMBINED_DYN_WINDOW;
-    if (win > 0 && (cycle_count - g_dyn_win_start[proc_id]) >= (Counter)win) {
-      Counter tot = g_dyn_fe_cur[proc_id] + g_dyn_mem_cur[proc_id];
-      g_dyn_fe_frac[proc_id] = tot ? (double)g_dyn_fe_cur[proc_id] / (double)tot : 0.5;
+    Counter period = win ? (Counter)win : 8192;
+    if ((cycle_count - g_dyn_win_start[proc_id]) >= period) {
+      Counter fb = GET_STAT_EVENT(proc_id, TOPDOWN_FETCH_BUBBLES_SLOTS);
+      Counter ts = GET_STAT_EVENT(proc_id, TOPDOWN_TOTAL_SLOTS);
+      Counter is = GET_STAT_EVENT(proc_id, TOPDOWN_ISSUED_SLOTS);
+      Counter rb = GET_STAT_EVENT(proc_id, TOPDOWN_RECOVERY_BUBBLES_SLOTS);
+      Counter bs = GET_STAT_EVENT(proc_id, TOPDOWN_BACKEND_STALLS_CYCLES);
+      Counter ml = GET_STAT_EVENT(proc_id, TOPDOWN_MEM_LOAD_STALLS_CYCLES);
+      Counter ms = GET_STAT_EVENT(proc_id, TOPDOWN_MEM_STORE_STALLS_CYCLES);
+      // window deltas (cumulative: snapshots are 0 -> deltas == totals)
+      double d_fb = (double)(fb - g_snap_fb[proc_id]);
+      double d_ts = (double)(ts - g_snap_ts[proc_id]);
+      double d_is = (double)(is - g_snap_is[proc_id]);
+      double d_rb = (double)(rb - g_snap_rb[proc_id]);
+      double d_bs = (double)(bs - g_snap_bs[proc_id]);
+      double d_mem = (double)((ml - g_snap_ml[proc_id]) + (ms - g_snap_ms[proc_id]));
+      // top-down: frontend_bound slots = FetchBubbles; backend_bound slots = Total - Frontend
+      // - BadSpec - Retiring = ts - fb - is - rb; mem_bound = backend * mem_stalls/backend_stalls
+      double backend_slots = d_ts - d_fb - d_is - d_rb;
+      if (backend_slots < 0.0)
+        backend_slots = 0.0;
+      double mem_slots = (d_bs > 0.0) ? backend_slots * d_mem / d_bs : 0.0;
+      double denom = d_fb + mem_slots;
+      g_dyn_fe_frac[proc_id] = (denom > 0.0) ? d_fb / denom : 0.5;
       g_dyn_valid[proc_id] = TRUE;
-      g_dyn_fe_cur[proc_id] = 0;
-      g_dyn_mem_cur[proc_id] = 0;
+      if (win) {  // sliding window advances the snapshot; cumulative keeps snapshots at 0
+        g_snap_fb[proc_id] = fb;
+        g_snap_ts[proc_id] = ts;
+        g_snap_is[proc_id] = is;
+        g_snap_rb[proc_id] = rb;
+        g_snap_bs[proc_id] = bs;
+        g_snap_ml[proc_id] = ml;
+        g_snap_ms[proc_id] = ms;
+      }
       g_dyn_win_start[proc_id] = cycle_count;
     }
   }

@@ -202,9 +202,21 @@ DEF_PARAM(td_combined_dynamic_depth, TD_COMBINED_DYNAMIC_DEPTH, Flag, Flag, FALS
    window from the just-completed window. 0 = cumulative (whole run, computed live). */
 DEF_PARAM(td_combined_dyn_window, TD_COMBINED_DYN_WINDOW, uns, uns, 100000, )
 /* Bucket boundaries on fe_frac (in [0,1]). <= lo -> memory-dominated; >= hi -> front-end-
-   dominated; strictly between -> balanced (both classes deep). */
+   dominated; strictly between -> balanced (both classes deep). In GRADUATED mode
+   (td_combined_dyn_buckets >= 2) these instead define the input WINDOW the buckets span:
+   fe_frac is normalized as (fe-lo)/(hi-lo) clamped to [0,1] before bucketing, so fe<=lo pins to
+   the memory-extreme bucket and fe>=hi to the front-end-extreme bucket. Set the window over the
+   observed fe_frac range (e.g. a memory-bound-heavy suite where fe never exceeds ~0.35 wants
+   hi~0.35) so every bucket resolves the real population instead of most sitting empty. */
 DEF_PARAM(td_combined_dyn_fe_lo, TD_COMBINED_DYN_FE_LO, float, float, 0.33, )
 DEF_PARAM(td_combined_dyn_fe_hi, TD_COMBINED_DYN_FE_HI, float, float, 0.66, )
+/* Graduated dynamic depth: instead of the 3-way (fe / balanced / mem) split, quantize fe_frac
+   into this many buckets over the [fe_lo, fe_hi] window and INTERPOLATE each class's depth --
+   basic at the class's far end, suite max (td_*_rrip_min_rrpv) at the window middle, extreme
+   (td_combined_dyn_*_extreme) at its near end -- so each successive bucket toward an end pushes
+   that class more extreme (and the other toward basic). 0/1 = the 3-bucket fe_lo/fe_hi behavior.
+   Depth mode only. */
+DEF_PARAM(td_combined_dyn_buckets, TD_COMBINED_DYN_BUCKETS, uns, uns, 0, )
 /* Depth for the DOMINANT class in an extreme window. The balanced window uses the suite-wide
    max (td_fe_rrip_min_rrpv / td_load_rrip_min_rrpv). In a strongly one-sided window the
    dominant class may go BELOW (deeper than) that max -- a heavily front-end- or memory-bound
