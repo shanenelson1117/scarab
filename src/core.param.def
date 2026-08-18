@@ -235,6 +235,16 @@ DEF_PARAM(td_combined_dynamic_thresh, TD_COMBINED_DYNAMIC_THRESH, Flag, Flag, FA
    (td_fe_rrip_thresh / td_load_replay_thresh) broadens that class's protection. */
 DEF_PARAM(td_combined_dyn_instr_thr_extreme, TD_COMBINED_DYN_INSTR_THR_EXTREME, float, float, 0.3, )
 DEF_PARAM(td_combined_dyn_data_thr_extreme, TD_COMBINED_DYN_DATA_THR_EXTREME, float, float, 0.2, )
+/* DRRIP-style SET DUELING selector for the combined L2 policy. 4 leader groups of 16 sets each
+   permanently run a fixed (instr,data) depth bin -- d32, d48i32, i48d16, i48 -- and every
+   window the bin with the FEWEST demand misses on its leader sets is chosen; all follower sets
+   adopt that bin's depths for the next window. Learns the data-vs-instruction protection
+   balance online from real miss feedback instead of the modeled top-down counter. Mutually
+   exclusive with td_combined_dynamic_depth / td_combined_dynamic_thresh (set-duel wins if more
+   than one is set); requires td_combined_on_mlc. */
+DEF_PARAM(td_combined_set_duel, TD_COMBINED_SET_DUEL, Flag, Flag, FALSE, )
+/* Set-dueling selection window, in RETIRED INSTRUCTIONS per proc (not cycles). */
+DEF_PARAM(td_combined_duel_window, TD_COMBINED_DUEL_WINDOW, uns, uns, 100000, )
 /* Most-protected (minimum) initial RRPV for a front-end-bound icache line; may be negative
    (signed reference_val). extrapolate off => a miss above td_fe_rrip_thresh inserts here. */
 DEF_PARAM(td_fe_rrip_min_rrpv, TD_FE_RRIP_MIN_RRPV, int, int, 0, )

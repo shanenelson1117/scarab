@@ -122,6 +122,68 @@ static Counter mlc_seq_num = 1;
 static Counter bus_out_seq_num = 1;
 static Counter l1fill_seq_num = 1;
 static Counter mlc_fill_seq_num = 1;
+
+/**************************************************************************************/
+/* Set dueling (DRRIP-style) for the combined L2 policy (--td_combined_set_duel).
+ * 4 leader groups of 16 sets each permanently run a fixed (instr,data) depth bin; every
+ * window (TD_COMBINED_DUEL_WINDOW retired instructions) the bin with the fewest demand
+ * misses on its leader sets is chosen, and all follower sets adopt it for the next window. */
+
+#define TD_DUEL_NBINS 4
+/* bin menu: d32, d48i32, i48d16, i48   (basic = RRIP_DISTANT_VAL-1 = 2, unprotected) */
+static const int g_duel_instr[TD_DUEL_NBINS] = {2, -32, -48, -48};
+static const int g_duel_data[TD_DUEL_NBINS] = {-32, -48, -16, 2};
+static Counter   g_duel_miss[MAX_NUM_PROCS][TD_DUEL_NBINS];
+static int       g_duel_sel[MAX_NUM_PROCS];        /* selected follower bin */
+static Counter   g_duel_win_start[MAX_NUM_PROCS];  /* inst_count at window start */
+static Flag      g_duel_init_done[MAX_NUM_PROCS];
+
+/* leader set? -> TRUE and *bin = its group; follower -> FALSE. Leaders are every 8th set
+ * ((set&7)==0 -> 64 of 512), round-robined into 4 groups of 16 via (set>>3)&3. */
+static inline Flag duel_leader(uns set, int* bin) {
+  if ((set & 7u) != 0)
+    return FALSE;
+  *bin = (int)((set >> 3) & 3u);
+  return TRUE;
+}
+
+/* Advance the window once TD_COMBINED_DUEL_WINDOW instructions have retired since it began:
+ * pick the least-missing bin (ties keep the current selection), then reset the counters. */
+static void duel_maybe_advance(uns8 proc_id) {
+  if (!g_duel_init_done[proc_id]) {
+    g_duel_win_start[proc_id] = inst_count[proc_id];
+    g_duel_sel[proc_id] = 1;  /* d48i32 (balanced) until the first window completes */
+    for (int b = 0; b < TD_DUEL_NBINS; b++)
+      g_duel_miss[proc_id][b] = 0;
+    g_duel_init_done[proc_id] = TRUE;
+    return;
+  }
+  if (inst_count[proc_id] - g_duel_win_start[proc_id] < (Counter)TD_COMBINED_DUEL_WINDOW)
+    return;
+  int     best = g_duel_sel[proc_id];  /* start from the current pick -> ties keep it */
+  Counter best_miss = g_duel_miss[proc_id][best];
+  for (int b = 0; b < TD_DUEL_NBINS; b++) {
+    if (g_duel_miss[proc_id][b] < best_miss) {
+      best_miss = g_duel_miss[proc_id][b];
+      best = b;
+    }
+  }
+  g_duel_sel[proc_id] = best;
+  for (int b = 0; b < TD_DUEL_NBINS; b++)
+    g_duel_miss[proc_id][b] = 0;
+  g_duel_win_start[proc_id] = inst_count[proc_id];
+}
+
+/* The bin a fill for `addr` should use: a leader set uses its own group's bin; a follower
+ * uses the currently selected bin. */
+static int duel_bin_for_addr(uns8 proc_id, Addr addr) {
+  Addr tag = 0, line_addr = 0;
+  uns  set = ext_cache_index(&MLC(proc_id)->cache, addr, &tag, &line_addr);
+  int  bin = 0;
+  if (duel_leader(set, &bin))
+    return bin;
+  return g_duel_sel[proc_id];
+}
 static Counter* core_fill_seq_num;
 static uns mem_req_demand_entries = 0;
 static uns mem_req_pref_entries = 0;
@@ -1679,6 +1741,10 @@ static Flag mem_complete_mlc_access(Mem_Req* req, Mem_Queue_Entry* mlc_queue_ent
     cache_set_hit_promote_frac(FALSE, 0.0);  // clear one-shot (consumed on hit; drop on miss)
   req->mlc_hit = data ? TRUE : FALSE;
 
+  // Set dueling: advance the selection window (instruction-clocked) once per MLC access.
+  if (TD_COMBINED_ON_MLC && TD_COMBINED_SET_DUEL)
+    duel_maybe_advance(req->proc_id);
+
   if (data || PERFECT_MLC) { /* mlc hit */
     /* if exclusive cache, invalidate the line in L2 if there is a done function
      * to transfer the data to MLC -- also need to propagate the dirty to MLC */
@@ -1706,6 +1772,15 @@ static Flag mem_complete_mlc_access(Mem_Req* req, Mem_Queue_Entry* mlc_queue_ent
       return TRUE;
     }
   } else { /* mlc miss */
+    // Set dueling: credit this demand miss to its leader group (followers/prefetches ignored).
+    if (TD_COMBINED_ON_MLC && TD_COMBINED_SET_DUEL &&
+        (req->type == MRT_IFETCH || req->type == MRT_DFETCH || req->type == MRT_DSTORE)) {
+      Addr dtag = 0, dline = 0;
+      uns  dset = ext_cache_index(&MLC(req->proc_id)->cache, req->addr, &dtag, &dline);
+      int  dbin = 0;
+      if (duel_leader(dset, &dbin))
+        g_duel_miss[req->proc_id][dbin]++;
+    }
     /* if req is wb then either fill mlc or try again */
     Flag mlc_miss_send_l1 =
         (MLC_WRITE_THROUGH && (req->type == MRT_WB)) || ((req->type != MRT_WB) && (req->type != MRT_WB_NODIRTY));
@@ -4330,7 +4405,13 @@ Flag mlc_fill_line(Mem_Req* req) {
     int    data_depth = TD_LOAD_RRIP_MIN_RRPV;
     double instr_thr = (double)TD_FE_RRIP_THRESH;
     double data_thr = (double)TD_LOAD_REPLAY_THRESH;
-    if (TD_COMBINED_DYNAMIC_DEPTH || TD_COMBINED_DYNAMIC_THRESH) {
+    if (TD_COMBINED_SET_DUEL) {
+      // Set dueling picks the (instr,data) depth bin: a leader set uses its own group's bin,
+      // a follower uses the currently selected bin. Thresholds stay per-class.
+      int bin = duel_bin_for_addr(req->proc_id, req->addr);
+      instr_depth = g_duel_instr[bin];
+      data_depth = g_duel_data[bin];
+    } else if (TD_COMBINED_DYNAMIC_DEPTH || TD_COMBINED_DYNAMIC_THRESH) {
       double fe = topdown_fe_bound_fraction(req->proc_id);
       Flag fe_dom = (fe >= (double)TD_COMBINED_DYN_FE_HI);   // front-end-dominated window
       Flag mem_dom = (fe <= (double)TD_COMBINED_DYN_FE_LO);  // memory-dominated window
