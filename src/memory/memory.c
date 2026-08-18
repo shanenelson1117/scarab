@@ -125,34 +125,68 @@ static Counter mlc_fill_seq_num = 1;
 
 /**************************************************************************************/
 /* Set dueling (DRRIP-style) for the combined L2 policy (--td_combined_set_duel).
- * 4 leader groups of 16 sets each permanently run a fixed (instr,data) depth bin; every
- * window (TD_COMBINED_DUEL_WINDOW retired instructions) the bin with the fewest demand
- * misses on its leader sets is chosen, and all follower sets adopt it for the next window. */
+ * 3 leader groups (TD_COMBINED_DUEL_SETS_PER_GROUP sets each) permanently run a fixed
+ * (instr,data) depth bin; every window (TD_COMBINED_DUEL_WINDOW retired instructions) the bin
+ * with the fewest demand misses on its leader sets is chosen, and all follower sets adopt it. */
 
-#define TD_DUEL_NBINS 4
-/* bin menu: d32, d48i32, i48d16, i48   (basic = RRIP_DISTANT_VAL-1 = 2, unprotected) */
-static const int g_duel_instr[TD_DUEL_NBINS] = {2, -32, -48, -48};
-static const int g_duel_data[TD_DUEL_NBINS] = {-32, -48, -16, 2};
+#define TD_DUEL_NBINS 3
+/* bin menu: d32 (data only), i48d32 (both at suite max), i48 (instr only).
+ * basic = RRIP_DISTANT_VAL-1 = 2 (unprotected). */
+static const int g_duel_instr[TD_DUEL_NBINS] = {2, -48, -48};
+static const int g_duel_data[TD_DUEL_NBINS] = {-32, -32, 2};
 static Counter   g_duel_miss[MAX_NUM_PROCS][TD_DUEL_NBINS];
 static int       g_duel_sel[MAX_NUM_PROCS];        /* selected follower bin */
 static Counter   g_duel_win_start[MAX_NUM_PROCS];  /* inst_count at window start */
 static Flag      g_duel_init_done[MAX_NUM_PROCS];
 
-/* leader set? -> TRUE and *bin = its group; follower -> FALSE. Leaders are every 8th set
- * ((set&7)==0 -> 64 of 512), round-robined into 4 groups of 16 via (set>>3)&3. */
+/* Per-set role, shared across procs (identical cache geometry): bin index for a leader set,
+ * -1 for a follower. Built once for the current num_sets and sets-per-group. */
+static int* g_duel_set_role = NULL;
+static uns  g_duel_role_nsets = 0;
+static uns  g_duel_role_perg = 0;
+
+/* Assign exactly TD_DUEL_NBINS * sets_per_group leader sets, spread uniformly across the cache
+ * and round-robined into bins so every bin gets exactly sets_per_group sets. */
+static void duel_ensure_roles(uns num_sets) {
+  uns perg = TD_COMBINED_DUEL_SETS_PER_GROUP;
+  uns total = TD_DUEL_NBINS * perg;
+  while (total > num_sets) {  // clamp so leaders fit
+    perg--;
+    total = TD_DUEL_NBINS * perg;
+  }
+  if (g_duel_set_role && g_duel_role_nsets == num_sets && g_duel_role_perg == perg)
+    return;
+  if (g_duel_set_role)
+    free(g_duel_set_role);
+  g_duel_set_role = (int*)malloc(sizeof(int) * num_sets);
+  for (uns s = 0; s < num_sets; s++)
+    g_duel_set_role[s] = -1;  // follower
+  for (uns j = 0; j < total; j++) {
+    uns s = (uns)(((uns64)j * (uns64)num_sets) / (uns64)total);  // spread position
+    if (s >= num_sets)
+      s = num_sets - 1;
+    g_duel_set_role[s] = (int)(j % TD_DUEL_NBINS);  // round-robin -> perg sets per bin
+  }
+  g_duel_role_nsets = num_sets;
+  g_duel_role_perg = perg;
+}
+
+/* leader set? -> TRUE and *bin = its group; follower -> FALSE. */
 static inline Flag duel_leader(uns set, int* bin) {
-  if ((set & 7u) != 0)
+  int role = (set < g_duel_role_nsets) ? g_duel_set_role[set] : -1;
+  if (role < 0)
     return FALSE;
-  *bin = (int)((set >> 3) & 3u);
+  *bin = role;
   return TRUE;
 }
 
 /* Advance the window once TD_COMBINED_DUEL_WINDOW instructions have retired since it began:
  * pick the least-missing bin (ties keep the current selection), then reset the counters. */
 static void duel_maybe_advance(uns8 proc_id) {
+  duel_ensure_roles(MLC(proc_id)->cache.num_sets);  // build the leader/follower map once
   if (!g_duel_init_done[proc_id]) {
     g_duel_win_start[proc_id] = inst_count[proc_id];
-    g_duel_sel[proc_id] = 1;  /* d48i32 (balanced) until the first window completes */
+    g_duel_sel[proc_id] = 1;  /* i48d32 (balanced) until the first window completes */
     for (int b = 0; b < TD_DUEL_NBINS; b++)
       g_duel_miss[proc_id][b] = 0;
     g_duel_init_done[proc_id] = TRUE;
@@ -177,6 +211,7 @@ static void duel_maybe_advance(uns8 proc_id) {
 /* The bin a fill for `addr` should use: a leader set uses its own group's bin; a follower
  * uses the currently selected bin. */
 static int duel_bin_for_addr(uns8 proc_id, Addr addr) {
+  duel_ensure_roles(MLC(proc_id)->cache.num_sets);
   Addr tag = 0, line_addr = 0;
   uns  set = ext_cache_index(&MLC(proc_id)->cache, addr, &tag, &line_addr);
   int  bin = 0;
