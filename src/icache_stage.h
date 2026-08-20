@@ -32,6 +32,7 @@
 #include "globals/global_types.h"
 
 #include "libs/cache_lib.h"
+#include "libs/hash_lib.h"
 
 #include "decoupled_frontend.h"
 #include "stage_data.h"
@@ -120,6 +121,10 @@ typedef struct Icache_Stage_struct {
   Cache icache;           /* the cache storage structure (caches Inst_Info *) */
   Cache icache_line_info; /* contains info about the icache lines */
   Cache pref_icache;      /* Prefetcher cache storage structure (caches Inst_Info *) */
+  /* icache_footprint: unbounded (not cache-sized) set of every line address ever filled
+     into ic->icache, so a line that is evicted and refilled is counted only once. Its
+     growth is what ICACHE_UNIQUE_FILL_LINES reports. Only allocated if ICACHE_FOOTPRINT. */
+  Hash_Table icache_footprint_lines;
   char rand_wb_state[31]; /* State of random number generator for random writeback */
 } Icache_Stage;
 
@@ -155,6 +160,11 @@ void redirect_icache_stage(void);
 void debug_icache_stage(void);
 void update_icache_stage(void);
 void icache_resolve_fetch_barrier(uns8 proc_id, uns64 inst_uid);
+
+/* icache_footprint: drop every core's set of filled line addresses, so the code footprint
+ * covers the same window as the stats. Called once when warmup ends; deliberately not
+ * called on a periodic stat clear (that would make the cumulative column over-count). */
+void icache_footprint_reset_all(void);
 
 Flag icache_fill_line(Mem_Req*);
 Flag icache_off_path(void);

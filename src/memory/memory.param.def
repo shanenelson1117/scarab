@@ -106,6 +106,10 @@ DEF_PARAM(icache_line_size, ICACHE_LINE_SIZE, uns, uns,
           64, ) /* line size in bytes */
 DEF_PARAM(perfect_icache, PERFECT_ICACHE, Flag, Flag,
           FALSE, ) /* it always hits? */
+/* icache_footprint: count the distinct lines ever filled into the icache
+   (ICACHE_UNIQUE_FILL_LINES). Measurement only -- one hash lookup per fill,
+   no effect on timing. */
+DEF_PARAM(icache_footprint, ICACHE_FOOTPRINT, Flag, Flag, TRUE, )
 DEF_PARAM(icache_read_ports, ICACHE_READ_PORTS, uns, uns, 1, )
 DEF_PARAM(icache_write_ports, ICACHE_WRITE_PORTS, uns, uns, 1, )
 DEF_PARAM(icache_banks, ICACHE_BANKS, uns, uns, 8, )

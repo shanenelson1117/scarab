@@ -75,6 +75,10 @@
 #define DEBUG(proc_id, args...) _DEBUG(proc_id, DEBUG_ICACHE_STAGE, ##args)
 #define DEBUG_FDIP(proc_id, args...) _DEBUG(proc_id, DEBUG_FDIP, ##args)
 
+/* Buckets in the icache footprint set. Chained, so this only trades memory against
+   chain length; a typical SPEC code footprint is a few tens of thousands of lines. */
+#define ICACHE_FOOTPRINT_BUCKETS (64 * 1024)
+
 /**************************************************************************************/
 /* Global Variables */
 
@@ -115,6 +119,8 @@ static inline void execute_coupled_FSM(void);
 static inline void wp_process_icache_evicted(Icache_Data* line, Mem_Req* req, Addr* repl_line_addr);
 static inline void wp_process_icache_hit(Icache_Data* line, Addr fetch_addr);
 static inline void wp_process_icache_fill(Icache_Data* line, Mem_Req* req);
+
+static inline void icache_footprint_record(Addr line_addr);
 
 static inline Flag is_fetch_barrier_op(Op* op) {
   return (op->inst_info->table_info.bar_type & BAR_FETCH) || IS_CALLSYS(&op->inst_info->table_info);
@@ -165,6 +171,12 @@ void init_icache_stage(uns8 proc_id, const char* name) {
     init_cache(&ic->icache_line_info, "IC LI", ICACHE_SIZE, ICACHE_ASSOC, ICACHE_LINE_SIZE, sizeof(Icache_Data),
                icache_repl);
   }
+
+  /* icache_footprint: unbounded set of every line ever filled into the icache. Sized
+     generously since it grows with the code footprint, not the cache. Allocated here and
+     never in reset_icache_stage(), which also runs on every recovery. */
+  if (ICACHE_FOOTPRINT)
+    init_hash_table(&ic->icache_footprint_lines, "IC_FOOTPRINT", ICACHE_FOOTPRINT_BUCKETS, sizeof(uns8));
 
   // moved the init code from here to reset
   reset_icache_stage();
@@ -354,6 +366,39 @@ void icache_resolve_fetch_barrier(uns8 proc_id, uns64 inst_uid) {
 }
 
 /**************************************************************************************/
+/* icache_footprint_record: count one line entering the icache.
+ *
+ * Called from every site that inserts into ic->icache. The set is unbounded rather than
+ * cache-sized, so a line evicted and refilled is not counted twice: the stat is the size
+ * of the code the front end touches, not the fill count (that is ICACHE_FILL). Note that
+ * PERFECT_ICACHE never fills, so the footprint is 0 in that mode.
+ */
+
+static inline void icache_footprint_record(Addr line_addr) {
+  if (!ICACHE_FOOTPRINT)
+    return;
+
+  Flag new_entry = FALSE;
+  hash_table_access_create(&ic->icache_footprint_lines, (int64)line_addr, &new_entry);
+  if (new_entry)
+    STAT_EVENT(ic->proc_id, ICACHE_UNIQUE_FILL_LINES);
+}
+
+/**************************************************************************************/
+/* icache_footprint_reset_all: */
+
+void icache_footprint_reset_all(void) {
+  if (!ICACHE_FOOTPRINT)
+    return;
+
+  for (uns8 proc_id = 0; proc_id < NUM_CORES; proc_id++) {
+    Icache_Stage* ics = (model->id == CMP_MODEL) ? &cmp_model.icache_stage[proc_id] : ic;
+    if (ics)
+      hash_table_clear(&ics->icache_footprint_lines);
+  }
+}
+
+/**************************************************************************************/
 /* in_icache: returns whether instr in icache
  *            Used for branch stat collection
  */
@@ -387,6 +432,7 @@ Inst_Info** lookup_icache() {
       Addr dummy_repl_line_addr;
       line =
           (Inst_Info**)cache_insert(&ic->icache, ic->proc_id, ic->fetch_addr, &dummy_line_addr, &dummy_repl_line_addr);
+      icache_footprint_record(dummy_line_addr);
     } else
       STAT_EVENT(ic->proc_id, L2_IDEAL_MISS_ICACHE);
   }
@@ -1083,6 +1129,7 @@ Flag icache_fill_line(Mem_Req* req)  // cmp FIXME maybe needed to be optimized
     ic->line = (Inst_Info**)cache_insert(&ic->icache, ic->proc_id, ic->fetch_addr, &ic->line_addr, &repl_line_addr);
     DEBUG(ic->proc_id, "Got line switch into ic fetch %llx\n", ic->line_addr);
     STAT_EVENT(ic->proc_id, ICACHE_FILL);
+    icache_footprint_record(ic->line_addr);
 
     if (WP_COLLECT_STATS) {  // cmp IGNORE
       // keep the icache_line_info shadow in lockstep with the icache: same RRPV -> same
@@ -1155,6 +1202,7 @@ Flag icache_fill_line(Mem_Req* req)  // cmp FIXME maybe needed to be optimized
     if (TD_FE_RRIP_MARK)
       cache_set_marked_next_insert(FALSE, 0);
     line = (Inst_Info**)cache_insert(&ic->icache, ic->proc_id, req->addr, &dummy_addr, &repl_line_addr);
+    icache_footprint_record(dummy_addr);
 
     if (WP_COLLECT_STATS) {  // cmp IGNORE
       if (TD_FE_RRIP_MARK)
@@ -1242,6 +1290,7 @@ Inst_Info** ic_pref_cache_access(void) {
   if (line) {
     inserted_line =
         (Inst_Info**)cache_insert(&ic->icache, ic->proc_id, ic->fetch_addr, &ic->line_addr, &repl_line_addr);
+    icache_footprint_record(ic->line_addr);
     DEBUG(ic->proc_id, "ic_pref cache hit:fetch_addr:0x%s \n", hexstr64(ic->fetch_addr));
     STAT_EVENT(ic->proc_id, IC_PREF_MOVE_IC);
 

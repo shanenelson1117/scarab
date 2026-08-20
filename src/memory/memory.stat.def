@@ -3267,3 +3267,9 @@ DEF_STAT(  DATA_LD_PREF_MEM_CYCLES_OFFPATH, COUNT , NO_RATIO)
 
 DEF_STAT(  UOP_CACHE_LINE_EVICTED_USEFUL, DIST , NO_RATIO)
 DEF_STAT(  UOP_CACHE_LINE_EVICTED_USELESS, DIST , NO_RATIO)
+
+/* icache_footprint: distinct icache lines ever filled (code footprint), counted once per
+   line no matter how often it is evicted and refilled -- unlike ICACHE_FILL, which counts
+   every fill. Cumulative is the true unique total; Interval is the lines first touched
+   during that interval. Appended at the end of the file so no DIST group is disturbed. */
+DEF_STAT(  ICACHE_UNIQUE_FILL_LINES, COUNT , NO_RATIO)
