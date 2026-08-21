@@ -3270,6 +3270,14 @@ DEF_STAT(  UOP_CACHE_LINE_EVICTED_USELESS, DIST , NO_RATIO)
 
 /* icache_footprint: distinct icache lines ever filled (code footprint), counted once per
    line no matter how often it is evicted and refilled -- unlike ICACHE_FILL, which counts
-   every fill. Cumulative is the true unique total; Interval is the lines first touched
-   during that interval. Appended at the end of the file so no DIST group is disturbed. */
-DEF_STAT(  ICACHE_UNIQUE_FILL_LINES, COUNT , NO_RATIO)
+   every fill. Interval is the lines first touched during that interval; Cumulative is the
+   footprint of the whole run.
+
+   The NORESET_ prefix is load-bearing: init_global_stats() turns it into stat->noreset,
+   which is what makes reset_stats(FALSE) at the end of warmup fold count into total_count
+   instead of discarding it. Without it the cumulative column would restart at warmup end
+   and undercount badly -- the code is already resident in the icache by then, so it is
+   never refilled and never recounted. With it, Cumulative matches gem5's
+   icache.uniqueFillLinesTotal: distinct lines over warmup + measured region.
+   Appended at the end of the file so no DIST group is disturbed. */
+DEF_STAT(  NORESET_ICACHE_UNIQUE_FILL_LINES, COUNT , NO_RATIO)

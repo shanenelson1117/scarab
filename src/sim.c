@@ -63,7 +63,6 @@
 #include "cmp_model_support.h"
 #include "dumb_model.h"
 #include "freq.h"
-#include "icache_stage.h"
 #include "lookahead_buffer.h"
 #include "model.h"
 #include "op_pool.h"
@@ -663,11 +662,10 @@ void full_sim() {
     uop_sim();
     reset_uop_mode_counters();
     reset_stats(FALSE);  // ignore stats accumulated during warmup
-    /* Same window for the code footprint: lines filled during warmup must not hide
-       themselves from ICACHE_UNIQUE_FILL_LINES over the measured region. Deliberately
-       not done on the periodic clear_stats trigger below, where clearing the set would
-       make the cumulative column over-count. */
-    icache_footprint_reset_all();
+    /* The code footprint deliberately spans warmup too, and needs no action here: its
+       NORESET_ prefix carries the count across this reset into the cumulative column.
+       Restarting it would undercount, since code already resident in the icache when
+       warmup ends is never refilled and so would never be recounted. */
     /* The call below resets the cycle counts of all frequency
        domains but maintains the execution time value. This allows us to:
 

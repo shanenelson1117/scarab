@@ -174,7 +174,9 @@ void init_icache_stage(uns8 proc_id, const char* name) {
 
   /* icache_footprint: unbounded set of every line ever filled into the icache. Sized
      generously since it grows with the code footprint, not the cache. Allocated here and
-     never in reset_icache_stage(), which also runs on every recovery. */
+     never cleared -- not in reset_icache_stage() (which runs on every recovery) and not
+     at the end of warmup: a line already resident when warmup ends is never refilled, so
+     clearing the set would lose it from the count rather than recount it. */
   if (ICACHE_FOOTPRINT)
     init_hash_table(&ic->icache_footprint_lines, "IC_FOOTPRINT", ICACHE_FOOTPRINT_BUCKETS, sizeof(uns8));
 
@@ -381,21 +383,7 @@ static inline void icache_footprint_record(Addr line_addr) {
   Flag new_entry = FALSE;
   hash_table_access_create(&ic->icache_footprint_lines, (int64)line_addr, &new_entry);
   if (new_entry)
-    STAT_EVENT(ic->proc_id, ICACHE_UNIQUE_FILL_LINES);
-}
-
-/**************************************************************************************/
-/* icache_footprint_reset_all: */
-
-void icache_footprint_reset_all(void) {
-  if (!ICACHE_FOOTPRINT)
-    return;
-
-  for (uns8 proc_id = 0; proc_id < NUM_CORES; proc_id++) {
-    Icache_Stage* ics = (model->id == CMP_MODEL) ? &cmp_model.icache_stage[proc_id] : ic;
-    if (ics)
-      hash_table_clear(&ics->icache_footprint_lines);
-  }
+    STAT_EVENT(ic->proc_id, NORESET_ICACHE_UNIQUE_FILL_LINES);
 }
 
 /**************************************************************************************/
