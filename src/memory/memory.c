@@ -72,9 +72,10 @@
 #include "ramulator.h"
 
 /**************************************************************************************/
-/* Marked-RRIP on the MLC (--td_load_rrip_on_mlc): oldest valid on-path demanding load
+/* Marked-RRIP on the MLC (--td_load_rrip_on_mlc): oldest valid demanding load (any path)
  * waiting on `req` -> its on-demand memory-bound fraction (td_mem_cycles/td_window_cycles)
- * and PC. Mirrors the L1D fill logic in dcache_stage.c. */
+ * and PC. Mirrors the L1D fill logic in dcache_stage.c. Path-agnostic: any returning load
+ * sets the RRPV, since the fill happens because its data returned. */
 static inline Flag td_mlc_req_load_frac(Mem_Req* req, double* out_frac, Addr* out_pc) {
   if (out_frac)
     *out_frac = 0.0;
@@ -87,8 +88,8 @@ static inline Flag td_mlc_req_load_frac(Mem_Req* req, double* out_frac, Addr* ou
     Op* op = *op_p;
     if (!op || !op_u || op->unique_num != *op_u || !op->op_pool_valid)
       continue;  // stale/freed op slot
-    if (op->off_path || op->inst_info->table_info.mem_type != MEM_LD || op->td_window_cycles == 0)
-      continue;  // on-path loads only
+    if (op->inst_info->table_info.mem_type != MEM_LD || op->td_window_cycles == 0)
+      continue;  // any returning demanding load (on- or off-path)
     if (out_frac)
       *out_frac = (double)op->td_mem_cycles / (double)op->td_window_cycles;
     if (out_pc)

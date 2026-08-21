@@ -276,7 +276,7 @@ void update_dcache_stage(Stage_Data* src_sd) {
     // re-derives the RRPV from it. Tightly scoped to this one access and cleared right after
     // so it can't leak to store/prefetch hits (they keep the legacy min(0,target) promotion).
     Flag td_hit_pred_staged = FALSE;
-    if (TD_LOAD_RRIP_MARK && !TD_LOAD_RRIP_ON_MLC && TD_LOAD_RRIP_HIT_PREDICT && !op->off_path &&
+    if (TD_LOAD_RRIP_MARK && !TD_LOAD_RRIP_ON_MLC && TD_LOAD_RRIP_HIT_PREDICT &&
         op->inst_info->table_info.mem_type == MEM_LD) {
       double pf = 0.0;
       if (td_load_pc_pred_lookup(op->inst_info->addr, &pf)) {
@@ -817,10 +817,12 @@ static inline Dcache_Data* dcache_fill_get_cacheline(Mem_Req* req) {
         (req->op_count ? req->oldest_op_unique_num : -1));
 
   // marked-RRIP: compute the demanding load's memory-bound fraction ON DEMAND (no record
-  // CSV), the same way the record pass does -- td_mem_cycles / td_window_cycles accumulated
-  // by lsq_tag_inflight_loads over the load's in-flight window. Use the oldest still-valid
-  // load waiting on this fill; the insert path derives the initial RRPV from the fraction
-  // (gated by the anchor in extrapolate mode, or the replay threshold in fixed-min mode).
+  // CSV) -- td_mem_cycles / td_window_cycles accumulated by lsq_tag_inflight_loads over the
+  // load's in-flight window (dispatch -> completion). Use the oldest still-valid load waiting
+  // on this fill, on- or off-path: the fill happens because that load's data returned, so it
+  // sets the RRPV exactly as real hardware would, agnostic to path. The insert path derives
+  // the initial RRPV from the fraction (gated by the anchor in extrapolate mode, or the replay
+  // threshold in fixed-min mode).
   if (TD_LOAD_RRIP_MARK && !TD_LOAD_RRIP_ON_MLC) {
     double frac = 0.0;
     Flag   have_frac = FALSE;
@@ -832,14 +834,14 @@ static inline Dcache_Data* dcache_fill_get_cacheline(Mem_Req* req) {
       Op* op = *op_p;
       if (!op || !op_u || op->unique_num != *op_u || !op->op_pool_valid)
         continue;  // stale/freed op slot
-      // on-path loads only, mirroring the record pass (off-path ops never retire there)
-      if (op->off_path || op->inst_info->table_info.mem_type != MEM_LD ||
-          op->td_window_cycles == 0)
+      // any returning demanding load sets the RRPV, agnostic to on/off path: the line is
+      // being filled because this load's data returned, exactly as real hardware inserts it.
+      if (op->inst_info->table_info.mem_type != MEM_LD || op->td_window_cycles == 0)
         continue;
       frac = (double)op->td_mem_cycles / (double)op->td_window_cycles;
       frac_pc = op->inst_info->addr;
       have_frac = TRUE;
-      break;  // oldest valid on-path demanding load
+      break;  // oldest valid demanding load (any path)
     }
     int rrpv = have_frac ? marked_rrip_rrpv_from_frac(frac, TD_LOAD_RRIP_MIN_RRPV, TD_LOAD_RRIP_EXTRAPOLATE,
                                                       (double)TD_LOAD_RRIP_EXTRAP_ANCHOR, (double)TD_LOAD_REPLAY_THRESH)

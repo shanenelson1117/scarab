@@ -339,7 +339,11 @@ void lsq_tag_inflight_loads(Flag mem_bound_cycle) {
   const auto& load_entries = lsq_unit->get_queue(MEM_LD)->get_entries();
   for (const auto& entry : load_entries) {
     Op* op = entry.op;
-    // window = dispatch -> done; done_cycle == 0 means the load has not completed yet
+    // window = dispatch -> completion (done_cycle == 0 means not yet complete). The window
+    // closes when the load's data becomes available to the pipeline, which is a path-agnostic
+    // event: both on-path and off-path loads get done_cycle set when their data returns. This
+    // deliberately does NOT key off retire (an on-path-only event), so the membound fraction
+    // is well-defined for any load that returns, on-path or off-path.
     Flag in_window = (op->done_cycle == 0) || (cycle_count < op->done_cycle);
     if (!in_window)
       continue;
