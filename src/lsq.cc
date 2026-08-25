@@ -29,6 +29,8 @@
 
 #include "lsq.h"
 
+#include "topdown.h"
+
 extern "C" {
 #include "globals/assert.h"
 #include "globals/global_defs.h"
@@ -345,8 +347,16 @@ void lsq_tag_inflight_loads(Flag mem_bound_cycle) {
     // deliberately does NOT key off retire (an on-path-only event), so the membound fraction
     // is well-defined for any load that returns, on-path or off-path.
     Flag in_window = (op->done_cycle == 0) || (cycle_count < op->done_cycle);
-    if (!in_window)
+    if (!in_window) {
+      // Load has completed (its data is available to the pipeline). Emit its membound record
+      // row exactly once, here at completion, so the record matches where the marked-RRIP policy
+      // writes the RRPV (at the fill, when the data returns) rather than at retirement. This is
+      // path-agnostic -- off-path loads complete but never retire, so recording at completion is
+      // what lets any load that returns be recorded, mirroring the policy's path-agnostic write.
+      if (!op->td_recorded)
+        topdown_load_record(op->proc_id, op);  // idempotent; sets td_recorded when it writes
       continue;
+    }
 
     op->td_window_cycles++;
     if (mem_bound_cycle)

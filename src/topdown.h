@@ -41,6 +41,10 @@ void topdown_bp_recovery(uns proc_id, Op* op);
 void topdown_idq_update(uns proc_id, int count_available, int count_issued, int count_issued_on_path);
 void topdown_exec_update(uns proc_id, uns8 fus_busy);
 void topdown_load_retire(uns proc_id, Op* op);
+/* Emit this load's membound row to the record CSV. Called at COMPLETION (when the load's data
+ * returns / done_cycle is reached), to match where the marked-RRIP policy writes the RRPV.
+ * Path-agnostic: any load that returns is recorded, on- or off-path. */
+void topdown_load_record(uns proc_id, Op* op);
 void topdown_done(uns proc_id);
 /* Front-end-bound fraction fe/(fe+mem) over the dynamic-depth window (0.5 until warm). */
 double topdown_fe_bound_fraction(uns8 proc_id);
