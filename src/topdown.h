@@ -37,6 +37,10 @@
 
 #include "op.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 void topdown_bp_recovery(uns proc_id, Op* op);
 void topdown_idq_update(uns proc_id, int count_available, int count_issued, int count_issued_on_path);
 void topdown_exec_update(uns proc_id, uns8 fus_busy);
@@ -48,5 +52,9 @@ void topdown_load_record(uns proc_id, Op* op);
 void topdown_done(uns proc_id);
 /* Front-end-bound fraction fe/(fe+mem) over the dynamic-depth window (0.5 until warm). */
 double topdown_fe_bound_fraction(uns8 proc_id);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* #ifndef __TOPDOWN_H__ */
