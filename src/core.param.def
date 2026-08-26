@@ -125,6 +125,13 @@ DEF_PARAM(td_load_dir, TD_LOAD_DIR, char*, string, ".", )
 DEF_PARAM(td_load_replay, TD_LOAD_REPLAY, Flag, Flag, FALSE, )
 DEF_PARAM(td_load_replay_key, TD_LOAD_REPLAY_KEY, char*, string, "pc", )
 DEF_PARAM(td_load_replay_thresh, TD_LOAD_REPLAY_THRESH, float, float, 0.0, )
+/* Randomized equal-cardinality force-hit control. When TRUE, instead of force-hitting the keys
+ * whose mean membound ratio > td_load_replay_thresh, force-hit a seeded-random set of the SAME
+ * cardinality (N = #keys above thresh) drawn from all recorded keys. Isolates the value of the
+ * membound *selection* from force-hitting an equal-size arbitrary set. td_load_replay_seed makes
+ * the draw reproducible (per simpoint's own key universe). */
+DEF_PARAM(td_load_replay_random, TD_LOAD_REPLAY_RANDOM, Flag, Flag, FALSE, )
+DEF_PARAM(td_load_replay_seed, TD_LOAD_REPLAY_SEED, uns, uns, 0, )
 DEF_PARAM(td_load_evict_track, TD_LOAD_EVICT_TRACK, Flag, Flag, FALSE, )
 DEF_PARAM(td_load_evict_start_thresh, TD_LOAD_EVICT_START_THRESH, float, float, -1.0, )
 DEF_PARAM(td_load_evict_end_thresh, TD_LOAD_EVICT_END_THRESH, float, float, -1.0, )

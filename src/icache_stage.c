@@ -480,10 +480,12 @@ Flag mem_req_on_icache_miss() {
       DEBUG(ic->proc_id, "from IC_STAGE for cl 0x%llx at cycle %llu\n", ic->line_addr, cycle_count);
       STAT_EVENT(ic->proc_id, ICACHE_STAGE_MISS);
 
-      // a new on-path demand icache miss starts here -> reset its FE-bound accounting so
+      // a new demand icache miss starts here -> reset its FE-bound accounting so
       // icache_tag_inflight_miss accumulates fresh over this miss's window (needed whether the
-      // FE policy targets the L1I or the L2).
-      if ((TD_FE_RRIP_MARK || TD_FE_RRIP_ON_MLC || TD_COMBINED_ON_MLC) && !ic->off_path) {
+      // FE policy targets the L1I or the L2). Reset on- and off-path: off-path misses now carry
+      // their own window so the L1I marked-RRIP insert can derive an RRPV for them too. (The
+      // L2/MLC variant keeps its own on-path gate in icache_fe_frac_for_line, so it is unaffected.)
+      if (TD_FE_RRIP_MARK || TD_FE_RRIP_ON_MLC || TD_COMBINED_ON_MLC) {
         ic->fe_miss_window_cycles = 0;
         ic->fe_miss_bound_cycles = 0;
       }
@@ -1029,13 +1031,16 @@ static inline void icache_process_ops(Stage_Data* cur_data, Flag fetched_from_uo
   }
 }
 
-/* td_fe_rrip_mark: accumulate the current on-path demand icache miss's outstanding window and
- * its front-end-bound subset (fe_bound_cycle). Called once per cycle from topdown_idq_update.
- * Credits only the demand miss fetch is currently blocked on (in-order fetch). */
+/* td_fe_rrip_mark: accumulate the current demand icache miss's outstanding window and its
+ * front-end-bound subset (fe_bound_cycle). Called once per cycle from topdown_idq_update.
+ * Credits the demand miss fetch is currently blocked on (in-order fetch), on- or off-path: the
+ * L1I fill sets the line's RRPV whether the awaited miss is on- or off-path, matching the
+ * path-agnostic L1D marked-RRIP policy. (The L2/MLC variant keeps its own on-path gate in
+ * icache_fe_frac_for_line, so accumulating off-path here stays MLC-neutral.) */
 void icache_tag_inflight_miss(uns8 proc_id, Flag fe_bound_cycle) {
   Icache_Stage* ics = &cmp_model.icache_stage[proc_id];
-  if (ics->state != ICACHE_WAIT_FOR_MISS || ics->off_path)
-    return;  // not blocked on an on-path demand icache miss
+  if (ics->state != ICACHE_WAIT_FOR_MISS)
+    return;  // not blocked on a demand icache miss
   ics->fe_miss_window_cycles++;
   if (fe_bound_cycle)
     ics->fe_miss_bound_cycles++;
@@ -1099,14 +1104,15 @@ Flag icache_fill_line(Mem_Req* req)  // cmp FIXME maybe needed to be optimized
       return TRUE;
     }
 
-    // td_fe_rrip_mark: this fill satisfies the on-path demand miss the front end was blocked
-    // on. Derive its L1I insert RRPV from the FE-bound fraction of the miss's outstanding
-    // window (fe_bound / window) using the td_fe_rrip_* knob set; unmeasured (window==0) or
-    // off-path fills insert at basic.
+    // td_fe_rrip_mark: this fill satisfies the demand miss the front end was blocked on.
+    // Derive its L1I insert RRPV from the FE-bound fraction of the miss's outstanding window
+    // (fe_bound / window) using the td_fe_rrip_* knob set, on- or off-path -- the line is
+    // filled because the awaited miss returned, exactly as real hardware inserts it, agnostic
+    // to path (matching the L1D marked-RRIP policy). Unmeasured (window==0) fills insert at basic.
     Flag td_fe_have_rrpv = FALSE;
     int  td_fe_rrpv = 0;
     if (TD_FE_RRIP_MARK) {
-      if (!ic->off_path && ic->fe_miss_window_cycles > 0) {
+      if (ic->fe_miss_window_cycles > 0) {
         double fe_frac = (double)ic->fe_miss_bound_cycles / (double)ic->fe_miss_window_cycles;
         td_fe_rrpv = marked_rrip_rrpv_from_frac(fe_frac, TD_FE_RRIP_MIN_RRPV, TD_FE_RRIP_EXTRAPOLATE,
                                                 (double)TD_FE_RRIP_EXTRAP_ANCHOR, (double)TD_FE_RRIP_THRESH);

@@ -10,9 +10,12 @@
 
 #include <cstdio>
 #include <cstring>
+#include <algorithm>
 #include <iterator>
 #include <list>
+#include <random>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 extern "C" {
@@ -31,6 +34,7 @@ extern "C" {
 
 static bool g_replay_loaded = false;
 static std::unordered_map<uns64, double> g_ratio;  // key (PC or va) -> mean mem-bound fraction
+static std::unordered_set<uns64> g_forced_random;  // td_load_replay_random: the randomly chosen forced-key set
 
 /* Marked-RRIP hit predictor (--td_load_rrip_hit_predict): load PC -> EWMA of the load's
  * measured miss memory-bound fraction. Updated at each on-path demand miss; queried at each
@@ -154,6 +158,32 @@ void td_load_replay_init(void) {
 
   fprintf(stderr, "[TD_LOAD] Loaded %zu keys from %s (key=%s, thresh=%f)\n", g_ratio.size(), path, suffix,
           (double)TD_LOAD_REPLAY_THRESH);
+
+  if (TD_LOAD_REPLAY_RANDOM) {
+    // Equal-cardinality control: instead of the membound keys (ratio > thresh), force-hit a
+    // seeded-random set of the SAME size N drawn from all recorded keys. N is derived here from
+    // the same record CSV + threshold the membound run uses, so cardinality matches automatically
+    // -- no dependency on the membound replay's outputs.
+    size_t n = 0;
+    std::vector<uns64> all_keys;
+    all_keys.reserve(g_ratio.size());
+    for (const auto& e : g_ratio) {
+      all_keys.push_back(e.first);
+      if (e.second > (double)TD_LOAD_REPLAY_THRESH)
+        n++;
+    }
+    // Canonicalize order before shuffling so the draw depends only on (keys, seed), not on the
+    // unordered_map's iteration order (which can vary across libstdc++ versions / rehash history).
+    std::sort(all_keys.begin(), all_keys.end());
+    std::mt19937_64 rng((uint64_t)TD_LOAD_REPLAY_SEED);
+    std::shuffle(all_keys.begin(), all_keys.end(), rng);
+    if (n > all_keys.size())
+      n = all_keys.size();
+    for (size_t i = 0; i < n; i++)
+      g_forced_random.insert(all_keys[i]);
+    fprintf(stderr, "[TD_LOAD] Random control: forcing %zu of %zu keys (seed=%u, matched thresh=%f)\n",
+            g_forced_random.size(), g_ratio.size(), (unsigned)TD_LOAD_REPLAY_SEED, (double)TD_LOAD_REPLAY_THRESH);
+  }
 }
 
 /**************************************************************************************/
@@ -170,6 +200,9 @@ Flag td_load_should_force_l1_hit(Op* op) {
   const char* key = TD_LOAD_REPLAY_KEY;
   uns64 k = (key && strcmp(key, "addr") == 0) ? op->oracle_info.va : op->inst_info->addr;
 
+  if (TD_LOAD_REPLAY_RANDOM)
+    return (g_forced_random.count(k) > 0) ? TRUE : FALSE;
+
   auto it = g_ratio.find(k);
   if (it == g_ratio.end())
     return FALSE;
@@ -181,6 +214,8 @@ Flag td_load_is_marked_key(uns64 key) {
   td_load_replay_init();
   if (g_ratio.empty())
     return FALSE;
+  if (TD_LOAD_REPLAY_RANDOM)
+    return (g_forced_random.count(key) > 0) ? TRUE : FALSE;
   auto it = g_ratio.find(key);
   return (it != g_ratio.end() && it->second > (double)TD_LOAD_REPLAY_THRESH) ? TRUE : FALSE;
 }
