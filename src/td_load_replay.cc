@@ -113,6 +113,21 @@ void td_load_mkdir_p(const char* dir) {
 }
 
 /**************************************************************************************/
+/* Key normalization */
+
+/* Marked status is tracked at L1D cacheline granularity in addr (VA) key mode: a VA counts as
+ * marked iff its containing cacheline is marked. Both the stored keys (CSV load) and every
+ * lookup drop the line-offset bits via the L1D's shift (keeping only the MSBs that distinguish
+ * the cacheline), so all VAs in one line collapse to a single key. In PC key mode the key is a
+ * PC, not an address, and passes through unchanged. */
+static inline uns64 td_load_norm_key(uns64 k) {
+  const char* key = TD_LOAD_REPLAY_KEY;
+  if (key && strcmp(key, "addr") == 0)
+    return k >> dcache_get_line_shift();
+  return k;
+}
+
+/**************************************************************************************/
 /* CSV load */
 
 void td_load_replay_init(void) {
@@ -146,8 +161,11 @@ void td_load_replay_init(void) {
     unsigned long long k = 0;
     double frac = 0.0;
     if (sscanf(line, "0x%llx,%lf", &k, &frac) == 2) {
-      sum[(uns64)k] += frac;
-      cnt[(uns64)k] += 1;
+      // In addr mode, collapse the VA to its cacheline so every VA in a line aggregates into
+      // one entry (mean fraction over the line). In PC mode this is a no-op.
+      uns64 nk = td_load_norm_key((uns64)k);
+      sum[nk] += frac;
+      cnt[nk] += 1;
     }
   }
   fclose(fp);
@@ -199,6 +217,7 @@ Flag td_load_should_force_l1_hit(Op* op) {
 
   const char* key = TD_LOAD_REPLAY_KEY;
   uns64 k = (key && strcmp(key, "addr") == 0) ? op->oracle_info.va : op->inst_info->addr;
+  k = td_load_norm_key(k);  // addr mode: match on the load's cacheline, not the exact VA
 
   if (TD_LOAD_REPLAY_RANDOM)
     return (g_forced_random.count(k) > 0) ? TRUE : FALSE;
@@ -214,6 +233,7 @@ Flag td_load_is_marked_key(uns64 key) {
   td_load_replay_init();
   if (g_ratio.empty())
     return FALSE;
+  key = td_load_norm_key(key);  // addr mode: normalize a raw VA to its cacheline before lookup
   if (TD_LOAD_REPLAY_RANDOM)
     return (g_forced_random.count(key) > 0) ? TRUE : FALSE;
   auto it = g_ratio.find(key);

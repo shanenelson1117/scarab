@@ -99,6 +99,7 @@ Flag do_oracle_dcache_access(Op*, Addr*);
 uns dcache_get_assoc(void);
 uns dcache_get_num_sets(void);
 uns dcache_get_set_index(Addr va, Addr* line_addr_out);  /* returns set index, fills *line_addr_out */
+uns dcache_get_line_shift(void);  /* LOG2(line size): >> this maps a VA to its cacheline id */
 
 /**************************************************************************************/
 

@@ -82,6 +82,10 @@ uns dcache_get_set_index(Addr va, Addr* line_addr_out) {
   return ext_cache_index(&dc->dcache, va, line_addr_out, &tag);
 }
 
+uns dcache_get_line_shift(void) {
+  return dc->dcache.shift_bits;  /* == LOG2(DCACHE_LINE_SIZE) */
+}
+
 /**************************************************************************************/
 /* Prototypes for Inline Methods */
 
