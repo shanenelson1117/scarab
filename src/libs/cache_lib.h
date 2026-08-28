@@ -68,6 +68,7 @@ typedef enum Repl_Policy_enum {
   REPL_DRRIP,   /* dynamic re-reference interval prediction */
   REPL_SHIP,    /* signature-based hit predictor */
   REPL_MARKED_RRIP, /* SRRIP variant: marked (memory-bound) lines insert at RRPV 0 */
+  REPL_PLRU_TREE,   /* tree-based pseudo-LRU (binary tree of direction bits per set) */
 
   NUM_REPL
 } Repl_Policy;
@@ -125,6 +126,9 @@ typedef struct Cache_struct {
   Addr offset_mask; /* mask used to get the line offset */
 
   uns* repl_ctrs; /* replacement info */
+
+  uns64* plru_tree; /* REPL_PLRU_TREE: one per set; packed direction bits of the pseudo-LRU
+                       binary tree over the ways (internal node n in [1, assoc-1] -> bit n) */
 
   /* A dynamically allocated array of all of the cache entries. The array is two-dimensional, sets are row major. */
   Cache_Entry** entries;

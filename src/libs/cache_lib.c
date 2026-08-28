@@ -1876,6 +1876,87 @@ Cache_Entry* ship_update_evict(Cache* cache, uns8 proc_id, uns set, uns* way, vo
 }
 
 /**************************************************************************************/
+/* PLRU_TREE: tree-based pseudo-LRU.
+ *
+ * Per set, a balanced binary tree of (assoc-1) direction bits laid out as an implicit heap:
+ * internal node n in [1, assoc-1] has children 2n (left) and 2n+1 (right); leaf node
+ * (assoc + way) corresponds to `way`. A bit selects the subtree the victim lives in:
+ *   0 -> victim is to the LEFT, 1 -> victim is to the RIGHT.
+ * On access/insert of a way, every bit on its root->leaf path is flipped to point AWAY from
+ * that leaf (marking its subtree as recently used); eviction walks root->leaf following the
+ * bits to the pseudo-oldest leaf. Requires power-of-two associativity (checked at init). */
+
+void plru_action_init(Cache* cache, const char* name, uns cache_size, uns assoc, uns line_size, uns data_size,
+                      Repl_Policy repl_policy);
+void plru_update_hit(Cache* cache, uns set, uns way, void* arg);
+void plru_update_insert(Cache* cache, uns8 proc_id, uns set, uns way, void* arg);
+Cache_Entry* plru_update_evict(Cache* cache, uns8 proc_id, uns set, uns* way, void* arg, Flag if_external);
+
+/* Flip every bit on `way`'s root->leaf path to point away from it (way becomes MRU). */
+static inline void plru_touch(Cache* cache, uns set, uns way) {
+  uns    assoc = cache->assoc;
+  uns64  tree = cache->plru_tree[set];
+  uns    node = assoc + way;  // leaf
+  while (node > 1) {
+    uns parent = node >> 1;
+    // left child is even (2*parent); point away from the touched child.
+    if ((node & 1) == 0)
+      tree |= ((uns64)1 << parent);   // touched LEFT  -> point RIGHT
+    else
+      tree &= ~((uns64)1 << parent);  // touched RIGHT -> point LEFT
+    node = parent;
+  }
+  cache->plru_tree[set] = tree;
+}
+
+void plru_action_init(Cache* cache, const char* name, uns cache_size, uns assoc, uns line_size, uns data_size,
+                      Repl_Policy repl_policy) {
+  general_action_init(cache, name, cache_size, assoc, line_size, data_size, repl_policy);
+  ASSERTM(0, (assoc & (assoc - 1)) == 0, "REPL_PLRU_TREE requires power-of-two assoc (got %u)\n", assoc);
+  ASSERTM(0, assoc <= 64, "REPL_PLRU_TREE tree bits must fit in a uns64 (assoc %u > 64)\n", assoc);
+  cache->plru_tree = (uns64*)calloc(cache->num_sets, sizeof(uns64));
+}
+
+void plru_update_hit(Cache* cache, uns set, uns way, void* arg) {
+  plru_touch(cache, set, way);
+  cache_debug_print_set(cache, set, way, CACHE_EVENT_HIT);
+}
+
+void plru_update_insert(Cache* cache, uns8 proc_id, uns set, uns way, void* arg) {
+  // a freshly filled line is the most-recently-used in its set: same path update as a hit.
+  plru_touch(cache, set, way);
+  cache_debug_print_set(cache, set, way, CACHE_EVENT_INSERT);
+}
+
+Cache_Entry* plru_update_evict(Cache* cache, uns8 proc_id, uns set, uns* way, void* arg, Flag if_external) {
+  uns assoc = cache->assoc;
+
+  // prefer an invalid way (cold fill), matching the other evict handlers; the tree bits for
+  // the chosen way are set when update_insert touches it after the fill.
+  uns victim = assoc;  // sentinel: none found
+  for (uns ii = 0; ii < assoc; ii++) {
+    if (!cache->entries[set][ii].valid) {
+      victim = ii;
+      break;
+    }
+  }
+
+  // full set: follow the tree from the root down to a leaf.
+  if (victim == assoc) {
+    uns node = 1;
+    while (node < assoc) {
+      Flag go_right = (cache->plru_tree[set] >> node) & (uns64)1;
+      node = (node << 1) | (go_right ? 1u : 0u);
+    }
+    victim = node - assoc;
+  }
+
+  *way = victim;
+  cache_debug_print_set(cache, set, victim, CACHE_EVENT_EVICT);
+  return &cache->entries[set][victim];
+}
+
+/**************************************************************************************/
 /* Driven Table */
 
 // clang-format off
@@ -1887,6 +1968,7 @@ struct repl_policy_func repl_policy_func_table[NUM_REPL] = {
   { REPL_DRRIP,   drrip_action_init,    general_action_repl,  nru_update_hit,     drrip_update_insert,  drrip_update_evict  },
   { REPL_SHIP,    ship_action_init,     general_action_repl,  ship_update_hit,    ship_update_insert,   ship_update_evict   },
   { REPL_MARKED_RRIP, general_action_init, general_action_repl, marked_rrip_update_hit, marked_rrip_update_insert, srrip_update_evict },
+  { REPL_PLRU_TREE, plru_action_init,   general_action_repl,  plru_update_hit,    plru_update_insert,   plru_update_evict   },
   { REPL_VOID,    NULL,                 NULL,                 NULL,               NULL,                 NULL                },
 };
 // clang-format on
