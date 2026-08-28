@@ -73,7 +73,7 @@ char rand_repl_state[31];
 /* RRIP re-reference prediction value width / max (used by SRRIP/BRRIP/DRRIP/MARKED_RRIP).
    Defined at file scope so the Cache_Entry fill paths above the RRIP policy functions can
    reference RRIP_DISTANT_VAL when initializing marked_promote_rrpv. */
-const static uns8 RRIP_M = 2;
+// const static uns8 RRIP_M = 2;
 const static uns8 RRIP_DISTANT_VAL = 4;
 
 /**************************************************************************************/
