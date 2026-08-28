@@ -74,7 +74,7 @@ char rand_repl_state[31];
    Defined at file scope so the Cache_Entry fill paths above the RRIP policy functions can
    reference RRIP_DISTANT_VAL when initializing marked_promote_rrpv. */
 const static uns8 RRIP_M = 2;
-const static uns8 RRIP_DISTANT_VAL = (1 << RRIP_M) - 1;
+const static uns8 RRIP_DISTANT_VAL = 4;
 
 /**************************************************************************************/
 
