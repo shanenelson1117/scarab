@@ -136,6 +136,19 @@ DEF_PARAM(td_load_evict_track, TD_LOAD_EVICT_TRACK, Flag, Flag, FALSE, )
 DEF_PARAM(td_load_evict_start_thresh, TD_LOAD_EVICT_START_THRESH, float, float, -1.0, )
 DEF_PARAM(td_load_evict_end_thresh, TD_LOAD_EVICT_END_THRESH, float, float, -1.0, )
 DEF_PARAM(td_load_rrip_mark, TD_LOAD_RRIP_MARK, Flag, Flag, FALSE, )
+/* Marked-RRIP: the "basic" (unprotected) initial RRPV -- what a line inserts at when nothing
+   marked it, i.e. no fraction was staged (prefetch fill, off-path, no demanding op) or the
+   fraction did not clear the class threshold. It is also the least-protected end of the
+   extrapolation ramp. Shared by every marked-RRIP caller (L1I, L1D, MLC) so all levels agree
+   on what "unprotected" means.
+   Default 3 = RRIP_DISTANT_VAL-1. NOTE this is NOT the lowest priority: srrip_update_evict
+   evicts on reference_val == RRIP_DISTANT_VAL (4), so 3 is one aging round above the floor
+   and 4 is evict-on-arrival. Setting it to 4 makes unmarked lines the first victims (a
+   BRRIP-distant / pseudo-bypass insertion). Values ABOVE 4 are unsafe -- the eviction test is
+   an exact equality, so such a line would never match and would age forever -- and are clamped
+   to 4. Negative values are allowed (they protect unmarked lines) but make the "marked"
+   distinction meaningless unless td_*_min_rrpv is pushed lower still. */
+DEF_PARAM(marked_rrip_basic_rrpv, MARKED_RRIP_BASIC_RRPV, int, int, 3, )
 /* Marked-RRIP (REPL_MARKED_RRIP) protects memory-bound load lines. The demanding load's
    memory-bound fraction is computed ON DEMAND at fill (td_mem_cycles/td_window_cycles, as
    the record pass measures it) -- no record CSV, so --td_load_dir / --td_load_replay_key

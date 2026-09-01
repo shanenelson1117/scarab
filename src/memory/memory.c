@@ -178,10 +178,15 @@ static Counter mlc_fill_seq_num = 1;
  * with the fewest demand misses on its leader sets is chosen, and all follower sets adopt it. */
 
 #define TD_DUEL_NBINS 3
-/* bin menu: d32 (data only), i48d32 (both at suite max), i48 (instr only).
- * basic = RRIP_DISTANT_VAL-1 = 2 (unprotected). */
-static const int g_duel_instr[TD_DUEL_NBINS] = {2, -48, -48};
-static const int g_duel_data[TD_DUEL_NBINS] = {-32, -32, 2};
+/* Sentinel for "this class is unprotected in this bin". Resolved at use to
+ * marked_rrip_basic_rrpv() (--marked_rrip_basic_rrpv, default 3) rather than baked in, so the
+ * duel's idea of "basic" cannot drift from the policy's. It previously read 2 here while
+ * marked_rrip_update_insert used RRIP_DISTANT_VAL-1 = 3, which left the "off" class one notch
+ * more protected than a genuinely unmarked line. */
+#define TD_DUEL_BASIC INT_MAX
+/* bin menu: d32 (data only), i48d32 (both at suite max), i48 (instr only). */
+static const int g_duel_instr[TD_DUEL_NBINS] = {TD_DUEL_BASIC, -48, -48};
+static const int g_duel_data[TD_DUEL_NBINS] = {-32, -32, TD_DUEL_BASIC};
 static Counter   g_duel_miss[MAX_NUM_PROCS][TD_DUEL_NBINS];
 static int       g_duel_sel[MAX_NUM_PROCS];        /* selected follower bin */
 static Counter   g_duel_win_start[MAX_NUM_PROCS];  /* inst_count at window start */
@@ -4618,7 +4623,7 @@ Flag mlc_fill_line(Mem_Req* req) {
     // per-class depths: static (td_fe/td_load_rrip_min_rrpv) or, under dynamic mode, chosen by
     // the running front-end-bound vs mem-bound balance -- the dominant class stays deep, the
     // other drops to basic; a balanced window keeps BOTH deep (the non-zero-sum region).
-    const int    basic_rrpv = 2;    // RRIP_DISTANT_VAL-1 = basic; min_rrpv=2 -> insert at basic
+    const int    basic_rrpv = marked_rrip_basic_rrpv();  // --marked_rrip_basic_rrpv (default 3)
     const double off_thr = 1.0;     // fraction can't exceed 1 -> nothing qualifies -> all basic
     int    instr_depth = TD_FE_RRIP_MIN_RRPV;
     int    data_depth = TD_LOAD_RRIP_MIN_RRPV;
@@ -4628,8 +4633,8 @@ Flag mlc_fill_line(Mem_Req* req) {
       // Set dueling picks the (instr,data) depth bin: a leader set uses its own group's bin,
       // a follower uses the currently selected bin. Thresholds stay per-class.
       int bin = duel_bin_for_addr(req->proc_id, req->addr);
-      instr_depth = g_duel_instr[bin];
-      data_depth = g_duel_data[bin];
+      instr_depth = (g_duel_instr[bin] == TD_DUEL_BASIC) ? basic_rrpv : g_duel_instr[bin];
+      data_depth = (g_duel_data[bin] == TD_DUEL_BASIC) ? basic_rrpv : g_duel_data[bin];
     } else if (TD_COMBINED_DYNAMIC_DEPTH || TD_COMBINED_DYNAMIC_THRESH) {
       double fe = topdown_fe_bound_fraction(req->proc_id);
       Flag fe_dom = (fe >= (double)TD_COMBINED_DYN_FE_HI);   // front-end-dominated window

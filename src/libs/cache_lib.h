@@ -199,6 +199,10 @@ void cache_set_marked_next_insert(Flag have_rrpv, int rrpv);
 /* Map a fraction (membound, front-end-bound, ...) to an initial RRPV using an explicit knob
  * set. Callers precompute the RRPV so REPL_MARKED_RRIP stays signal-agnostic. */
 int marked_rrip_rrpv_from_frac(double f, int min_rrpv, Flag extrapolate, double anchor, double thresh);
+/* The "basic" (unprotected) initial RRPV for REPL_MARKED_RRIP: --marked_rrip_basic_rrpv,
+ * clamped to RRIP_DISTANT_VAL (above that a line can never match the eviction test). Callers
+ * that need to name the unprotected depth themselves must use this rather than a literal. */
+int marked_rrip_basic_rrpv(void);
 /* REPL_MARKED_RRIP hit predictor (--td_load_rrip_hit_predict): stage the accessing load's
  * PC-predicted membound fraction so the next hit re-derives its RRPV from it. have==FALSE
  * (or never called) keeps the legacy min(0, inserted RRPV) hit behavior. One-shot: consumed

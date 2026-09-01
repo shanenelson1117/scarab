@@ -1560,6 +1560,16 @@ static int  g_marked_rrip_next_rrpv = 0;
 static Flag   g_marked_rrip_hit_have_frac = FALSE;
 static double g_marked_rrip_hit_frac      = 0.0;
 
+/* The "basic" (unprotected) initial RRPV, from --marked_rrip_basic_rrpv. Clamped to
+ * RRIP_DISTANT_VAL: srrip_update_evict selects on reference_val == RRIP_DISTANT_VAL (an exact
+ * equality), so a line inserted above that value could never match it and would age without
+ * bound while never being chosen as a victim. Single definition so cache_lib and every caller
+ * that precomputes an RRPV agree on where "unprotected" sits. */
+int marked_rrip_basic_rrpv(void) {
+  int basic = MARKED_RRIP_BASIC_RRPV;
+  return (basic > (int)RRIP_DISTANT_VAL) ? (int)RRIP_DISTANT_VAL : basic;
+}
+
 void cache_set_marked_next_insert(Flag have_rrpv, int rrpv) {
   g_marked_rrip_have_rrpv = have_rrpv;
   g_marked_rrip_next_rrpv = rrpv;
@@ -1576,7 +1586,7 @@ void cache_set_hit_promote_frac(Flag have, double frac) {
  *   - fixed-min (extrapolate off): min RRPV iff fraction > thresh, else basic;
  *   - extrapolate on: fraction < anchor -> basic; anchor (-> basic) .. 1.0 (-> min). */
 int marked_rrip_rrpv_from_frac(double f, int min_rrpv, Flag extrapolate, double anchor, double thresh) {
-  const int basic = RRIP_DISTANT_VAL - 1;
+  const int basic = marked_rrip_basic_rrpv();
   if (!extrapolate)
     return (f > thresh) ? min_rrpv : basic;
   double lo = (anchor >= 0.0) ? anchor : thresh;
@@ -1598,7 +1608,7 @@ int marked_rrip_rrpv_from_frac(double f, int min_rrpv, Flag extrapolate, double 
 
 void marked_rrip_update_insert(Cache* cache, uns8 proc_id, uns set, uns way, void* arg);
 void marked_rrip_update_insert(Cache* cache, uns8 proc_id, uns set, uns way, void* arg) {
-  const int basic = RRIP_DISTANT_VAL - 1;
+  const int basic = marked_rrip_basic_rrpv();
   // no RRPV staged (e.g. prefetch fill, off-path, unmarked cache) -> unprotected
   int rrpv = g_marked_rrip_have_rrpv ? g_marked_rrip_next_rrpv : basic;
   cache->entries[set][way].reference_val       = rrpv;
