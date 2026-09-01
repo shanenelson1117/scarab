@@ -865,6 +865,10 @@ DEF_STAT(  MLC_WB_FILL,  DIST,  NO_RATIO  )  // filled by L0 writeback, therefor
 DEF_STAT(  MLC_DEMAND_FILL,  DIST,  NO_RATIO  )
 DEF_STAT(  MLC_PREF_FILL,    DIST,  NO_RATIO  ) 
 
+/* REPL_MOCKINGJAY: fills the policy declined to allocate (the line was not inserted). */
+DEF_STAT(  MLC_MOCKINGJAY_BYPASS         ,  COUNT,  NO_RATIO  )
+DEF_STAT(  L1_MOCKINGJAY_BYPASS          ,  COUNT,  NO_RATIO  )
+
 DEF_STAT(  NORESET_L1_FILL               ,  COUNT,  NO_RATIO  )
 DEF_STAT(  NORESET_L1_FILL_NONPREF       ,  COUNT,  NO_RATIO  )
 DEF_STAT(  NORESET_L1_FILL_PREF          ,  COUNT,  NO_RATIO  )

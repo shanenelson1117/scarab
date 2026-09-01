@@ -99,6 +99,53 @@ static inline Flag td_mlc_req_load_frac(Mem_Req* req, double* out_frac, Addr* ou
   return FALSE;
 }
 
+/* REPL_MOCKINGJAY: the signature source for a request. Data traffic uses the demanding load's
+   PC (falling back to the prefetch trigger PC, then the oldest waiting op's PC); instruction
+   traffic uses the fetch address, since Scarab does not carry a fetch PC on an ifetch req. */
+static inline Addr mockingjay_req_pc(Mem_Req* req) {
+  if (req->type == MRT_IFETCH || req->type == MRT_IPRF || req->type == MRT_UOCPRF || req->type == MRT_FDIPPRFON ||
+      req->type == MRT_FDIPPRFOFF)
+    return req->addr;
+  if (req->loadPC)
+    return req->loadPC;
+  if (req->pref_loadPC)
+    return req->pref_loadPC;
+  return (Addr)req->oldest_op_addr;
+}
+
+static inline Flag mockingjay_req_is_wb(Mem_Req* req) {
+  return (req->type == MRT_WB || req->type == MRT_WB_NODIRTY) ? TRUE : FALSE;
+}
+
+/* Stage this request's PC/traffic class for the next mockingjay hit or insert on `cache`.
+   No-op (and FALSE) for a cache not running REPL_MOCKINGJAY. */
+static inline Flag mockingjay_stage_access(Cache* cache, Mem_Req* req) {
+  if (cache->repl_policy != REPL_MOCKINGJAY)
+    return FALSE;
+  cache_set_mockingjay_next_access(TRUE, mockingjay_req_pc(req), mem_req_type_is_prefetch(req->type),
+                                   mockingjay_req_is_wb(req), req->proc_id);
+  return TRUE;
+}
+
+/* TRUE if mockingjay would decline to allocate this fill in `cache`. On TRUE the caller must
+   skip the insert entirely; the policy's own state update for the bypassed fill is done here
+   (with the request's context staged), so the caller only has to complete the request. */
+static inline Flag mockingjay_bypass_fill(Cache* cache, Mem_Req* req) {
+  if (cache->repl_policy != REPL_MOCKINGJAY || !MOCKINGJAY_BYPASS)
+    return FALSE;
+  /* Never drop a writeback -- the reference excludes writebacks from the bypass check, and
+     dropping one here would silently lose the dirty line. */
+  if (mockingjay_req_is_wb(req))
+    return FALSE;
+  if (!cache_mockingjay_should_bypass(cache, req->addr, mockingjay_req_pc(req), mem_req_type_is_prefetch(req->type),
+                                      req->proc_id))
+    return FALSE;
+
+  mockingjay_stage_access(cache, req);
+  cache_mockingjay_note_bypass(cache, req->addr);
+  return TRUE;
+}
+
 /**************************************************************************************/
 /* Macros */
 
@@ -1556,8 +1603,12 @@ static Flag mem_complete_l1_access(Mem_Req* req, Mem_Queue_Entry* l1_queue_entry
   if (!PREFETCH_UPDATE_LRU_L1 && (req->type == MRT_DPRF || req->type == MRT_IPRF || req->type == MRT_UOCPRF ||
                                   req->type == MRT_FDIPPRFON || req->type == MRT_FDIPPRFOFF))
     update_l1_lru = FALSE;
+  // REPL_MOCKINGJAY: hand the access its PC / traffic class (consumed on a hit).
+  Flag mj_l1_staged = update_l1_lru ? mockingjay_stage_access(&L1(req->proc_id)->cache, req) : FALSE;
   data = (L1_Data*)cache_access(&L1(req->proc_id)->cache, req->addr, &line_addr,
                                 update_l1_lru);  // access L2
+  if (mj_l1_staged)
+    cache_set_mockingjay_next_access(FALSE, 0, FALSE, FALSE, 0);
   req->l1_hit = data ? TRUE : FALSE;
   cache_part_l1_access(req);
   if (FORCE_L1_MISS)
@@ -1772,7 +1823,12 @@ static Flag mem_complete_mlc_access(Mem_Req* req, Mem_Queue_Entry* mlc_queue_ent
       td_mlc_pred_staged = TRUE;
     }
   }
+  // REPL_MOCKINGJAY: hand the access its PC / traffic class (consumed on a hit; the miss path
+  // clears it below so it cannot leak into an unrelated later access).
+  Flag mj_mlc_staged = update_mlc_lru ? mockingjay_stage_access(&MLC(req->proc_id)->cache, req) : FALSE;
   data = (MLC_Data*)cache_access(&MLC(req->proc_id)->cache, req->addr, &line_addr, update_mlc_lru);  // access MLC
+  if (mj_mlc_staged)
+    cache_set_mockingjay_next_access(FALSE, 0, FALSE, FALSE, 0);
   if (td_mlc_pred_staged)
     cache_set_hit_promote_frac(FALSE, 0.0);  // clear one-shot (consumed on hit; drop on miss)
   req->mlc_hit = data ? TRUE : FALSE;
@@ -4133,6 +4189,18 @@ Flag l1_fill_line(Mem_Req* req) {
     return SUCCESS;
   }
 
+  /* REPL_MOCKINGJAY bypass: see the equivalent block in mlc_fill_line. Checked before
+     get_next_repl_line so no victim is chosen and no writeback is scheduled for a fill that
+     is not going to happen. */
+  if (mockingjay_bypass_fill(&L1(req->proc_id)->cache, req)) {
+    STAT_EVENT(req->proc_id, L1_MOCKINGJAY_BYPASS);
+    req->l1_miss_satisfied = TRUE;
+    req->l1_miss_cycle = MAX_CTR;
+    if (TRACK_L1_MISS_DEPS || MARK_L1_MISSES)
+      mark_ops_as_l1_miss_satisfied(req);
+    return SUCCESS;
+  }
+
   /* Do not insert the line yet, just check which line we
      need to replace. If that line is dirty, it's possible
      that we won't be able to insert the writeback into the
@@ -4260,6 +4328,9 @@ Flag l1_fill_line(Mem_Req* req) {
       data_ctr->count = data_ctr->count + 1;
     }
   }
+
+  // REPL_MOCKINGJAY: hand the fill its PC / traffic class (consumed by the insert below).
+  mockingjay_stage_access(&L1(req->proc_id)->cache, req);
 
   // Put prefetches in the right position for replacement
   // cmp FIXME prefetchers
@@ -4427,6 +4498,118 @@ Flag mlc_fill_line(Mem_Req* req) {
   /* if (!get_write_port(&MLC(req->proc_id)->ports[req->mlc_bank])) return
    * FAILURE; */
 
+  /* REPL_MOCKINGJAY bypass: the policy predicts this line's reuse is further out than every
+     resident line's, so it is not allocated at all. Nothing is evicted and no writeback is
+     scheduled; the request still completes and still fills the core-side caches, so the only
+     effect is that a later access to this line misses in the MLC. Checked before the fill
+     stats and before get_next_repl_line so neither observes a fill that did not happen. */
+  if (mockingjay_bypass_fill(&MLC(req->proc_id)->cache, req)) {
+    STAT_EVENT(req->proc_id, MLC_MOCKINGJAY_BYPASS);
+    ASSERT(req->proc_id, req->mlc_miss_cycle != MAX_CTR);
+    ASSERT(req->proc_id, req->mlc_miss);
+    req->mlc_miss_satisfied = TRUE;
+    req->mlc_miss_cycle = MAX_CTR;
+    return SUCCESS;
+  }
+
+  /* Do not insert the line yet, just check which line we
+     need to replace. If that line is dirty, it's possible
+     that we won't be able to insert the writeback into the
+     memory system. */
+  Flag repl_line_valid;
+  data = (MLC_Data*)get_next_repl_line(&MLC(req->proc_id)->cache, req->proc_id, req->addr, &repl_line_addr,
+                                       &repl_line_valid);
+
+  /* If we are replacing anything, check if we need to write it back */
+  if (repl_line_valid) {
+    /* data points at the victim chosen above (not the incoming line), so its
+       metadata below describes the line being evicted. */
+    uns repl_proc_id = get_proc_id_from_cmp_addr(repl_line_addr);
+    if (!MLC_WRITE_THROUGH && data->dirty) {
+      /* need to do a write-back */
+      DEBUG(req->proc_id, "Scheduling writeback of addr:0x%s\n", hexstr64s(repl_line_addr));
+      if (0 && DEBUG_EXC_INSERTS)
+        printf("Scheduling L2 writeback of addr:0x%s ins addr:0x%s\n", hexstr64s(repl_line_addr), hexstr64s(req->addr));
+      if (!new_mem_mlc_wb_req(MRT_WB, repl_proc_id, repl_line_addr, MLC_LINE_SIZE, 1, NULL, NULL, unique_count))
+        return FAILURE;
+      STAT_EVENT(req->proc_id, MLC_FILL_DIRTY);
+    }
+
+    if (data->prefetch) {
+      if (!data->seen_prefetch) {  // prefeched line not used
+        pref_evictline_notused(repl_proc_id, repl_line_addr, data->pref_loadPC, data->global_hist);
+
+        STAT_EVENT(repl_proc_id, CORE_EVICTED_MLC_PREF_NOT_USED);
+        INC_STAT_EVENT(repl_proc_id, CORE_MEM_LATENCY_AVE_PREF_NOT_USED, data->mlc_miss_latency);
+
+        if (data->mlc_miss_latency > 1600)
+          STAT_EVENT(repl_proc_id, CORE_PREF_MLC_NOT_USED_LATENCY1600MORE);
+        else if (data->mlc_miss_latency > 1400)
+          STAT_EVENT(repl_proc_id, CORE_PREF_MLC_NOT_USED_LATENCY1600);
+        else if (data->mlc_miss_latency > 1200)
+          STAT_EVENT(repl_proc_id, CORE_PREF_MLC_NOT_USED_LATENCY1400);
+        else if (data->mlc_miss_latency > 1000)
+          STAT_EVENT(repl_proc_id, CORE_PREF_MLC_NOT_USED_LATENCY1200);
+        else if (data->mlc_miss_latency > 800)
+          STAT_EVENT(repl_proc_id, CORE_PREF_MLC_NOT_USED_LATENCY1000);
+        else if (data->mlc_miss_latency > 600)
+          STAT_EVENT(repl_proc_id, CORE_PREF_MLC_NOT_USED_LATENCY800);
+        else if (data->mlc_miss_latency > 400)
+          STAT_EVENT(repl_proc_id, CORE_PREF_MLC_NOT_USED_LATENCY600);
+        else if (data->mlc_miss_latency > 200)
+          STAT_EVENT(repl_proc_id, CORE_PREF_MLC_NOT_USED_LATENCY400);
+        else
+          STAT_EVENT(repl_proc_id, CORE_PREF_MLC_NOT_USED_LATENCY200);
+      } else {  // prefeched line used
+        pref_evictline_used(repl_proc_id, repl_line_addr, data->pref_loadPC, data->global_hist);
+
+        STAT_EVENT(repl_proc_id, CORE_EVICTED_MLC_PREF_USED);
+        INC_STAT_EVENT(repl_proc_id, CORE_MEM_LATENCY_AVE_PREF_USED, data->mlc_miss_latency);
+
+        if (data->mlc_miss_latency > 1600)
+          STAT_EVENT(repl_proc_id, CORE_PREF_MLC_USED_LATENCY1600MORE);
+        else if (data->mlc_miss_latency > 1400)
+          STAT_EVENT(repl_proc_id, CORE_PREF_MLC_USED_LATENCY1600);
+        else if (data->mlc_miss_latency > 1200)
+          STAT_EVENT(repl_proc_id, CORE_PREF_MLC_USED_LATENCY1400);
+        else if (data->mlc_miss_latency > 1000)
+          STAT_EVENT(repl_proc_id, CORE_PREF_MLC_USED_LATENCY1200);
+        else if (data->mlc_miss_latency > 800)
+          STAT_EVENT(repl_proc_id, CORE_PREF_MLC_USED_LATENCY1000);
+        else if (data->mlc_miss_latency > 600)
+          STAT_EVENT(repl_proc_id, CORE_PREF_MLC_USED_LATENCY800);
+        else if (data->mlc_miss_latency > 400)
+          STAT_EVENT(repl_proc_id, CORE_PREF_MLC_USED_LATENCY600);
+        else if (data->mlc_miss_latency > 200)
+          STAT_EVENT(repl_proc_id, CORE_PREF_MLC_USED_LATENCY400);
+        else
+          STAT_EVENT(repl_proc_id, CORE_PREF_MLC_USED_LATENCY200);
+      }
+    } else {
+      STAT_EVENT(repl_proc_id, CORE_EVICTED_MLC_DEMAND);
+      INC_STAT_EVENT(repl_proc_id, CORE_MEM_LATENCY_AVE_DEMAND, data->mlc_miss_latency);
+
+      if (data->mlc_miss_latency > 1000)
+        STAT_EVENT(repl_proc_id, CORE_PREF_MLC_DEMAND_LATENCY1000MORE);
+      else if (data->mlc_miss_latency > 900)
+        STAT_EVENT(repl_proc_id, CORE_PREF_MLC_DEMAND_LATENCY1000);
+      else if (data->mlc_miss_latency > 800)
+        STAT_EVENT(repl_proc_id, CORE_PREF_MLC_DEMAND_LATENCY900);
+      else if (data->mlc_miss_latency > 700)
+        STAT_EVENT(repl_proc_id, CORE_PREF_MLC_DEMAND_LATENCY800);
+      else if (data->mlc_miss_latency > 600)
+        STAT_EVENT(repl_proc_id, CORE_PREF_MLC_DEMAND_LATENCY700);
+      else if (data->mlc_miss_latency > 500)
+        STAT_EVENT(repl_proc_id, CORE_PREF_MLC_DEMAND_LATENCY600);
+      else if (data->mlc_miss_latency > 400)
+        STAT_EVENT(repl_proc_id, CORE_PREF_MLC_DEMAND_LATENCY500);
+      else if (data->mlc_miss_latency > 300)
+        STAT_EVENT(repl_proc_id, CORE_PREF_MLC_DEMAND_LATENCY400);
+      else
+        STAT_EVENT(repl_proc_id, CORE_PREF_MLC_DEMAND_LATENCY300);
+    }
+  }
+
   // COMBINED L2 policy: instruction demand fetches get an RRPV from the L1I fetch miss's
   // front-end-bound fraction (td_fe_rrip_* knobs); everything else uses the demanding load's
   // membound fraction (td_load_rrip_* knobs). No demanding op (prefetch/store) -> basic. Each
@@ -4552,6 +4735,9 @@ Flag mlc_fill_line(Mem_Req* req) {
     cache_set_marked_next_insert(have_rrpv, rrpv);
   }
 
+  // REPL_MOCKINGJAY: hand the fill its PC / traffic class (consumed by the insert below).
+  mockingjay_stage_access(&MLC(req->proc_id)->cache, req);
+
   // Put prefetches in the right position for replacement
   // cmp FIXME prefetchers
   if (req->type == MRT_DPRF || req->type == MRT_IPRF) {
@@ -4602,104 +4788,6 @@ Flag mlc_fill_line(Mem_Req* req) {
         STAT_EVENT(req->proc_id, CORE_PREF_MLC_PARTIAL_USED);
         STAT_EVENT_ALL(PREF_MLC_TOTAL_PARTIAL_USED);
       }
-    }
-  }
-
-  /* Do not insert the line yet, just check which line we
-     need to replace. If that line is dirty, it's possible
-     that we won't be able to insert the writeback into the
-     memory system. */
-  Flag repl_line_valid;
-  data = (MLC_Data*)get_next_repl_line(&MLC(req->proc_id)->cache, req->proc_id, req->addr, &repl_line_addr,
-                                       &repl_line_valid);
-
-  /* If we are replacing anything, check if we need to write it back */
-  if (repl_line_valid) {
-    /* Note: data now points to the newly inserted line after cache_insert above.
-       For the evicted line's proc_id, we must extract it from repl_line_addr. */
-    uns repl_proc_id = get_proc_id_from_cmp_addr(repl_line_addr);
-    if (!MLC_WRITE_THROUGH && data->dirty) {
-      /* need to do a write-back */
-      DEBUG(req->proc_id, "Scheduling writeback of addr:0x%s\n", hexstr64s(repl_line_addr));
-      if (0 && DEBUG_EXC_INSERTS)
-        printf("Scheduling L2 writeback of addr:0x%s ins addr:0x%s\n", hexstr64s(repl_line_addr), hexstr64s(req->addr));
-      if (!new_mem_mlc_wb_req(MRT_WB, repl_proc_id, repl_line_addr, MLC_LINE_SIZE, 1, NULL, NULL, unique_count))
-        return FAILURE;
-      STAT_EVENT(req->proc_id, MLC_FILL_DIRTY);
-    }
-
-    if (data->prefetch) {
-      if (!data->seen_prefetch) {  // prefeched line not used
-        pref_evictline_notused(repl_proc_id, repl_line_addr, data->pref_loadPC, data->global_hist);
-
-        STAT_EVENT(repl_proc_id, CORE_EVICTED_MLC_PREF_NOT_USED);
-        INC_STAT_EVENT(repl_proc_id, CORE_MEM_LATENCY_AVE_PREF_NOT_USED, data->mlc_miss_latency);
-
-        if (data->mlc_miss_latency > 1600)
-          STAT_EVENT(repl_proc_id, CORE_PREF_MLC_NOT_USED_LATENCY1600MORE);
-        else if (data->mlc_miss_latency > 1400)
-          STAT_EVENT(repl_proc_id, CORE_PREF_MLC_NOT_USED_LATENCY1600);
-        else if (data->mlc_miss_latency > 1200)
-          STAT_EVENT(repl_proc_id, CORE_PREF_MLC_NOT_USED_LATENCY1400);
-        else if (data->mlc_miss_latency > 1000)
-          STAT_EVENT(repl_proc_id, CORE_PREF_MLC_NOT_USED_LATENCY1200);
-        else if (data->mlc_miss_latency > 800)
-          STAT_EVENT(repl_proc_id, CORE_PREF_MLC_NOT_USED_LATENCY1000);
-        else if (data->mlc_miss_latency > 600)
-          STAT_EVENT(repl_proc_id, CORE_PREF_MLC_NOT_USED_LATENCY800);
-        else if (data->mlc_miss_latency > 400)
-          STAT_EVENT(repl_proc_id, CORE_PREF_MLC_NOT_USED_LATENCY600);
-        else if (data->mlc_miss_latency > 200)
-          STAT_EVENT(repl_proc_id, CORE_PREF_MLC_NOT_USED_LATENCY400);
-        else
-          STAT_EVENT(repl_proc_id, CORE_PREF_MLC_NOT_USED_LATENCY200);
-      } else {  // prefeched line used
-        pref_evictline_used(repl_proc_id, repl_line_addr, data->pref_loadPC, data->global_hist);
-
-        STAT_EVENT(repl_proc_id, CORE_EVICTED_MLC_PREF_USED);
-        INC_STAT_EVENT(repl_proc_id, CORE_MEM_LATENCY_AVE_PREF_USED, data->mlc_miss_latency);
-
-        if (data->mlc_miss_latency > 1600)
-          STAT_EVENT(repl_proc_id, CORE_PREF_MLC_USED_LATENCY1600MORE);
-        else if (data->mlc_miss_latency > 1400)
-          STAT_EVENT(repl_proc_id, CORE_PREF_MLC_USED_LATENCY1600);
-        else if (data->mlc_miss_latency > 1200)
-          STAT_EVENT(repl_proc_id, CORE_PREF_MLC_USED_LATENCY1400);
-        else if (data->mlc_miss_latency > 1000)
-          STAT_EVENT(repl_proc_id, CORE_PREF_MLC_USED_LATENCY1200);
-        else if (data->mlc_miss_latency > 800)
-          STAT_EVENT(repl_proc_id, CORE_PREF_MLC_USED_LATENCY1000);
-        else if (data->mlc_miss_latency > 600)
-          STAT_EVENT(repl_proc_id, CORE_PREF_MLC_USED_LATENCY800);
-        else if (data->mlc_miss_latency > 400)
-          STAT_EVENT(repl_proc_id, CORE_PREF_MLC_USED_LATENCY600);
-        else if (data->mlc_miss_latency > 200)
-          STAT_EVENT(repl_proc_id, CORE_PREF_MLC_USED_LATENCY400);
-        else
-          STAT_EVENT(repl_proc_id, CORE_PREF_MLC_USED_LATENCY200);
-      }
-    } else {
-      STAT_EVENT(repl_proc_id, CORE_EVICTED_MLC_DEMAND);
-      INC_STAT_EVENT(repl_proc_id, CORE_MEM_LATENCY_AVE_DEMAND, data->mlc_miss_latency);
-
-      if (data->mlc_miss_latency > 1000)
-        STAT_EVENT(repl_proc_id, CORE_PREF_MLC_DEMAND_LATENCY1000MORE);
-      else if (data->mlc_miss_latency > 900)
-        STAT_EVENT(repl_proc_id, CORE_PREF_MLC_DEMAND_LATENCY1000);
-      else if (data->mlc_miss_latency > 800)
-        STAT_EVENT(repl_proc_id, CORE_PREF_MLC_DEMAND_LATENCY900);
-      else if (data->mlc_miss_latency > 700)
-        STAT_EVENT(repl_proc_id, CORE_PREF_MLC_DEMAND_LATENCY800);
-      else if (data->mlc_miss_latency > 600)
-        STAT_EVENT(repl_proc_id, CORE_PREF_MLC_DEMAND_LATENCY700);
-      else if (data->mlc_miss_latency > 500)
-        STAT_EVENT(repl_proc_id, CORE_PREF_MLC_DEMAND_LATENCY600);
-      else if (data->mlc_miss_latency > 400)
-        STAT_EVENT(repl_proc_id, CORE_PREF_MLC_DEMAND_LATENCY500);
-      else if (data->mlc_miss_latency > 300)
-        STAT_EVENT(repl_proc_id, CORE_PREF_MLC_DEMAND_LATENCY400);
-      else
-        STAT_EVENT(repl_proc_id, CORE_PREF_MLC_DEMAND_LATENCY300);
     }
   }
 

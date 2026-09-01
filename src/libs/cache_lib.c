@@ -1364,6 +1364,11 @@ void general_action_init(Cache* cache, const char* name, uns cache_size, uns ass
   cache->tag_mask = ~cache->set_mask;                 /* use after shifting */
   cache->offset_mask = N_BIT_MASK(cache->shift_bits); /* use before shifting */
 
+  /* Only the uop cache is byte-addressable, and it does not use a strategy policy. init_cache
+     clears this at the end of its own path; do the same here, because Cache structs are
+     malloc'd (e.g. mem->uncores) and cache_index reads this field on every access. */
+  cache->tag_incl_offset = FALSE;
+
   /* allocate memory for all the sets (pointers to line arrays)  */
   cache->entries = (Cache_Entry**)malloc(sizeof(Cache_Entry*) * num_sets);
 
@@ -1957,6 +1962,519 @@ Cache_Entry* plru_update_evict(Cache* cache, uns8 proc_id, uns set, uns* way, vo
 }
 
 /**************************************************************************************/
+/* MOCKINGJAY -- Shah, Jain & Lin, "Effective Mimicry of Belady's MIN Policy" (HPCA'22).
+ *
+ * Adapted from the authors' ChampSim CRC2 submission (mockingjay.llc_repl). The policy is
+ * cache-level agnostic: everything the reference derived from the compile-time LLC_SET /
+ * LLC_WAY / LOG2_LLC_SIZE constants is derived here at init from the Cache's own geometry,
+ * so the same code runs as an MLC (L2) or L1 (LLC) policy.
+ *
+ * Mechanism (unchanged from the reference):
+ *  - A PC signature (CRC of the PC, plus hit/prefetch or prefetch/core bits) indexes a Reuse
+ *    Distance Predictor (RDP) holding a predicted reuse distance in accesses.
+ *  - A small sampled cache, present only on a sparse subset of sets, records (tag, signature,
+ *    timestamp) so a later access to the same block yields a measured reuse distance, which
+ *    trains the RDP toward it with a temporal-difference step. Lines that age out of the
+ *    sampler without reuse "detrain" their signature toward INF_RD.
+ *  - Every resident line carries an Estimated Time Remaining (ETR), set on fill/hit from the
+ *    RDP and decremented every GRANULARITY accesses to the set. The victim is the line with
+ *    the largest |ETR| (ties broken toward a negative ETR, i.e. already overdue).
+ *  - A fill whose predicted reuse distance beats every resident line's ETR is bypassed.
+ *
+ * Scarab-specific adaptation notes:
+ *  - ETR lives in Cache_Entry.reference_val (a signed int already), so no per-line storage
+ *    is added; the RDP, the sampler, and the per-set clocks hang off Cache.predictor.
+ *  - The reference's find_victim both chooses a victim and decides bypass. Scarab's
+ *    update_evict must return a way, so the bypass decision is split into the pure predicate
+ *    cache_mockingjay_should_bypass(), which callers consult before cache_insert.
+ *  - The accessing PC / traffic class is staged one-shot via
+ *    cache_set_mockingjay_next_access() (same convention as REPL_MARKED_RRIP), because the
+ *    strategy dispatcher passes no per-access context. An access with no staged context is
+ *    treated as a PC-less demand access.
+ *  - The RDP is a direct-indexed table over the pc_signature_bits-wide signature. That is
+ *    exactly equivalent to the reference's unordered_map<uint32_t,int> (the signature is
+ *    already masked to that width) with an explicit valid bit standing in for map::count.
+ *  - The sampler is allocated densely over the sampled sets only, replacing the reference's
+ *    sparse map; index arithmetic is otherwise identical.
+ *
+ * The RDP-update arithmetic (integer truncation in temporal_difference and in the FLEXMIN
+ * prefetch penalty) is reproduced exactly as the reference computes it, deliberately -- these
+ * are the semantics the published results were produced with.
+ */
+
+#define MOCKINGJAY_SAMPLED_CACHE_WAYS 5
+#define MOCKINGJAY_LOG2_SAMPLER_GROUPS 4 /* sampler groups per sampled cache set */
+#define MOCKINGJAY_TIMESTAMP_BITS 8
+#define MOCKINGJAY_MAX_RD_SLACK 22 /* reference: MAX_RD = INF_RD - 22 */
+#define MOCKINGJAY_MAX_PC_SIGNATURE_BITS 24 /* caps the RDP table at 16M entries */
+
+const static double MOCKINGJAY_TEMP_DIFFERENCE = 1.0 / 16.0;
+
+typedef struct Mockingjay_Sampled_Line_struct {
+  Flag  valid;
+  uns64 tag;
+  uns64 signature;
+  int   timestamp;
+} Mockingjay_Sampled_Line;
+
+typedef struct Mockingjay_State_struct {
+  /* geometry, derived at init from the cache's own size/assoc/line size */
+  int log2_sets;
+  int log2_block;
+  int log2_size; /* log2 of the cache's total capacity in bytes */
+  int sampled_set_mask_len;
+  int pc_signature_bits;
+  int sampler_tag_bits;
+  int history;
+  int granularity;
+  int inf_rd;  /* reference: LLC_WAY * HISTORY - 1 */
+  int inf_etr; /* reference: LLC_WAY * HISTORY / GRANULARITY - 1 */
+  int max_rd;  /* reference: INF_RD - 22 */
+  double flexmin_penalty;
+
+  int* etr_clock;         /* per set: accesses until the next ETR aging step */
+  int* current_timestamp; /* per set: sampler timestamp, wraps at 2^TIMESTAMP_BITS */
+
+  int* rdp;        /* direct-indexed by signature; predicted reuse distance */
+  Flag* rdp_valid; /* stands in for the reference map's count() */
+
+  int* sampled_rank; /* per set: dense sampler rank, or -1 if the set is not sampled */
+  Mockingjay_Sampled_Line* sampler; /* (num_sampled << LOG2_SAMPLER_SETS) groups of WAYS */
+  uns  num_sampled_sets;
+} Mockingjay_State;
+
+void mockingjay_action_init(Cache* cache, const char* name, uns cache_size, uns assoc, uns line_size, uns data_size,
+                            Repl_Policy repl_policy);
+void mockingjay_update_hit(Cache* cache, uns set, uns way, void* arg);
+void mockingjay_update_insert(Cache* cache, uns8 proc_id, uns set, uns way, void* arg);
+Cache_Entry* mockingjay_update_evict(Cache* cache, uns8 proc_id, uns set, uns* way, void* arg, Flag if_external);
+
+/* One-shot per-access context (see cache_set_mockingjay_next_access). Cleared state is a
+ * PC-less demand access, which is what an unstaged access is treated as. */
+static Addr g_mj_pc = 0;
+static Flag g_mj_is_prefetch = FALSE;
+static Flag g_mj_is_writeback = FALSE;
+static uns8 g_mj_proc_id = 0;
+
+void cache_set_mockingjay_next_access(Flag have_ctx, Addr pc, Flag is_prefetch, Flag is_writeback, uns8 proc_id) {
+  g_mj_pc = have_ctx ? pc : 0;
+  g_mj_is_prefetch = have_ctx ? is_prefetch : FALSE;
+  g_mj_is_writeback = have_ctx ? is_writeback : FALSE;
+  g_mj_proc_id = have_ctx ? proc_id : 0;
+}
+
+static inline void mj_clear_ctx(void) {
+  g_mj_pc = 0;
+  g_mj_is_prefetch = FALSE;
+  g_mj_is_writeback = FALSE;
+  g_mj_proc_id = 0;
+}
+
+static inline Mockingjay_State* mj_state(Cache* cache) {
+  return (Mockingjay_State*)cache->predictor;
+}
+
+static inline int mj_abs(int v) {
+  return v < 0 ? -v : v;
+}
+
+/* The sparse set sample: a set qualifies when its low mask bits equal its high mask bits. */
+static inline Flag mj_is_sampled_set(Mockingjay_State* s, uns set) {
+  int mask_len = s->sampled_set_mask_len;
+  uns mask = ((uns)1 << mask_len) - 1;
+  return ((set & mask) == ((set >> (s->log2_sets - mask_len)) & mask)) ? TRUE : FALSE;
+}
+
+static inline uns64 mj_crc_hash(uns64 block_addr) {
+  const uns64 crc_polynomial = 3988292384ULL;
+  uns64 val = block_addr;
+  uns   ii;
+  for (ii = 0; ii < 3; ii++)
+    val = ((val & 1) == 1) ? ((val >> 1) ^ crc_polynomial) : (val >> 1);
+  return val;
+}
+
+/* Single-core: PC || hit || prefetch. Multi-core: PC || prefetch || core (2 bits, as in the
+ * reference -- it assumes at most 4 cores). Hashed, then masked to pc_signature_bits. */
+static inline uns mj_pc_signature(Mockingjay_State* s, Addr pc, Flag hit, Flag prefetch, uns8 proc_id) {
+  uns64 sig = (uns64)pc;
+  if (NUM_CORES == 1) {
+    sig = (sig << 1) | (hit ? 1ULL : 0ULL);
+    sig = (sig << 1) | (prefetch ? 1ULL : 0ULL);
+  } else {
+    sig = (sig << 1) | (prefetch ? 1ULL : 0ULL);
+    sig = (sig << 2) | ((uns64)proc_id & 0x3ULL);
+  }
+  sig = mj_crc_hash(sig);
+  return (uns)(sig & ((((uns64)1) << s->pc_signature_bits) - 1));
+}
+
+/* Sampler index: the low (LOG2_SAMPLER_SETS + log2_sets) bits of the block address. Its low
+ * log2_sets bits are the cache set index (which the caller has already checked is sampled),
+ * so the reference's sparse index (set | group << log2_sets) maps onto the dense rank here. */
+static inline uns mj_sampler_index(Mockingjay_State* s, Addr line_addr) {
+  uns64 blk = (uns64)line_addr >> s->log2_block;
+  uns   idx = (uns)(blk & ((((uns64)1) << (MOCKINGJAY_LOG2_SAMPLER_GROUPS + s->log2_sets)) - 1));
+  uns   set = idx & (((uns)1 << s->log2_sets) - 1);
+  uns   group = idx >> s->log2_sets;
+  ASSERT(0, s->sampled_rank[set] >= 0);
+  return ((uns)s->sampled_rank[set] << MOCKINGJAY_LOG2_SAMPLER_GROUPS) + group;
+}
+
+static inline uns64 mj_sampler_tag(Mockingjay_State* s, Addr line_addr) {
+  uns64 x = (uns64)line_addr >> (s->log2_sets + s->log2_block + MOCKINGJAY_LOG2_SAMPLER_GROUPS);
+  return x & ((((uns64)1) << s->sampler_tag_bits) - 1);
+}
+
+static inline Mockingjay_Sampled_Line* mj_sampler_group(Mockingjay_State* s, uns idx) {
+  return &s->sampler[(size_t)idx * MOCKINGJAY_SAMPLED_CACHE_WAYS];
+}
+
+static int mj_sampler_search(Mockingjay_State* s, uns64 tag, uns idx) {
+  Mockingjay_Sampled_Line* group = mj_sampler_group(s, idx);
+  int way;
+  for (way = 0; way < MOCKINGJAY_SAMPLED_CACHE_WAYS; way++) {
+    if (group[way].valid && group[way].tag == tag)
+      return way;
+  }
+  return -1;
+}
+
+/* A sampler entry evicted without seeing reuse: push its signature toward INF_RD. */
+static void mj_detrain(Mockingjay_State* s, uns idx, int way) {
+  if (way < 0)
+    return;
+  Mockingjay_Sampled_Line* line = &mj_sampler_group(s, idx)[way];
+  if (!line->valid)
+    return;
+
+  uns sig = (uns)line->signature;
+  if (s->rdp_valid[sig]) {
+    s->rdp[sig] = MIN2(s->rdp[sig] + 1, s->inf_rd);
+  } else {
+    s->rdp_valid[sig] = TRUE;
+    s->rdp[sig] = s->inf_rd;
+  }
+  line->valid = FALSE;
+}
+
+/* Temporal-difference step toward the measured sample. Reproduces the reference exactly,
+ * including the integer truncation of (delta * 1/16) and the min(1, ...) clamp -- so the
+ * predictor moves by at most one per training event, and not at all for deltas under 16. */
+static int mj_temporal_difference(Mockingjay_State* s, int init, int sample) {
+  if (sample > init) {
+    int diff = (int)((sample - init) * MOCKINGJAY_TEMP_DIFFERENCE);
+    diff = MIN2(1, diff);
+    return MIN2(init + diff, s->inf_rd);
+  } else if (sample < init) {
+    int diff = (int)((init - sample) * MOCKINGJAY_TEMP_DIFFERENCE);
+    diff = MIN2(1, diff);
+    return MAX2(init - diff, 0);
+  }
+  return init;
+}
+
+static inline int mj_increment_timestamp(int input) {
+  return (input + 1) % (1 << MOCKINGJAY_TIMESTAMP_BITS);
+}
+
+static inline int mj_time_elapsed(int global, int local) {
+  if (global >= local)
+    return global - local;
+  return global + (1 << MOCKINGJAY_TIMESTAMP_BITS) - local;
+}
+
+/* Victim choice over a full set: largest |ETR|, ties broken toward an overdue (negative) ETR.
+ * Also reports that largest |ETR|, which the bypass predicate compares the RDP against. */
+static uns mj_victim_way(Cache* cache, uns set, int* out_max_etr) {
+  uns victim_way = 0;
+  int max_etr = 0;
+  uns ii;
+
+  for (ii = 0; ii < cache->assoc; ii++) {
+    int etr = cache->entries[set][ii].reference_val;
+    int abs_etr = mj_abs(etr);
+    if (abs_etr > max_etr || (abs_etr == max_etr && etr < 0)) {
+      max_etr = abs_etr;
+      victim_way = ii;
+    }
+  }
+
+  if (out_max_etr)
+    *out_max_etr = max_etr;
+  return victim_way;
+}
+
+void mockingjay_action_init(Cache* cache, const char* name, uns cache_size, uns assoc, uns line_size, uns data_size,
+                            Repl_Policy repl_policy) {
+  Mockingjay_State* s;
+  uns ii, jj, rank;
+
+  general_action_init(cache, name, cache_size, assoc, line_size, data_size, repl_policy);
+
+  s = (Mockingjay_State*)calloc(1, sizeof(Mockingjay_State));
+  cache->predictor = s;
+
+  /* The set-sampling test and the sampler index both slice the set index out of the block
+     address, which only works when the set count is a power of two (Scarab's own set_mask
+     assumes this too). */
+  ASSERTM(0, cache->num_sets > 0 && (cache->num_sets & (cache->num_sets - 1)) == 0,
+          "REPL_MOCKINGJAY requires power-of-two num_sets (got %u; cache_size/line_size/assoc)\n", cache->num_sets);
+  ASSERTM(0, assoc > 0 && (assoc & (assoc - 1)) == 0, "REPL_MOCKINGJAY requires power-of-two assoc (got %u)\n", assoc);
+
+  s->log2_sets = (int)LOG2(cache->num_sets);
+  s->log2_block = (int)LOG2(line_size);
+  s->log2_size = s->log2_sets + (int)LOG2(assoc) + s->log2_block;
+
+  s->history = (int)MOCKINGJAY_HISTORY;
+  s->granularity = (int)MOCKINGJAY_GRANULARITY;
+  ASSERTM(0, s->history > 0 && s->granularity > 0, "REPL_MOCKINGJAY needs history/granularity > 0 (%d/%d)\n",
+          s->history, s->granularity);
+
+  s->inf_rd = (int)assoc * s->history - 1;
+  s->inf_etr = ((int)assoc * s->history / s->granularity) - 1;
+  s->max_rd = s->inf_rd - MOCKINGJAY_MAX_RD_SLACK;
+  if (s->max_rd < 0)
+    s->max_rd = 0;
+  /* Measured reuse distances come from an 8-bit wrapping timestamp, so a distance beyond the
+     timestamp range is indistinguishable from a short one and INF_RD must stay inside it. */
+  ASSERTM(0, s->inf_rd < (1 << MOCKINGJAY_TIMESTAMP_BITS),
+          "REPL_MOCKINGJAY: INF_RD %d does not fit in %d timestamp bits (assoc %u * history %d too large)\n", s->inf_rd,
+          MOCKINGJAY_TIMESTAMP_BITS, assoc, s->history);
+
+  /* The reference derives the sampled-set count from LLC capacity (log2_size - 16, i.e. one
+     sampled set per 64KB). A 256KB L2 therefore samples only 4 sets, which trains slowly --
+     hence the override knob. */
+  s->sampled_set_mask_len =
+      (MOCKINGJAY_LOG2_SAMPLED_SETS >= 0) ? (s->log2_sets - MOCKINGJAY_LOG2_SAMPLED_SETS) : (16 - (int)LOG2(assoc) - s->log2_block);
+  /* mask_len 0 samples every set; mask_len == log2_sets would too (the comparison becomes
+     trivially true), so cap one below that -- the sparse end is 2 sampled sets. */
+  if (s->sampled_set_mask_len < 0)
+    s->sampled_set_mask_len = 0;
+  if (s->log2_sets > 0 && s->sampled_set_mask_len > s->log2_sets - 1)
+    s->sampled_set_mask_len = s->log2_sets - 1;
+
+  /* Likewise the signature width: log2_size - 10 gives only 8 bits (256 RDP entries) on a
+     256KB L2 versus 11 on a 2MB LLC, so it is overridable too. */
+  s->pc_signature_bits = (MOCKINGJAY_PC_SIGNATURE_BITS >= 0) ? (int)MOCKINGJAY_PC_SIGNATURE_BITS : (s->log2_size - 10);
+  if (s->pc_signature_bits < 1)
+    s->pc_signature_bits = 1;
+  if (s->pc_signature_bits > MOCKINGJAY_MAX_PC_SIGNATURE_BITS)
+    s->pc_signature_bits = MOCKINGJAY_MAX_PC_SIGNATURE_BITS;
+
+  s->sampler_tag_bits = 31 - s->log2_size;
+  if (s->sampler_tag_bits < 1)
+    s->sampler_tag_bits = 1;
+
+  s->flexmin_penalty = 2.0 - (double)LOG2(NUM_CORES) / 4.0;
+
+  s->etr_clock = (int*)malloc(sizeof(int) * cache->num_sets);
+  s->current_timestamp = (int*)calloc(cache->num_sets, sizeof(int));
+  for (ii = 0; ii < cache->num_sets; ii++)
+    s->etr_clock[ii] = s->granularity;
+
+  s->rdp = (int*)calloc((size_t)1 << s->pc_signature_bits, sizeof(int));
+  s->rdp_valid = (Flag*)calloc((size_t)1 << s->pc_signature_bits, sizeof(Flag));
+
+  /* Rank the sampled sets so the sampler can be allocated densely over them. */
+  s->sampled_rank = (int*)malloc(sizeof(int) * cache->num_sets);
+  rank = 0;
+  for (ii = 0; ii < cache->num_sets; ii++)
+    s->sampled_rank[ii] = mj_is_sampled_set(s, ii) ? (int)rank++ : -1;
+  s->num_sampled_sets = rank;
+  s->sampler = (Mockingjay_Sampled_Line*)calloc((size_t)rank << MOCKINGJAY_LOG2_SAMPLER_GROUPS,
+                                                sizeof(Mockingjay_Sampled_Line) * MOCKINGJAY_SAMPLED_CACHE_WAYS);
+
+  /* Every line starts at ETR 0, as the reference's global array does. */
+  for (ii = 0; ii < cache->num_sets; ii++)
+    for (jj = 0; jj < assoc; jj++)
+      cache->entries[ii][jj].reference_val = 0;
+
+  DEBUG(0, "%s: REPL_MOCKINGJAY sets=%u assoc=%u INF_RD=%d INF_ETR=%d MAX_RD=%d sig_bits=%d sampled_sets=%u\n",
+        cache->name, cache->num_sets, assoc, s->inf_rd, s->inf_etr, s->max_rd, s->pc_signature_bits,
+        s->num_sampled_sets);
+}
+
+/* The reference's llc_update_replacement_state, shared by the hit, fill and bypass paths.
+ * way == cache->assoc means the fill was bypassed (the reference passes LLC_WAY): the sampler
+ * is still trained and the set still ages, only the per-line ETR write is skipped. */
+static void mj_update_state(Cache* cache, uns set, uns way, Addr line_addr, Flag hit) {
+  Mockingjay_State* s = mj_state(cache);
+  uns sig;
+  uns ii;
+
+  /* Writebacks carry no useful PC: a written-back line that missed is marked overdue so it
+     leaves first, and it never trains the predictor. */
+  if (g_mj_is_writeback) {
+    if (!hit && way < cache->assoc)
+      cache->entries[set][way].reference_val = -s->inf_etr;
+    return;
+  }
+
+  sig = mj_pc_signature(s, g_mj_pc, hit, g_mj_is_prefetch, g_mj_proc_id);
+
+  if (mj_is_sampled_set(s, set)) {
+    uns   idx = mj_sampler_index(s, line_addr);
+    uns64 stag = mj_sampler_tag(s, line_addr);
+    Mockingjay_Sampled_Line* group = mj_sampler_group(s, idx);
+    int   sampler_way = mj_sampler_search(s, stag, idx);
+    int   lru_way = -1;
+    int   lru_rd = -1;
+    int   w;
+
+    /* Reuse of a sampled block: the elapsed time is a measured reuse distance for the
+       signature that last touched it. Train the RDP toward it and free the entry. */
+    if (sampler_way > -1) {
+      uns last_sig = (uns)group[sampler_way].signature;
+      int last_timestamp = group[sampler_way].timestamp;
+      int sample = mj_time_elapsed(s->current_timestamp[set], last_timestamp);
+
+      if (sample <= s->inf_rd) {
+        /* FLEXMIN: a prefetched line's measured distance is inflated so prefetch-fed lines
+           are retained less aggressively than demand-fed ones. */
+        if (g_mj_is_prefetch)
+          sample = (int)(sample * s->flexmin_penalty);
+        if (s->rdp_valid[last_sig]) {
+          s->rdp[last_sig] = mj_temporal_difference(s, s->rdp[last_sig], sample);
+        } else {
+          s->rdp_valid[last_sig] = TRUE;
+          s->rdp[last_sig] = sample;
+        }
+        group[sampler_way].valid = FALSE;
+      }
+    }
+
+    /* Make room in the sampler group: prefer an invalid entry, detrain anything that has aged
+       past INF_RD, otherwise detrain the oldest. */
+    for (w = 0; w < MOCKINGJAY_SAMPLED_CACHE_WAYS; w++) {
+      int sample;
+      if (!group[w].valid) {
+        lru_way = w;
+        lru_rd = s->inf_rd + 1;
+        continue;
+      }
+      sample = mj_time_elapsed(s->current_timestamp[set], group[w].timestamp);
+      if (sample > s->inf_rd) {
+        lru_way = w;
+        lru_rd = s->inf_rd + 1;
+        mj_detrain(s, idx, w);
+      } else if (sample > lru_rd) {
+        lru_way = w;
+        lru_rd = sample;
+      }
+    }
+    mj_detrain(s, idx, lru_way);
+
+    for (w = 0; w < MOCKINGJAY_SAMPLED_CACHE_WAYS; w++) {
+      if (!group[w].valid) {
+        group[w].valid = TRUE;
+        group[w].signature = sig;
+        group[w].tag = stag;
+        group[w].timestamp = s->current_timestamp[set];
+        break;
+      }
+    }
+
+    s->current_timestamp[set] = mj_increment_timestamp(s->current_timestamp[set]);
+  }
+
+  /* Age every other line in the set once per GRANULARITY accesses. */
+  if (s->etr_clock[set] == s->granularity) {
+    for (ii = 0; ii < cache->assoc; ii++) {
+      int etr = cache->entries[set][ii].reference_val;
+      if (ii != way && mj_abs(etr) < s->inf_etr)
+        cache->entries[set][ii].reference_val = etr - 1;
+    }
+    s->etr_clock[set] = 0;
+  }
+  s->etr_clock[set]++;
+
+  /* Set the accessed line's ETR from the predicted reuse distance. An unseen signature is
+     optimistic on a single core (ETR 0, retained) and pessimistic when sharing the cache. */
+  if (way < cache->assoc) {
+    if (!s->rdp_valid[sig])
+      cache->entries[set][way].reference_val = (NUM_CORES == 1) ? 0 : s->inf_etr;
+    else if (s->rdp[sig] > s->max_rd)
+      cache->entries[set][way].reference_val = s->inf_etr;
+    else
+      cache->entries[set][way].reference_val = s->rdp[sig] / s->granularity;
+  }
+}
+
+void mockingjay_update_hit(Cache* cache, uns set, uns way, void* arg) {
+  mj_update_state(cache, set, way, cache->entries[set][way].base, TRUE);
+  mj_clear_ctx();
+  cache_debug_print_set(cache, set, way, CACHE_EVENT_HIT);
+}
+
+void mockingjay_update_insert(Cache* cache, uns8 proc_id, uns set, uns way, void* arg) {
+  /* general_action_repl has already written base/tag, so the sampler sees the filled line. */
+  mj_update_state(cache, set, way, cache->entries[set][way].base, FALSE);
+  mj_clear_ctx();
+  cache_debug_print_set(cache, set, way, CACHE_EVENT_INSERT);
+}
+
+Cache_Entry* mockingjay_update_evict(Cache* cache, uns8 proc_id, uns set, uns* way, void* arg, Flag if_external) {
+  uns ii;
+
+  /* An invalid way is always taken first, before any ETR comparison. */
+  *way = cache->assoc;
+  for (ii = 0; ii < cache->assoc; ii++) {
+    if (!cache->entries[set][ii].valid) {
+      *way = ii;
+      break;
+    }
+  }
+  if (*way == cache->assoc)
+    *way = mj_victim_way(cache, set, NULL);
+
+  cache_debug_print_set(cache, set, *way, CACHE_EVENT_EVICT);
+  return &cache->entries[set][*way];
+}
+
+Flag cache_mockingjay_should_bypass(Cache* cache, Addr addr, Addr pc, Flag is_prefetch, uns8 proc_id) {
+  Mockingjay_State* s;
+  Addr tag, line_addr;
+  uns  set, ii, sig;
+  int  max_etr = 0;
+
+  if (cache->repl_policy != REPL_MOCKINGJAY)
+    return FALSE;
+  s = mj_state(cache);
+  set = cache_index(cache, addr, &tag, &line_addr);
+
+  /* The reference returns an invalid way before it ever reaches the bypass check, so a set
+     with a free way never bypasses. */
+  for (ii = 0; ii < cache->assoc; ii++) {
+    if (!cache->entries[set][ii].valid)
+      return FALSE;
+  }
+
+  (void)mj_victim_way(cache, set, &max_etr);
+
+  /* hit=FALSE here: the reference forms the bypass signature from a miss. */
+  sig = mj_pc_signature(s, pc, FALSE, is_prefetch, proc_id);
+  if (!s->rdp_valid[sig])
+    return FALSE;
+
+  /* Bypass when the line's predicted reuse is beyond what the cache can hold, or simply
+     further out than the most-distant resident line. */
+  return (s->rdp[sig] > s->max_rd || s->rdp[sig] / s->granularity > max_etr) ? TRUE : FALSE;
+}
+
+void cache_mockingjay_note_bypass(Cache* cache, Addr addr) {
+  Addr tag, line_addr;
+  uns  set;
+
+  if (cache->repl_policy != REPL_MOCKINGJAY)
+    return;
+
+  set = cache_index(cache, addr, &tag, &line_addr);
+  mj_update_state(cache, set, cache->assoc, line_addr, FALSE);
+  mj_clear_ctx();
+}
+
+/**************************************************************************************/
 /* Driven Table */
 
 // clang-format off
@@ -1969,6 +2487,7 @@ struct repl_policy_func repl_policy_func_table[NUM_REPL] = {
   { REPL_SHIP,    ship_action_init,     general_action_repl,  ship_update_hit,    ship_update_insert,   ship_update_evict   },
   { REPL_MARKED_RRIP, general_action_init, general_action_repl, marked_rrip_update_hit, marked_rrip_update_insert, srrip_update_evict },
   { REPL_PLRU_TREE, plru_action_init,   general_action_repl,  plru_update_hit,    plru_update_insert,   plru_update_evict   },
+  { REPL_MOCKINGJAY, mockingjay_action_init, general_action_repl, mockingjay_update_hit, mockingjay_update_insert, mockingjay_update_evict },
   { REPL_VOID,    NULL,                 NULL,                 NULL,               NULL,                 NULL                },
 };
 // clang-format on

@@ -69,6 +69,7 @@ typedef enum Repl_Policy_enum {
   REPL_SHIP,    /* signature-based hit predictor */
   REPL_MARKED_RRIP, /* SRRIP variant: marked (memory-bound) lines insert at RRPV 0 */
   REPL_PLRU_TREE,   /* tree-based pseudo-LRU (binary tree of direction bits per set) */
+  REPL_MOCKINGJAY,  /* Mockingjay (HPCA'22): PC-signature reuse-distance prediction + ETR */
 
   NUM_REPL
 } Repl_Policy;
@@ -203,6 +204,24 @@ int marked_rrip_rrpv_from_frac(double f, int min_rrpv, Flag extrapolate, double 
  * (or never called) keeps the legacy min(0, inserted RRPV) hit behavior. One-shot: consumed
  * by the next marked_rrip hit. */
 void cache_set_hit_promote_frac(Flag have, double frac);
+
+/* REPL_MOCKINGJAY: the strategy dispatcher passes no per-access context, so the accessing
+ * PC / traffic class is staged one-shot right before the cache_access or cache_insert that
+ * the policy should see it on (same convention as cache_set_marked_next_insert). It is
+ * consumed and cleared by the next mockingjay hit/insert/bypass update. have_ctx==FALSE
+ * makes the next update behave as a PC-less demand access (signature of PC 0). */
+void cache_set_mockingjay_next_access(Flag have_ctx, Addr pc, Flag is_prefetch, Flag is_writeback, uns8 proc_id);
+/* REPL_MOCKINGJAY bypass predicate: TRUE when Mockingjay would decline to allocate this fill
+ * (its predicted reuse distance is longer than every resident line's remaining time). Scarab's
+ * update_evict must name a way, so the caller checks this BEFORE cache_insert and skips the
+ * fill entirely. Pure -- it reads state but does not change it. Returns FALSE for any cache
+ * not running REPL_MOCKINGJAY, and whenever the set has an invalid way (an available way is
+ * always taken, matching the reference implementation). Writebacks must never be bypassed. */
+Flag cache_mockingjay_should_bypass(Cache* cache, Addr addr, Addr pc, Flag is_prefetch, uns8 proc_id);
+/* REPL_MOCKINGJAY: run the replacement-state update for a fill the caller bypassed. The
+ * reference policy still trains the sampler and ages the set on a bypassed fill; only the
+ * per-line ETR write is skipped. Call with the same staged context as the skipped insert. */
+void cache_mockingjay_note_bypass(Cache* cache, Addr addr);
 void* cache_insert_replpos(Cache* cache, uns8 proc_id, Addr addr, Addr* line_addr, Addr* repl_line_addr,
                            Cache_Insert_Repl insert_repl_policy, Flag isPrefetch);
 void* cache_insert_lru(Cache*, uns8, Addr, Addr*, Addr*);

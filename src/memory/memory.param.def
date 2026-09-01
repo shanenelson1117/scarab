@@ -134,6 +134,27 @@ DEF_PARAM(pw_priority_list_filepath, PW_PRIORITY_LIST_FILEPATH, char*, string, "
 DEF_PARAM(num_priority_pws, NUM_PRIORITY_PWS, uns, uns, 10,)
 DEF_PARAM(prioritize_pws_after_first_sticky_until_backend_stall, PRIORITIZE_PWS_AFTER_FIRST_STICKY_UNTIL_BACKEND_STALL, Flag, Flag, FALSE,)
 DEF_PARAM(no_repl_after_queue_size, NO_REPL_AFTER_QUEUE_SIZE, uns, uns, 0,)
+
+/* Mockingjay (HPCA'22) replacement -- REPL_MOCKINGJAY. Select it with
+   --mlc_cache_repl_policy 22 (L2) or --l1_cache_repl_policy 22 (LLC); the policy itself is
+   level-agnostic and these knobs apply to whichever level is running it.
+
+   Bypass: Mockingjay declines to allocate a fill whose predicted reuse distance is worse than
+   every resident line's. Scarab has no generic bypass path, so this is wired explicitly into
+   mlc_fill_line/l1_fill_line. Writebacks are never bypassed (matching the reference, and
+   because dropping one would lose dirty data). Turn it off to run victim selection only. */
+DEF_PARAM(mockingjay_bypass, MOCKINGJAY_BYPASS, Flag, Flag, TRUE, )
+/* Sampler / predictor sizing. -1 uses the reference's capacity-derived value, which assumes an
+   LLC: log2(sampled sets) = log2(bytes) - 16 and signature width = log2(bytes) - 10. A 256KB
+   8-way L2 derives only 4 sampled sets and an 8-bit signature (256 RDP entries), so raising
+   these is usually worthwhile at L2. Signature width is capped at 24 bits. */
+DEF_PARAM(mockingjay_log2_sampled_sets, MOCKINGJAY_LOG2_SAMPLED_SETS, int, int, -1, )
+DEF_PARAM(mockingjay_pc_signature_bits, MOCKINGJAY_PC_SIGNATURE_BITS, int, int, -1, )
+/* Reuse-distance scale: INF_RD = assoc*history - 1 and ETR counts in units of `granularity`
+   accesses. INF_RD must stay under 256 (the sampler timestamp is 8 bits), so history must be
+   <= 256/assoc; the defaults are the paper's. */
+DEF_PARAM(mockingjay_history, MOCKINGJAY_HISTORY, uns, uns, 8, )
+DEF_PARAM(mockingjay_granularity, MOCKINGJAY_GRANULARITY, uns, uns, 8, )
 /* FDIP Confidence Cache */
 // The cache line size is fixed to ICACHE_LINE_SIZE (64 by default). The number of entries in a FDIP UC is FDIP_UC_SIZE / ICACHE_LINE_SIZE. To have 16K (16384) entries, FDIP_UC_SIZE should be 1048576.
 DEF_PARAM(  fdip_uc_size                   , FDIP_UC_SIZE                    , uns    , uns     , 0                      ,       )
