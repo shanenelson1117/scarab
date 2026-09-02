@@ -1378,6 +1378,7 @@ void general_action_init(Cache* cache, const char* name, uns cache_size, uns ass
     /* allocate memory for all of the data elements in each line */
     for (jj = 0; jj < assoc; jj++) {
       cache->entries[ii][jj].valid = FALSE;
+      cache->entries[ii][jj].marked_protected = FALSE;
       if (data_size) {
         cache->entries[ii][jj].data = (void*)malloc(data_size);
         memset(cache->entries[ii][jj].data, 0, data_size);
@@ -1576,6 +1577,16 @@ int marked_rrip_basic_rrpv(void) {
 static Flag g_marked_rrip_have_basic = FALSE;
 static int  g_marked_rrip_basic = 0;
 
+/* Set by marked_rrip_update_hit: was the line just reused one that had been MARKED at insert?
+ * Read immediately after a cache_access by the set-duel "protected hits" metric, which scores
+ * a leader group by how often its protected lines actually get reused rather than by raw
+ * misses. Stale unless a hit just occurred, so callers must gate on the access having hit. */
+static Flag g_marked_rrip_last_hit_protected = FALSE;
+
+Flag cache_marked_last_hit_protected(void) {
+  return g_marked_rrip_last_hit_protected;
+}
+
 void cache_set_marked_next_basic(Flag have_basic, int basic) {
   g_marked_rrip_have_basic = have_basic;
   g_marked_rrip_basic = (basic > (int)RRIP_DISTANT_VAL) ? (int)RRIP_DISTANT_VAL : basic;
@@ -1633,6 +1644,8 @@ void marked_rrip_update_insert(Cache* cache, uns8 proc_id, uns set, uns way, voi
   int rrpv = g_marked_rrip_have_rrpv ? g_marked_rrip_next_rrpv : basic;
   cache->entries[set][way].reference_val       = rrpv;
   cache->entries[set][way].marked_promote_rrpv = rrpv;  // remember for hit promotion
+  // sticky record of "this line cleared its class threshold", for the protected-hits metric
+  cache->entries[set][way].marked_protected    = (rrpv < basic) ? TRUE : FALSE;
   g_marked_rrip_have_rrpv = FALSE;                      // consume the one-shots
   g_marked_rrip_next_rrpv = 0;
   g_marked_rrip_have_basic = FALSE;
@@ -1652,6 +1665,9 @@ void marked_rrip_update_insert(Cache* cache, uns8 proc_id, uns set, uns way, voi
 void marked_rrip_update_hit(Cache* cache, uns set, uns way, void* arg);
 void marked_rrip_update_hit(Cache* cache, uns set, uns way, void* arg) {
   int rrpv;
+  // Publish whether the line being reused was a MARKED one, for the set-duel "protected hits"
+  // metric. One-shot: read by the caller right after cache_access, cleared on the next hit.
+  g_marked_rrip_last_hit_protected = cache->entries[set][way].marked_protected;
   if (g_marked_rrip_hit_have_frac) {
     // load-side hit predictor uses the L1D/L2 (td_load_rrip_*) knob set
     rrpv = marked_rrip_rrpv_from_frac(g_marked_rrip_hit_frac, TD_LOAD_RRIP_MIN_RRPV, TD_LOAD_RRIP_EXTRAPOLATE,

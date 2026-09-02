@@ -423,6 +423,268 @@ static void duel_cfg_for_addr(uns8 proc_id, Addr addr, int* depth_idx, int* basi
   *depth_idx = g_duel_depth_sel[proc_id];
   *basic_val = duel_basic_now(proc_id);
 }
+/**************************************************************************************/
+/* Set dueling for the COMBINED LLC policy (--td_combined_l1_set_duel).
+ *
+ * Three independent arms, tuned together by coordinate descent:
+ *   DEPTH  D in {0: instr -32 / data OFF, 1: instr -32 / data -16, 2: instr -32 / data -32}
+ *          -- instruction protection is pinned; the arm chooses how much DATA to add on top.
+ *          "data OFF" is the TD_DUEL_BASIC sentinel, so it resolves to whatever basic the
+ *          group is running and composes correctly with the BASIC arm.
+ *   THRESH T in {0.5, 0.7}, applied to BOTH class gates together.
+ *   BASIC  B in {2, 3, 4}, the RRPV an unmarked line inserts at.
+ *
+ * Group 0 ALWAYS runs the incumbent (D_sel, T_sel, B_sel); every other group is a
+ * one-coordinate probe off it. So the incumbent is always measured, ties keep it, and a win
+ * moves exactly one coordinate. Group COUNT is fixed by the arm flags at init (the set-role
+ * map depends on it); only the values each probe carries are refreshed per window.
+ *
+ * Disabling an arm drops its probe groups and pins that coordinate to the static params.
+ *
+ * Metric (--td_combined_l1_duel_metric): 0 = demand misses, minimised. 1 = PROTECTED HITS,
+ * maximised -- hits on lines that were marked at insert, i.e. is the protection being reused.
+ * Kept deliberately separate from misses: an arm that marks very few lines can score well on
+ * protected hits while missing more overall, so metric 1 favours narrow confident marking. */
+
+#define L1DUEL_NDEPTH 3
+#define L1DUEL_NTHRESH 2
+#define L1DUEL_NBASIC 3
+#define L1DUEL_MAX_GROUPS (1 + (L1DUEL_NDEPTH - 1) + (L1DUEL_NTHRESH - 1) + (L1DUEL_NBASIC - 1))
+
+/* instruction depth is pinned across the depth bins; data goes OFF / -16 / -32 */
+static const int g_l1duel_instr[L1DUEL_NDEPTH] = {-32, -32, -32};
+static const int g_l1duel_data[L1DUEL_NDEPTH] = {TD_DUEL_BASIC, -16, -32};
+static const double g_l1duel_thresh_val[L1DUEL_NTHRESH] = {0.5, 0.7};
+static const int g_l1duel_basic_val[L1DUEL_NBASIC] = {2, 3, 4};
+#define L1DUEL_THRESH_SEED 1 /* 0.7 */
+#define L1DUEL_BASIC_SEED 1  /* 3 */
+
+typedef enum { L1D_INCUMBENT = 0, L1D_DEPTH, L1D_THRESH, L1D_BASIC } L1Duel_Kind;
+
+static Counter     g_l1duel_score[MAX_NUM_PROCS][L1DUEL_MAX_GROUPS];
+static L1Duel_Kind g_l1duel_kind[MAX_NUM_PROCS][L1DUEL_MAX_GROUPS];
+static int         g_l1duel_probe[MAX_NUM_PROCS][L1DUEL_MAX_GROUPS]; /* index the group probes */
+static int         g_l1duel_depth_sel[MAX_NUM_PROCS];
+static int         g_l1duel_thresh_sel[MAX_NUM_PROCS];
+static int         g_l1duel_basic_sel[MAX_NUM_PROCS];
+static Counter     g_l1duel_win_start[MAX_NUM_PROCS];
+static Flag        g_l1duel_init_done[MAX_NUM_PROCS];
+static int*        g_l1duel_set_role = NULL;
+static uns         g_l1duel_role_nsets = 0;
+static uns         g_l1duel_role_perg = 0;
+static int         g_l1duel_role_ngroups = 0;
+
+/* Fixed by the arm flags: 1 incumbent + one probe per non-selected value of each enabled arm. */
+static inline int l1duel_ngroups(void) {
+  return 1 + (TD_COMBINED_L1_DUEL_DEPTH_AXIS ? L1DUEL_NDEPTH - 1 : 0) +
+         (TD_COMBINED_L1_DUEL_THRESH_AXIS ? L1DUEL_NTHRESH - 1 : 0) +
+         (TD_COMBINED_L1_DUEL_BASIC_AXIS ? L1DUEL_NBASIC - 1 : 0);
+}
+
+static inline Flag l1duel_maximise(void) {
+  return TD_COMBINED_L1_DUEL_METRIC == 1 ? TRUE : FALSE; /* protected hits: more is better */
+}
+
+/* Rebuild the probe table: group 0 is the incumbent, then every non-selected value of each
+ * enabled arm. Called at init and after every window so probes track the new selection. */
+static void l1duel_refresh_probes(uns8 proc_id) {
+  int g = 0;
+  g_l1duel_kind[proc_id][g] = L1D_INCUMBENT;
+  g_l1duel_probe[proc_id][g] = 0;
+  g++;
+  if (TD_COMBINED_L1_DUEL_DEPTH_AXIS) {
+    for (int d = 0; d < L1DUEL_NDEPTH; d++) {
+      if (d == g_l1duel_depth_sel[proc_id])
+        continue;
+      g_l1duel_kind[proc_id][g] = L1D_DEPTH;
+      g_l1duel_probe[proc_id][g] = d;
+      g++;
+    }
+  }
+  if (TD_COMBINED_L1_DUEL_THRESH_AXIS) {
+    for (int t = 0; t < L1DUEL_NTHRESH; t++) {
+      if (t == g_l1duel_thresh_sel[proc_id])
+        continue;
+      g_l1duel_kind[proc_id][g] = L1D_THRESH;
+      g_l1duel_probe[proc_id][g] = t;
+      g++;
+    }
+  }
+  if (TD_COMBINED_L1_DUEL_BASIC_AXIS) {
+    for (int b = 0; b < L1DUEL_NBASIC; b++) {
+      if (b == g_l1duel_basic_sel[proc_id])
+        continue;
+      g_l1duel_kind[proc_id][g] = L1D_BASIC;
+      g_l1duel_probe[proc_id][g] = b;
+      g++;
+    }
+  }
+  ASSERT(0, g == l1duel_ngroups());
+}
+
+/* The (depth idx, threshold, basic) a group runs: the incumbent, with this group's one
+ * coordinate overridden. A disabled arm's coordinate comes from the static params. */
+static void l1duel_group_cfg(uns8 proc_id, int group, int* depth_idx, double* thr, int* basic) {
+  *depth_idx = TD_COMBINED_L1_DUEL_DEPTH_AXIS ? g_l1duel_depth_sel[proc_id] : -1;
+  *thr = TD_COMBINED_L1_DUEL_THRESH_AXIS ? g_l1duel_thresh_val[g_l1duel_thresh_sel[proc_id]] : -1.0;
+  *basic = TD_COMBINED_L1_DUEL_BASIC_AXIS ? g_l1duel_basic_val[g_l1duel_basic_sel[proc_id]]
+                                          : marked_rrip_basic_rrpv();
+  if (group <= 0)
+    return;
+  switch (g_l1duel_kind[proc_id][group]) {
+    case L1D_DEPTH:
+      *depth_idx = g_l1duel_probe[proc_id][group];
+      break;
+    case L1D_THRESH:
+      *thr = g_l1duel_thresh_val[g_l1duel_probe[proc_id][group]];
+      break;
+    case L1D_BASIC:
+      *basic = g_l1duel_basic_val[g_l1duel_probe[proc_id][group]];
+      break;
+    default:
+      break;
+  }
+}
+
+static void l1duel_ensure_roles(uns num_sets) {
+  const int ngroups = l1duel_ngroups();
+  uns perg = TD_COMBINED_L1_DUEL_SETS_PER_GROUP;
+  if (perg < 1)
+    perg = 1;
+  while ((uns)(ngroups * (int)perg) > num_sets && perg > 1)
+    perg--;
+  uns total = (uns)ngroups * perg;
+  if (total > num_sets)
+    total = num_sets;
+
+  if (g_l1duel_set_role && g_l1duel_role_nsets == num_sets && g_l1duel_role_perg == perg &&
+      g_l1duel_role_ngroups == ngroups)
+    return;
+  if (g_l1duel_set_role)
+    free(g_l1duel_set_role);
+  g_l1duel_set_role = (int*)malloc(sizeof(int) * num_sets);
+  for (uns s = 0; s < num_sets; s++)
+    g_l1duel_set_role[s] = -1;  // follower
+  for (uns j = 0; j < total; j++) {
+    uns s = (uns)(((uns64)j * (uns64)num_sets) / (uns64)total);  // spread uniformly
+    if (s >= num_sets)
+      s = num_sets - 1;
+    g_l1duel_set_role[s] = (int)(j % (uns)ngroups);  // round-robin -> perg sets per group
+  }
+  g_l1duel_role_nsets = num_sets;
+  g_l1duel_role_perg = perg;
+  g_l1duel_role_ngroups = ngroups;
+}
+
+static inline Flag l1duel_leader(uns set, int* group) {
+  int role = (set < g_l1duel_role_nsets) ? g_l1duel_set_role[set] : -1;
+  if (role < 0)
+    return FALSE;
+  *group = role;
+  return TRUE;
+}
+
+/* Score one access against a leader group. Called on every demand LLC access. */
+static void l1duel_account(uns8 proc_id, Addr addr, Flag hit) {
+  if (!(TD_COMBINED_ON_L1 && TD_COMBINED_L1_SET_DUEL))
+    return;
+  l1duel_ensure_roles(L1(proc_id)->cache.num_sets);
+  Addr tag = 0, line_addr = 0;
+  uns  set = ext_cache_index(&L1(proc_id)->cache, addr, &tag, &line_addr);
+  int  group = 0;
+  if (!l1duel_leader(set, &group))
+    return;
+  if (l1duel_maximise()) {
+    // protected hits: only a hit on a line that was MARKED at insert counts
+    if (hit && cache_marked_last_hit_protected())
+      g_l1duel_score[proc_id][group]++;
+  } else if (!hit) {
+    g_l1duel_score[proc_id][group]++;  // demand misses
+  }
+}
+
+static void l1duel_maybe_advance(uns8 proc_id) {
+  if (!(TD_COMBINED_ON_L1 && TD_COMBINED_L1_SET_DUEL))
+    return;
+  l1duel_ensure_roles(L1(proc_id)->cache.num_sets);
+  if (!g_l1duel_init_done[proc_id]) {
+    g_l1duel_win_start[proc_id] = inst_count[proc_id];
+    g_l1duel_depth_sel[proc_id] = 1;  /* instr -32 / data -16 */
+    g_l1duel_thresh_sel[proc_id] = L1DUEL_THRESH_SEED;
+    g_l1duel_basic_sel[proc_id] = L1DUEL_BASIC_SEED;
+    l1duel_refresh_probes(proc_id);
+    for (int g = 0; g < L1DUEL_MAX_GROUPS; g++)
+      g_l1duel_score[proc_id][g] = 0;
+    g_l1duel_init_done[proc_id] = TRUE;
+    return;
+  }
+  if (inst_count[proc_id] - g_l1duel_win_start[proc_id] < (Counter)TD_COMBINED_L1_DUEL_WINDOW)
+    return;
+
+  /* group 0 is the incumbent, so starting there makes ties keep the current selection */
+  int     best = 0;
+  Counter best_score = g_l1duel_score[proc_id][0];
+  for (int g = 0; g < l1duel_ngroups(); g++) {
+    Flag better = l1duel_maximise() ? (g_l1duel_score[proc_id][g] > best_score)
+                                    : (g_l1duel_score[proc_id][g] < best_score);
+    if (better) {
+      best_score = g_l1duel_score[proc_id][g];
+      best = g;
+    }
+  }
+
+  switch (g_l1duel_kind[proc_id][best]) {  // exactly one coordinate moves
+    case L1D_DEPTH:
+      g_l1duel_depth_sel[proc_id] = g_l1duel_probe[proc_id][best];
+      break;
+    case L1D_THRESH:
+      g_l1duel_thresh_sel[proc_id] = g_l1duel_probe[proc_id][best];
+      break;
+    case L1D_BASIC:
+      g_l1duel_basic_sel[proc_id] = g_l1duel_probe[proc_id][best];
+      break;
+    default:
+      break;  // incumbent won -> nothing changes
+  }
+  l1duel_refresh_probes(proc_id);
+
+  for (int g = 0; g < L1DUEL_MAX_GROUPS; g++)
+    g_l1duel_score[proc_id][g] = 0;
+  g_l1duel_win_start[proc_id] = inst_count[proc_id];
+}
+
+/* Resolve the depths/thresholds/basic a fill for `addr` should use. Returns the values the
+ * static params would give when dueling is off, so the caller is uniform either way. */
+static void l1duel_cfg_for_addr(uns8 proc_id, Addr addr, int* instr_depth, int* data_depth, double* instr_thr,
+                                double* data_thr, int* basic_rrpv) {
+  *instr_depth = TD_FE_RRIP_MIN_RRPV;
+  *data_depth = TD_LOAD_RRIP_MIN_RRPV;
+  *instr_thr = (double)TD_FE_RRIP_THRESH;
+  *data_thr = (double)TD_LOAD_REPLAY_THRESH;
+  *basic_rrpv = marked_rrip_basic_rrpv();
+  if (!TD_COMBINED_L1_SET_DUEL)
+    return;
+
+  l1duel_ensure_roles(L1(proc_id)->cache.num_sets);
+  Addr tag = 0, line_addr = 0;
+  uns  set = ext_cache_index(&L1(proc_id)->cache, addr, &tag, &line_addr);
+  int  group = 0;
+  if (!l1duel_leader(set, &group))
+    group = 0;  // follower -> the incumbent configuration
+
+  int    d_idx = -1;
+  double thr = -1.0;
+  l1duel_group_cfg(proc_id, group, &d_idx, &thr, basic_rrpv);
+  if (d_idx >= 0) {  // depth arm on
+    *instr_depth = (g_l1duel_instr[d_idx] == TD_DUEL_BASIC) ? *basic_rrpv : g_l1duel_instr[d_idx];
+    *data_depth = (g_l1duel_data[d_idx] == TD_DUEL_BASIC) ? *basic_rrpv : g_l1duel_data[d_idx];
+  }
+  if (thr >= 0.0) {  // threshold arm on -> both gates move together
+    *instr_thr = thr;
+    *data_thr = thr;
+  }
+}
+
 static Counter* core_fill_seq_num;
 static uns mem_req_demand_entries = 0;
 static uns mem_req_pref_entries = 0;
@@ -1770,6 +2032,16 @@ static Flag mem_complete_l1_access(Mem_Req* req, Mem_Queue_Entry* l1_queue_entry
   if (mj_l1_staged)
     cache_set_mockingjay_next_access(FALSE, 0, FALSE, FALSE, 0);
   req->l1_hit = data ? TRUE : FALSE;
+
+  // LLC set dueling: score this demand access against its leader group, then advance the
+  // window. Must run right after cache_access -- the protected-hits metric reads the
+  // one-shot that marked_rrip_update_hit just published.
+  if (TD_COMBINED_ON_L1 && TD_COMBINED_L1_SET_DUEL &&
+      (req->type == MRT_IFETCH || req->type == MRT_DFETCH || req->type == MRT_DSTORE)) {
+    l1duel_account(req->proc_id, req->addr, req->l1_hit);
+    l1duel_maybe_advance(req->proc_id);
+  }
+
   cache_part_l1_access(req);
   if (FORCE_L1_MISS)
     data = NULL;
@@ -4494,8 +4766,13 @@ Flag l1_fill_line(Mem_Req* req) {
   // fraction, each with its own depth and threshold. Static depths only -- the set-duel and
   // dynamic selectors are MLC-bound, so the fixed td_*_min_rrpv values apply here.
   if (TD_COMBINED_ON_L1) {
-    td_combined_stage_fill(req, TD_FE_RRIP_MIN_RRPV, TD_LOAD_RRIP_MIN_RRPV, (double)TD_FE_RRIP_THRESH,
-                           (double)TD_LOAD_REPLAY_THRESH, marked_rrip_basic_rrpv());
+    // With --td_combined_l1_set_duel a leader set uses its own group's (depth, threshold,
+    // basic) and a follower uses the incumbent; without it these are the static params.
+    int    l1_instr_depth, l1_data_depth, l1_basic;
+    double l1_instr_thr, l1_data_thr;
+    l1duel_cfg_for_addr(req->proc_id, req->addr, &l1_instr_depth, &l1_data_depth, &l1_instr_thr, &l1_data_thr,
+                        &l1_basic);
+    td_combined_stage_fill(req, l1_instr_depth, l1_data_depth, l1_instr_thr, l1_data_thr, l1_basic);
   }
 
   // REPL_MOCKINGJAY: hand the fill its PC / traffic class (consumed by the insert below).

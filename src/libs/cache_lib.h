@@ -97,6 +97,11 @@ typedef struct Cache_Entry_struct {
   int  marked_promote_rrpv; /* REPL_MARKED_RRIP: RRPV this line was inserted at; the hit
                                handler promotes to min(0, this) so aging can't erase the
                                membound protection */
+  Flag marked_protected;    /* REPL_MARKED_RRIP: was this line MARKED at insert (its fraction
+                               cleared the class threshold), as opposed to inserted at basic?
+                               Sticky for the line's lifetime -- marked_promote_rrpv is
+                               rewritten on every hit, so it cannot answer this after the
+                               first reuse. Read by the set-duel "protected hits" metric. */
   Flag outcome;       /* for replacement policy */
 } Cache_Entry;
 
@@ -211,6 +216,10 @@ int marked_rrip_rrpv_from_frac_basic(double f, int min_rrpv, Flag extrapolate, d
  * Governs the unstaged fallback (prefetch / off-path fills). have_basic==FALSE restores the
  * global --marked_rrip_basic_rrpv. Consumed by the next marked_rrip insert. */
 void cache_set_marked_next_basic(Flag have_basic, int basic);
+/* TRUE if the line reused by the most recent REPL_MARKED_RRIP hit had been MARKED at insert
+ * (its fraction cleared the class threshold) rather than inserted at basic. Only meaningful
+ * immediately after a cache_access that hit; gate on the hit before reading it. */
+Flag cache_marked_last_hit_protected(void);
 /* REPL_MARKED_RRIP hit predictor (--td_load_rrip_hit_predict): stage the accessing load's
  * PC-predicted membound fraction so the next hit re-derives its RRPV from it. have==FALSE
  * (or never called) keeps the legacy min(0, inserted RRPV) hit behavior. One-shot: consumed

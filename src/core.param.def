@@ -219,6 +219,30 @@ DEF_PARAM(td_combined_on_mlc, TD_COMBINED_ON_MLC, Flag, Flag, FALSE, )
    Note the LLC is 16-way where the MLC is 8-way, so aging per fill differs -- MLC-tuned
    depths do NOT carry over and must be re-swept. */
 DEF_PARAM(td_combined_on_l1, TD_COMBINED_ON_L1, Flag, Flag, FALSE, )
+/* Set dueling for the combined LLC policy. Three independent arms, each separately switchable;
+   every window the best leader group wins and exactly one coordinate moves (coordinate descent).
+   Group 0 always runs the incumbent (D_sel, T_sel, B_sel) -- so ties keep the current choice --
+   and every other group is a one-coordinate probe off it. Disabling an arm drops its probe
+   groups AND pins that coordinate: depth to the static td_*_min_rrpv, threshold to the static
+   td_fe_rrip_thresh / td_load_replay_thresh, basic to --marked_rrip_basic_rrpv.
+     DEPTH  (3 bins) instruction pinned at -32, data OFF / -16 / -32
+     THRESH (2 vals) 0.5 / 0.7 applied to BOTH class gates together
+     BASIC  (3 vals) 2 / 3 / 4, the unmarked insertion RRPV
+   All arms on = 6 leader groups; at 16 sets each that is 96 of the LLC's 2048 sets (4.7%). */
+DEF_PARAM(td_combined_l1_set_duel, TD_COMBINED_L1_SET_DUEL, Flag, Flag, FALSE, )
+DEF_PARAM(td_combined_l1_duel_depth_axis, TD_COMBINED_L1_DUEL_DEPTH_AXIS, Flag, Flag, TRUE, )
+DEF_PARAM(td_combined_l1_duel_thresh_axis, TD_COMBINED_L1_DUEL_THRESH_AXIS, Flag, Flag, TRUE, )
+DEF_PARAM(td_combined_l1_duel_basic_axis, TD_COMBINED_L1_DUEL_BASIC_AXIS, Flag, Flag, TRUE, )
+DEF_PARAM(td_combined_l1_duel_window, TD_COMBINED_L1_DUEL_WINDOW, uns, uns, 100000, )
+DEF_PARAM(td_combined_l1_duel_sets_per_group, TD_COMBINED_L1_DUEL_SETS_PER_GROUP, uns, uns, 16, )
+/* Selection metric. 0 = DEMAND MISSES on the group's leader sets, minimised (the classic
+   DRRIP criterion: which arm misses least). 1 = PROTECTED HITS, maximised: count only hits on
+   lines that were MARKED at insert, i.e. whose fraction cleared the class threshold. That
+   scores an arm by whether the protection it bought is actually being reused rather than by
+   aggregate set performance, which is the quantity this policy is really trying to maximise.
+   The two can disagree: an arm that protects very few lines can have excellent protected-hit
+   behaviour while missing more overall, so 1 tends to favour narrower, more confident marking. */
+DEF_PARAM(td_combined_l1_duel_metric, TD_COMBINED_L1_DUEL_METRIC, uns, uns, 0, )
 /* Combined L2 DYNAMIC depth: instead of static per-class depths, bucket by the running
    balance of front-end-bound vs mem-bound cycles and pick which class is protected deep.
    fe_frac = fe_bound_cycles / (fe_bound_cycles + mem_bound_cycles) over a window:
