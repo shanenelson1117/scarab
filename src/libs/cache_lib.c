@@ -1570,6 +1570,17 @@ int marked_rrip_basic_rrpv(void) {
   return (basic > (int)RRIP_DISTANT_VAL) ? (int)RRIP_DISTANT_VAL : basic;
 }
 
+/* Optional one-shot override of the basic RRPV for the next marked_rrip insert. Set-dueling
+ * chooses basic PER SET, so the global param cannot describe the fill; the caller stages the
+ * set's value here the same way it stages the RRPV itself. Clamped identically. */
+static Flag g_marked_rrip_have_basic = FALSE;
+static int  g_marked_rrip_basic = 0;
+
+void cache_set_marked_next_basic(Flag have_basic, int basic) {
+  g_marked_rrip_have_basic = have_basic;
+  g_marked_rrip_basic = (basic > (int)RRIP_DISTANT_VAL) ? (int)RRIP_DISTANT_VAL : basic;
+}
+
 void cache_set_marked_next_insert(Flag have_rrpv, int rrpv) {
   g_marked_rrip_have_rrpv = have_rrpv;
   g_marked_rrip_next_rrpv = rrpv;
@@ -1586,7 +1597,15 @@ void cache_set_hit_promote_frac(Flag have, double frac) {
  *   - fixed-min (extrapolate off): min RRPV iff fraction > thresh, else basic;
  *   - extrapolate on: fraction < anchor -> basic; anchor (-> basic) .. 1.0 (-> min). */
 int marked_rrip_rrpv_from_frac(double f, int min_rrpv, Flag extrapolate, double anchor, double thresh) {
-  const int basic = marked_rrip_basic_rrpv();
+  return marked_rrip_rrpv_from_frac_basic(f, min_rrpv, extrapolate, anchor, thresh,
+                                          marked_rrip_basic_rrpv());
+}
+
+/* As above, but with the unprotected ("basic") end supplied explicitly -- set-dueling picks it
+ * per set, so it cannot come from the global param. */
+int marked_rrip_rrpv_from_frac_basic(double f, int min_rrpv, Flag extrapolate, double anchor, double thresh,
+                                     int basic_rrpv) {
+  const int basic = basic_rrpv;
   if (!extrapolate)
     return (f > thresh) ? min_rrpv : basic;
   double lo = (anchor >= 0.0) ? anchor : thresh;
@@ -1608,13 +1627,16 @@ int marked_rrip_rrpv_from_frac(double f, int min_rrpv, Flag extrapolate, double 
 
 void marked_rrip_update_insert(Cache* cache, uns8 proc_id, uns set, uns way, void* arg);
 void marked_rrip_update_insert(Cache* cache, uns8 proc_id, uns set, uns way, void* arg) {
-  const int basic = marked_rrip_basic_rrpv();
+  // per-set basic if the caller staged one (set dueling), else the global param
+  const int basic = g_marked_rrip_have_basic ? g_marked_rrip_basic : marked_rrip_basic_rrpv();
   // no RRPV staged (e.g. prefetch fill, off-path, unmarked cache) -> unprotected
   int rrpv = g_marked_rrip_have_rrpv ? g_marked_rrip_next_rrpv : basic;
   cache->entries[set][way].reference_val       = rrpv;
   cache->entries[set][way].marked_promote_rrpv = rrpv;  // remember for hit promotion
-  g_marked_rrip_have_rrpv = FALSE;                      // consume the one-shot
+  g_marked_rrip_have_rrpv = FALSE;                      // consume the one-shots
   g_marked_rrip_next_rrpv = 0;
+  g_marked_rrip_have_basic = FALSE;
+  g_marked_rrip_basic = 0;
 
   cache_debug_print_set(cache, set, way, CACHE_EVENT_INSERT);
 }

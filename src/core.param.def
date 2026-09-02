@@ -270,6 +270,20 @@ DEF_PARAM(td_combined_duel_window, TD_COMBINED_DUEL_WINDOW, uns, uns, 100000, )
    spread uniformly across the L2; the rest are followers. Equal per bin so raw leader miss
    counts are directly comparable. Clamped so 3 * value <= num_sets. */
 DEF_PARAM(td_combined_duel_sets_per_group, TD_COMBINED_DUEL_SETS_PER_GROUP, uns, uns, 16, )
+/* Sets per leader group for the two BASIC-RRPV groups of the duel (the depth groups use
+   td_combined_duel_sets_per_group above). Separate because the basic groups are exploratory --
+   they re-test the incumbent depth at the two non-selected basic RRPVs -- so they can be
+   smaller than the depth groups. Default 8 gives 3*16 + 2*8 = 64 leader sets, 12.5% of a
+   512-set L2 (the previous 3-group scheme used 48, 9.4%). Both counts are scaled down
+   together if they would not fit the cache. */
+DEF_PARAM(td_combined_duel_basic_sets_per_group, TD_COMBINED_DUEL_BASIC_SETS_PER_GROUP, uns, uns, 8, )
+/* Enable the BASIC-RRPV axis of the duel. TRUE (default): 5 leader groups -- 3 sweeping the
+   depth bin plus 2 sweeping the unmarked ("basic") RRPV over {2,3,4}, and the duel owns basic
+   on the MLC. FALSE: the 2 basic groups are not allocated at all, only the 3 depth groups
+   duel, and basic reverts to the global --marked_rrip_basic_rrpv -- i.e. the depth-only
+   dueling behaviour from before the basic axis was added. Use FALSE to measure what the basic
+   axis is actually worth. */
+DEF_PARAM(td_combined_duel_basic_axis, TD_COMBINED_DUEL_BASIC_AXIS, Flag, Flag, TRUE, )
 /* Most-protected (minimum) initial RRPV for a front-end-bound icache line; may be negative
    (signed reference_val). extrapolate off => a miss above td_fe_rrip_thresh inserts here. */
 DEF_PARAM(td_fe_rrip_min_rrpv, TD_FE_RRIP_MIN_RRPV, int, int, 0, )

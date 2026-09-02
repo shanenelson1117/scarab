@@ -203,6 +203,14 @@ int marked_rrip_rrpv_from_frac(double f, int min_rrpv, Flag extrapolate, double 
  * clamped to RRIP_DISTANT_VAL (above that a line can never match the eviction test). Callers
  * that need to name the unprotected depth themselves must use this rather than a literal. */
 int marked_rrip_basic_rrpv(void);
+/* As marked_rrip_rrpv_from_frac but with the unprotected ("basic") end supplied explicitly.
+ * Set dueling selects basic PER SET, so it cannot come from the global param. */
+int marked_rrip_rrpv_from_frac_basic(double f, int min_rrpv, Flag extrapolate, double anchor, double thresh,
+                                     int basic_rrpv);
+/* One-shot per-set basic RRPV for the next marked_rrip insert, staged like the RRPV itself.
+ * Governs the unstaged fallback (prefetch / off-path fills). have_basic==FALSE restores the
+ * global --marked_rrip_basic_rrpv. Consumed by the next marked_rrip insert. */
+void cache_set_marked_next_basic(Flag have_basic, int basic);
 /* REPL_MARKED_RRIP hit predictor (--td_load_rrip_hit_predict): stage the accessing load's
  * PC-predicted membound fraction so the next hit re-derives its RRPV from it. have==FALSE
  * (or never called) keeps the legacy min(0, inserted RRPV) hit behavior. One-shot: consumed

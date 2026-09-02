@@ -173,55 +173,155 @@ static Counter mlc_fill_seq_num = 1;
 
 /**************************************************************************************/
 /* Set dueling (DRRIP-style) for the combined L2 policy (--td_combined_set_duel).
- * 3 leader groups (TD_COMBINED_DUEL_SETS_PER_GROUP sets each) permanently run a fixed
- * (instr,data) depth bin; every window (TD_COMBINED_DUEL_WINDOW retired instructions) the bin
- * with the fewest demand misses on its leader sets is chosen, and all follower sets adopt it. */
+ *
+ * Two independent axes are tuned at once, by coordinate descent over a 3x3 grid:
+ *   DEPTH  D in {0: i72d48, 1: instr-only i96, 2: data-only d64}
+ *   BASIC  B in {2, 3, 4}  -- the RRPV an UNMARKED line inserts at (4 == RRIP_DISTANT_VAL,
+ *                            i.e. first victim; 3 == neutral; 2 == mildly protected)
+ *
+ * Five leader groups sample 5 of the 9 cells each window:
+ *   G0..G2  depth axis: depth = that group's bin,        basic = B_sel (incumbent)
+ *   G3,G4   basic axis: depth = D_sel (incumbent),       basic = the two NON-selected basics
+ *   followers                depth = D_sel,              basic = B_sel
+ *
+ * Note G(D_sel) is exactly the follower configuration, so it doubles as the incumbent in the
+ * comparison and ties keep it. Every window the group with the fewest demand misses on its own
+ * leader sets wins: a depth-group win moves D_sel, a basic-group win moves B_sel; the other
+ * axis is unchanged. G3/G4 are then re-pointed at the new (D_sel, non-selected basics).
+ *
+ * --marked_rrip_basic_rrpv is DELIBERATELY IGNORED here: the duel owns basic on the MLC and
+ * seeds at 3. That param still governs the non-duelling marked-RRIP paths (L1I, L1D, and
+ * static MLC configs).
+ *
+ * Caveats worth remembering when reading results:
+ *  - the axes interact unevenly. On the class-isolated depth bins (D1/D2) the OFF class
+ *    inserts at basic, so basic is the dominant lever there; on D0 it only touches lines that
+ *    fail the threshold. Switching D can therefore flip which B wins and vice versa, so the
+ *    descent can oscillate rather than settle.
+ *  - basic == 4 also suppresses AGING: srrip_update_evict only ages when no line sits at
+ *    RRIP_DISTANT_VAL, so a group at 4 barely ages and its marked lines are pinned harder as a
+ *    side effect. A win for such a group may come from that, not from the intended demotion. */
 
-#define TD_DUEL_NBINS 3
-/* Sentinel for "this class is unprotected in this bin". Resolved at use to
- * marked_rrip_basic_rrpv() (--marked_rrip_basic_rrpv, default 3) rather than baked in, so the
- * duel's idea of "basic" cannot drift from the policy's. It previously read 2 here while
- * marked_rrip_update_insert used RRIP_DISTANT_VAL-1 = 3, which left the "off" class one notch
- * more protected than a genuinely unmarked line. */
+#define TD_DUEL_NDEPTH 3                        /* depth bins */
+#define TD_DUEL_NBASIC 3                        /* basic-RRPV candidates */
+#define TD_DUEL_NBINS (TD_DUEL_NDEPTH + 2)      /* 3 depth groups + 2 basic groups */
+/* Sentinel for "this class is unprotected in this bin", resolved at use to the group's basic
+ * RRPV rather than baked in. It previously read 2 while marked_rrip_update_insert used
+ * RRIP_DISTANT_VAL-1 = 3, which left the "off" class one notch more protected than a
+ * genuinely unmarked line. */
 #define TD_DUEL_BASIC INT_MAX
-/* bin menu: d32 (data only), i48d32 (both at suite max), i48 (instr only). */
-static const int g_duel_instr[TD_DUEL_NBINS] = {TD_DUEL_BASIC, -48, -48};
-static const int g_duel_data[TD_DUEL_NBINS] = {-32, -32, TD_DUEL_BASIC};
-static Counter   g_duel_miss[MAX_NUM_PROCS][TD_DUEL_NBINS];
-static int       g_duel_sel[MAX_NUM_PROCS];        /* selected follower bin */
-static Counter   g_duel_win_start[MAX_NUM_PROCS];  /* inst_count at window start */
-static Flag      g_duel_init_done[MAX_NUM_PROCS];
+/* depth menu: i72d48 (both classes), i96 (instruction only), d64 (data only). */
+static const int g_duel_instr[TD_DUEL_NDEPTH] = {-72, -96, TD_DUEL_BASIC};
+static const int g_duel_data[TD_DUEL_NDEPTH] = {-48, TD_DUEL_BASIC, -64};
+/* basic menu; index 1 (== 3, the neutral value) is the seed. */
+static const int g_duel_basic_val[TD_DUEL_NBASIC] = {2, 3, 4};
+#define TD_DUEL_BASIC_SEED_IDX 1
+
+static Counter g_duel_miss[MAX_NUM_PROCS][TD_DUEL_NBINS];
+static int     g_duel_depth_sel[MAX_NUM_PROCS];    /* D_sel: index into g_duel_instr/data */
+static int     g_duel_basic_sel[MAX_NUM_PROCS];    /* B_sel: index into g_duel_basic_val */
+static int     g_duel_basic_probe[MAX_NUM_PROCS][2]; /* basic index each of G3/G4 tests */
+static Counter g_duel_win_start[MAX_NUM_PROCS];    /* inst_count at window start */
+static Flag    g_duel_init_done[MAX_NUM_PROCS];
+
+/* Leader groups in play: 5 with the basic axis on, 3 (depth only) with it off. */
+static inline int duel_ngroups(void) {
+  return TD_COMBINED_DUEL_BASIC_AXIS ? TD_DUEL_NBINS : TD_DUEL_NDEPTH;
+}
+
+/* The basic RRPV the incumbent (and every depth group) currently uses. With the basic axis
+ * off the duel does not own basic, so it falls back to the global --marked_rrip_basic_rrpv. */
+static inline int duel_basic_now(uns8 proc_id) {
+  return TD_COMBINED_DUEL_BASIC_AXIS ? g_duel_basic_val[g_duel_basic_sel[proc_id]]
+                                     : marked_rrip_basic_rrpv();
+}
+
+/* Point G3/G4 at the two basic candidates that B_sel is not currently using. */
+static void duel_refresh_probes(uns8 proc_id) {
+  int k = 0;
+  for (int b = 0; b < TD_DUEL_NBASIC && k < 2; b++) {
+    if (b != g_duel_basic_sel[proc_id])
+      g_duel_basic_probe[proc_id][k++] = b;
+  }
+  while (k < 2)  /* only reachable if TD_DUEL_NBASIC < 3 */
+    g_duel_basic_probe[proc_id][k++] = g_duel_basic_sel[proc_id];
+}
+
+/* The (depth index, basic value) a given leader group runs. */
+static void duel_group_cfg(uns8 proc_id, int group, int* depth_idx, int* basic_val) {
+  if (group < TD_DUEL_NDEPTH) {
+    *depth_idx = group;                     /* depth axis: vary depth ... */
+    *basic_val = duel_basic_now(proc_id);   /* ... at the incumbent basic */
+  } else {
+    *depth_idx = g_duel_depth_sel[proc_id];               /* basic axis: incumbent depth ... */
+    *basic_val = g_duel_basic_val[g_duel_basic_probe[proc_id][group - TD_DUEL_NDEPTH]];
+  }
+}
 
 /* Per-set role, shared across procs (identical cache geometry): bin index for a leader set,
  * -1 for a follower. Built once for the current num_sets and sets-per-group. */
 static int* g_duel_set_role = NULL;
 static uns  g_duel_role_nsets = 0;
-static uns  g_duel_role_perg = 0;
+static uns  g_duel_role_perg = 0;        /* sets per DEPTH group the map was built for */
+static uns  g_duel_role_perg_basic = 0;  /* sets per BASIC group the map was built for */
+static int  g_duel_role_ngroups = 0;     /* group count the map was built for (3 or 5) */
 
-/* Assign exactly TD_DUEL_NBINS * sets_per_group leader sets, spread uniformly across the cache
- * and round-robined into bins so every bin gets exactly sets_per_group sets. */
+/* Assign leader sets: TD_DUEL_NDEPTH groups of `perg_d` plus 2 groups of `perg_b`, spread
+ * uniformly across the cache. Groups are interleaved (rather than a plain j % NBINS, which
+ * would require equal sizes) so each group's sets stay scattered even when the two sizes
+ * differ. Both counts scale down together if the leaders would not fit. */
 static void duel_ensure_roles(uns num_sets) {
-  uns perg = TD_COMBINED_DUEL_SETS_PER_GROUP;
-  uns total = TD_DUEL_NBINS * perg;
-  while (total > num_sets) {  // clamp so leaders fit
-    perg--;
-    total = TD_DUEL_NBINS * perg;
+  const int ngroups = duel_ngroups();
+  const int nbasic_groups = ngroups - TD_DUEL_NDEPTH;  // 2 with the basic axis on, else 0
+  uns perg_d = TD_COMBINED_DUEL_SETS_PER_GROUP;
+  uns perg_b = nbasic_groups ? TD_COMBINED_DUEL_BASIC_SETS_PER_GROUP : 0;
+  if (perg_d < 1)
+    perg_d = 1;
+  if (nbasic_groups && perg_b < 1)
+    perg_b = 1;
+  while ((uns)(TD_DUEL_NDEPTH * perg_d + nbasic_groups * perg_b) > num_sets) {
+    if (perg_d >= perg_b && perg_d > 1)
+      perg_d--;
+    else if (perg_b > 1)
+      perg_b--;
+    else
+      break;  // one set per group is the floor; a cache this small cannot really duel
   }
-  if (g_duel_set_role && g_duel_role_nsets == num_sets && g_duel_role_perg == perg)
+  uns total = TD_DUEL_NDEPTH * perg_d + nbasic_groups * perg_b;
+  if (total > num_sets)
+    total = num_sets;
+
+  if (g_duel_set_role && g_duel_role_nsets == num_sets && g_duel_role_perg == perg_d &&
+      g_duel_role_perg_basic == perg_b && g_duel_role_ngroups == ngroups)
     return;
   if (g_duel_set_role)
     free(g_duel_set_role);
   g_duel_set_role = (int*)malloc(sizeof(int) * num_sets);
   for (uns s = 0; s < num_sets; s++)
     g_duel_set_role[s] = -1;  // follower
-  for (uns j = 0; j < total; j++) {
-    uns s = (uns)(((uns64)j * (uns64)num_sets) / (uns64)total);  // spread position
-    if (s >= num_sets)
-      s = num_sets - 1;
-    g_duel_set_role[s] = (int)(j % TD_DUEL_NBINS);  // round-robin -> perg sets per bin
+
+  /* Build the group sequence with the right multiplicity, cycling so groups interleave. */
+  uns left[TD_DUEL_NBINS];
+  for (int g = 0; g < ngroups; g++)
+    left[g] = (g < TD_DUEL_NDEPTH) ? perg_d : perg_b;
+  uns placed = 0;
+  int g = 0;
+  while (placed < total) {
+    if (left[g] > 0) {
+      uns s = (uns)(((uns64)placed * (uns64)num_sets) / (uns64)total);  // spread position
+      if (s >= num_sets)
+        s = num_sets - 1;
+      g_duel_set_role[s] = g;
+      left[g]--;
+      placed++;
+    }
+    g = (g + 1) % ngroups;
   }
+
   g_duel_role_nsets = num_sets;
-  g_duel_role_perg = perg;
+  g_duel_role_perg = perg_d;
+  g_duel_role_perg_basic = perg_b;
+  g_duel_role_ngroups = ngroups;
 }
 
 /* leader set? -> TRUE and *bin = its group; follower -> FALSE. */
@@ -239,7 +339,9 @@ static void duel_maybe_advance(uns8 proc_id) {
   duel_ensure_roles(MLC(proc_id)->cache.num_sets);  // build the leader/follower map once
   if (!g_duel_init_done[proc_id]) {
     g_duel_win_start[proc_id] = inst_count[proc_id];
-    g_duel_sel[proc_id] = 1;  /* i48d32 (balanced) until the first window completes */
+    g_duel_depth_sel[proc_id] = 0;                        /* i72d48 until a window completes */
+    g_duel_basic_sel[proc_id] = TD_DUEL_BASIC_SEED_IDX;   /* basic 3 (neutral) */
+    duel_refresh_probes(proc_id);
     for (int b = 0; b < TD_DUEL_NBINS; b++)
       g_duel_miss[proc_id][b] = 0;
     g_duel_init_done[proc_id] = TRUE;
@@ -247,30 +349,44 @@ static void duel_maybe_advance(uns8 proc_id) {
   }
   if (inst_count[proc_id] - g_duel_win_start[proc_id] < (Counter)TD_COMBINED_DUEL_WINDOW)
     return;
-  int     best = g_duel_sel[proc_id];  /* start from the current pick -> ties keep it */
+
+  /* G(D_sel) runs exactly the follower configuration, so it is the incumbent: starting the
+     search there makes ties keep what the followers already use. */
+  int     best = g_duel_depth_sel[proc_id];
   Counter best_miss = g_duel_miss[proc_id][best];
-  for (int b = 0; b < TD_DUEL_NBINS; b++) {
+  for (int b = 0; b < duel_ngroups(); b++) {  // 3 groups when the basic axis is off
     if (g_duel_miss[proc_id][b] < best_miss) {
       best_miss = g_duel_miss[proc_id][b];
       best = b;
     }
   }
-  g_duel_sel[proc_id] = best;
+
+  /* A depth group winning moves D_sel; a basic group winning moves B_sel. The other axis is
+     untouched, so exactly one coordinate changes per window. */
+  if (best < TD_DUEL_NDEPTH)
+    g_duel_depth_sel[proc_id] = best;
+  else
+    g_duel_basic_sel[proc_id] = g_duel_basic_probe[proc_id][best - TD_DUEL_NDEPTH];
+  duel_refresh_probes(proc_id);  // re-point G3/G4 at the now non-selected basics
+
   for (int b = 0; b < TD_DUEL_NBINS; b++)
     g_duel_miss[proc_id][b] = 0;
   g_duel_win_start[proc_id] = inst_count[proc_id];
 }
 
-/* The bin a fill for `addr` should use: a leader set uses its own group's bin; a follower
- * uses the currently selected bin. */
-static int duel_bin_for_addr(uns8 proc_id, Addr addr) {
+/* The (depth index, basic RRPV) a fill for `addr` should use: a leader set uses its own
+ * group's configuration; a follower uses the selected (D_sel, B_sel). */
+static void duel_cfg_for_addr(uns8 proc_id, Addr addr, int* depth_idx, int* basic_val) {
   duel_ensure_roles(MLC(proc_id)->cache.num_sets);
   Addr tag = 0, line_addr = 0;
   uns  set = ext_cache_index(&MLC(proc_id)->cache, addr, &tag, &line_addr);
-  int  bin = 0;
-  if (duel_leader(set, &bin))
-    return bin;
-  return g_duel_sel[proc_id];
+  int  group = 0;
+  if (duel_leader(set, &group)) {
+    duel_group_cfg(proc_id, group, depth_idx, basic_val);
+    return;
+  }
+  *depth_idx = g_duel_depth_sel[proc_id];
+  *basic_val = duel_basic_now(proc_id);
 }
 static Counter* core_fill_seq_num;
 static uns mem_req_demand_entries = 0;
@@ -4623,18 +4739,23 @@ Flag mlc_fill_line(Mem_Req* req) {
     // per-class depths: static (td_fe/td_load_rrip_min_rrpv) or, under dynamic mode, chosen by
     // the running front-end-bound vs mem-bound balance -- the dominant class stays deep, the
     // other drops to basic; a balanced window keeps BOTH deep (the non-zero-sum region).
-    const int    basic_rrpv = marked_rrip_basic_rrpv();  // --marked_rrip_basic_rrpv (default 3)
+    // Unprotected ("basic") RRPV for this fill. Normally the global --marked_rrip_basic_rrpv;
+    // under set dueling the duel owns it and picks it PER SET, so it is overwritten below.
+    int          basic_rrpv = marked_rrip_basic_rrpv();
     const double off_thr = 1.0;     // fraction can't exceed 1 -> nothing qualifies -> all basic
     int    instr_depth = TD_FE_RRIP_MIN_RRPV;
     int    data_depth = TD_LOAD_RRIP_MIN_RRPV;
     double instr_thr = (double)TD_FE_RRIP_THRESH;
     double data_thr = (double)TD_LOAD_REPLAY_THRESH;
     if (TD_COMBINED_SET_DUEL) {
-      // Set dueling picks the (instr,data) depth bin: a leader set uses its own group's bin,
-      // a follower uses the currently selected bin. Thresholds stay per-class.
-      int bin = duel_bin_for_addr(req->proc_id, req->addr);
-      instr_depth = (g_duel_instr[bin] == TD_DUEL_BASIC) ? basic_rrpv : g_duel_instr[bin];
-      data_depth = (g_duel_data[bin] == TD_DUEL_BASIC) ? basic_rrpv : g_duel_data[bin];
+      // Set dueling picks BOTH the (instr,data) depth bin and the basic RRPV: a leader set
+      // uses its own group's pair, a follower uses the selected (D_sel, B_sel). Thresholds
+      // stay per-class. Note basic_rrpv is reassigned first so the TD_DUEL_BASIC sentinel
+      // below resolves to this set's basic, not the global param.
+      int d_idx = 0;
+      duel_cfg_for_addr(req->proc_id, req->addr, &d_idx, &basic_rrpv);
+      instr_depth = (g_duel_instr[d_idx] == TD_DUEL_BASIC) ? basic_rrpv : g_duel_instr[d_idx];
+      data_depth = (g_duel_data[d_idx] == TD_DUEL_BASIC) ? basic_rrpv : g_duel_data[d_idx];
     } else if (TD_COMBINED_DYNAMIC_DEPTH || TD_COMBINED_DYNAMIC_THRESH) {
       double fe = topdown_fe_bound_fraction(req->proc_id);
       Flag fe_dom = (fe >= (double)TD_COMBINED_DYN_FE_HI);   // front-end-dominated window
@@ -4696,19 +4817,22 @@ Flag mlc_fill_line(Mem_Req* req) {
     if (req->type == MRT_IFETCH) {
       double fe_frac = 0.0;
       if (icache_fe_frac_for_line(req->proc_id, req->addr, &fe_frac)) {
-        rrpv = marked_rrip_rrpv_from_frac(fe_frac, instr_depth, TD_FE_RRIP_EXTRAPOLATE,
-                                          (double)TD_FE_RRIP_EXTRAP_ANCHOR, instr_thr);
+        rrpv = marked_rrip_rrpv_from_frac_basic(fe_frac, instr_depth, TD_FE_RRIP_EXTRAPOLATE,
+                                                (double)TD_FE_RRIP_EXTRAP_ANCHOR, instr_thr, basic_rrpv);
         have_rrpv = TRUE;
       }
     } else {
       double frac = 0.0;
       Addr   frac_pc = 0;
       if (td_mlc_req_load_frac(req, &frac, &frac_pc)) {
-        rrpv = marked_rrip_rrpv_from_frac(frac, data_depth, TD_LOAD_RRIP_EXTRAPOLATE,
-                                          (double)TD_LOAD_RRIP_EXTRAP_ANCHOR, data_thr);
+        rrpv = marked_rrip_rrpv_from_frac_basic(frac, data_depth, TD_LOAD_RRIP_EXTRAPOLATE,
+                                                (double)TD_LOAD_RRIP_EXTRAP_ANCHOR, data_thr, basic_rrpv);
         have_rrpv = TRUE;
       }
     }
+    // Stage the set's basic too, so an UNMARKED fill (prefetch / off-path / no demanding op)
+    // lands at this set's basic rather than the global param's.
+    cache_set_marked_next_basic(TRUE, basic_rrpv);
     cache_set_marked_next_insert(have_rrpv, rrpv);
   }
   // marked-RRIP on MLC: derive the fill's initial RRPV from the demanding load's on-demand
