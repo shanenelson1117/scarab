@@ -146,6 +146,41 @@ static inline Flag mockingjay_bypass_fill(Cache* cache, Mem_Req* req) {
   return TRUE;
 }
 
+/* Stage the marked-RRIP insertion state for one COMBINED-policy fill. Level-agnostic: the
+   caller supplies the per-class depths/thresholds and the basic RRPV, so the MLC and the LLC
+   share identical insertion semantics and cannot drift apart.
+
+   Instruction lines take their RRPV from the L1I fetch miss's front-end-bound fraction
+   (icache_fe_frac_for_line is keyed by line address, so it resolves at any level); data lines
+   from the demanding load's membound fraction (td_mlc_req_load_frac walks req->op_ptrs and is
+   likewise per-request, not per-level, despite the name). No usable signal -> nothing staged,
+   and the line inserts at basic. */
+static inline void td_combined_stage_fill(Mem_Req* req, int instr_depth, int data_depth, double instr_thr,
+                                          double data_thr, int basic_rrpv) {
+  Flag have_rrpv = FALSE;
+  int  rrpv = 0;
+  if (req->type == MRT_IFETCH) {
+    double fe_frac = 0.0;
+    if (icache_fe_frac_for_line(req->proc_id, req->addr, &fe_frac)) {
+      rrpv = marked_rrip_rrpv_from_frac_basic(fe_frac, instr_depth, TD_FE_RRIP_EXTRAPOLATE,
+                                              (double)TD_FE_RRIP_EXTRAP_ANCHOR, instr_thr, basic_rrpv);
+      have_rrpv = TRUE;
+    }
+  } else {
+    double frac = 0.0;
+    Addr   frac_pc = 0;
+    if (td_mlc_req_load_frac(req, &frac, &frac_pc)) {
+      rrpv = marked_rrip_rrpv_from_frac_basic(frac, data_depth, TD_LOAD_RRIP_EXTRAPOLATE,
+                                              (double)TD_LOAD_RRIP_EXTRAP_ANCHOR, data_thr, basic_rrpv);
+      have_rrpv = TRUE;
+    }
+  }
+  // Stage the basic too, so an UNMARKED fill (prefetch / off-path / no demanding op) lands at
+  // this set's basic rather than the global param's.
+  cache_set_marked_next_basic(TRUE, basic_rrpv);
+  cache_set_marked_next_insert(have_rrpv, rrpv);
+}
+
 /**************************************************************************************/
 /* Macros */
 
@@ -681,6 +716,10 @@ void init_uncores(void) {
   }
 
   /* Initialize LLC */
+  /* td_combined_on_l1 redirects the LLC to the marked-line SRRIP policy, exactly as
+     td_combined_on_mlc does for the MLC above. Static mode only -- the set-duel and
+     dynamic-depth selectors stay MLC-bound. */
+  Repl_Policy l1_repl = TD_COMBINED_ON_L1 ? REPL_MARKED_RRIP : (Repl_Policy)L1_CACHE_REPL_POLICY;
   if (PRIVATE_L1) {
     ASSERTM(0, L1_SIZE % NUM_CORES == 0, "Total L1_SIZE must be a multiple of NUM_CORES if PRIVATE_L1 is on\n");
     ASSERTM(0, L1_BANKS % NUM_CORES == 0, "Total L1_BANKS must be a multiple of NUM_CORES if PRIVATE_L1 is on\n");
@@ -689,7 +728,7 @@ void init_uncores(void) {
 
       char buf[MAX_STR_LENGTH + 1];
       sprintf(buf, "L1[%d]", proc_id);
-      init_cache(&l1->cache, buf, L1_SIZE / NUM_CORES, L1_ASSOC, L1_LINE_SIZE, sizeof(L1_Data), L1_CACHE_REPL_POLICY);
+      init_cache(&l1->cache, buf, L1_SIZE / NUM_CORES, L1_ASSOC, L1_LINE_SIZE, sizeof(L1_Data), l1_repl);
 
       l1->num_banks = L1_BANKS / NUM_CORES;
       l1->ports = (Ports*)malloc(sizeof(Ports) * l1->num_banks);
@@ -702,7 +741,7 @@ void init_uncores(void) {
     }
   } else {
     Ported_Cache* l1 = (Ported_Cache*)malloc(sizeof(Ported_Cache));
-    init_cache(&l1->cache, "L1_CACHE", L1_SIZE, L1_ASSOC, L1_LINE_SIZE, sizeof(L1_Data), L1_CACHE_REPL_POLICY);
+    init_cache(&l1->cache, "L1_CACHE", L1_SIZE, L1_ASSOC, L1_LINE_SIZE, sizeof(L1_Data), l1_repl);
     l1->num_banks = L1_BANKS;
     l1->ports = (Ports*)malloc(sizeof(Ports) * l1->num_banks);
     for (uns ii = 0; ii < l1->num_banks; ii++) {
@@ -4450,6 +4489,15 @@ Flag l1_fill_line(Mem_Req* req) {
     }
   }
 
+  // COMBINED policy on the LLC (--td_combined_on_l1): instruction lines get an RRPV from the
+  // L1I fetch miss's front-end-bound fraction, data lines from the demanding load's membound
+  // fraction, each with its own depth and threshold. Static depths only -- the set-duel and
+  // dynamic selectors are MLC-bound, so the fixed td_*_min_rrpv values apply here.
+  if (TD_COMBINED_ON_L1) {
+    td_combined_stage_fill(req, TD_FE_RRIP_MIN_RRPV, TD_LOAD_RRIP_MIN_RRPV, (double)TD_FE_RRIP_THRESH,
+                           (double)TD_LOAD_REPLAY_THRESH, marked_rrip_basic_rrpv());
+  }
+
   // REPL_MOCKINGJAY: hand the fill its PC / traffic class (consumed by the insert below).
   mockingjay_stage_access(&L1(req->proc_id)->cache, req);
 
@@ -4812,28 +4860,7 @@ Flag mlc_fill_line(Mem_Req* req) {
       }
       // else balanced -> suite-max depths and nominal thresholds for both
     }
-    Flag   have_rrpv = FALSE;
-    int    rrpv = 0;
-    if (req->type == MRT_IFETCH) {
-      double fe_frac = 0.0;
-      if (icache_fe_frac_for_line(req->proc_id, req->addr, &fe_frac)) {
-        rrpv = marked_rrip_rrpv_from_frac_basic(fe_frac, instr_depth, TD_FE_RRIP_EXTRAPOLATE,
-                                                (double)TD_FE_RRIP_EXTRAP_ANCHOR, instr_thr, basic_rrpv);
-        have_rrpv = TRUE;
-      }
-    } else {
-      double frac = 0.0;
-      Addr   frac_pc = 0;
-      if (td_mlc_req_load_frac(req, &frac, &frac_pc)) {
-        rrpv = marked_rrip_rrpv_from_frac_basic(frac, data_depth, TD_LOAD_RRIP_EXTRAPOLATE,
-                                                (double)TD_LOAD_RRIP_EXTRAP_ANCHOR, data_thr, basic_rrpv);
-        have_rrpv = TRUE;
-      }
-    }
-    // Stage the set's basic too, so an UNMARKED fill (prefetch / off-path / no demanding op)
-    // lands at this set's basic rather than the global param's.
-    cache_set_marked_next_basic(TRUE, basic_rrpv);
-    cache_set_marked_next_insert(have_rrpv, rrpv);
+    td_combined_stage_fill(req, instr_depth, data_depth, instr_thr, data_thr, basic_rrpv);
   }
   // marked-RRIP on MLC: derive the fill's initial RRPV from the demanding load's on-demand
   // membound fraction (no CSV), and teach the hit predictor how membound this PC is on a miss.

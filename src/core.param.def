@@ -208,6 +208,17 @@ DEF_PARAM(td_fe_rrip_on_mlc, TD_FE_RRIP_ON_MLC, Flag, Flag, FALSE, )
    to 0 to statically assign per-class minimum RRPVs and thresholds. Supersedes / is mutually
    exclusive with td_load_rrip_on_mlc and td_fe_rrip_on_mlc. */
 DEF_PARAM(td_combined_on_mlc, TD_COMBINED_ON_MLC, Flag, Flag, FALSE, )
+/* The same combined policy on the LLC (Scarab's l1_* cache) instead of / as well as the MLC.
+   Both signals resolve at any level -- the instruction fraction is looked up by line address
+   and the data fraction hangs off the request -- and the LLC fills BEFORE the MLC on the
+   return path, so the demanding op is at least as likely to still be live.
+   STATIC MODE ONLY: td_combined_set_duel, td_combined_dynamic_depth and
+   td_combined_dynamic_thresh remain MLC-only (their leader-set map and selection state are
+   per-proc and bound to the MLC's geometry), so the LLC uses the fixed td_fe_rrip_min_rrpv /
+   td_load_rrip_min_rrpv depths and their thresholds.
+   Note the LLC is 16-way where the MLC is 8-way, so aging per fill differs -- MLC-tuned
+   depths do NOT carry over and must be re-swept. */
+DEF_PARAM(td_combined_on_l1, TD_COMBINED_ON_L1, Flag, Flag, FALSE, )
 /* Combined L2 DYNAMIC depth: instead of static per-class depths, bucket by the running
    balance of front-end-bound vs mem-bound cycles and pick which class is protected deep.
    fe_frac = fe_bound_cycles / (fe_bound_cycles + mem_bound_cycles) over a window:
