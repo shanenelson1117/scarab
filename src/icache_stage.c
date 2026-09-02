@@ -485,7 +485,7 @@ Flag mem_req_on_icache_miss() {
       // FE policy targets the L1I or the L2). Reset on- and off-path: off-path misses now carry
       // their own window so the L1I marked-RRIP insert can derive an RRPV for them too. (The
       // L2/MLC variant keeps its own on-path gate in icache_fe_frac_for_line, so it is unaffected.)
-      if (TD_FE_RRIP_MARK || TD_FE_RRIP_ON_MLC || TD_COMBINED_ON_MLC) {
+      if (TD_FE_RRIP_MARK || TD_FE_RRIP_ON_MLC || TD_COMBINED_ON_MLC || TD_COMBINED_ON_L1) {
         ic->fe_miss_window_cycles = 0;
         ic->fe_miss_bound_cycles = 0;
       }
