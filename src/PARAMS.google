@@ -1,0 +1,359 @@
+# File         : PARAMS.google
+# Description  : Core/memory configuration for the Google core spec, expressed in Scarab
+#                parameters. (Started as a copy of the Mockingjay (HPCA'22) config; the
+#                front end, cache hierarchy and DRAM have since been respecified.)
+#
+#
+# IMPORTANT Scarab-vs-matthew caveats:
+#   * Cache-level naming is INVERTED in Scarab: icache/dcache = L1, mlc = L2, l1_* = LLC.
+#   * FetchWidth and decode width share one knob (IC_ISSUE_WIDTH == DECODE_WIDTH), so
+#     --decode_width 6 sets BOTH the fetch and decode bandwidth to 6.
+#   * Scarab has no per-cache MSHR count. Requested MSHRs are APPROXIMATED:
+#       L1D=16 -> --mem_req_buffer_entries 16 ; L2=32 -> --queue_mlc_size 32 ;
+#       LLC=64 -> --queue_l1_size 64 ; L1I=8 has no separate knob (unmodeled).
+#     Consider --hier_mshr_on 1 if MSHR fidelity matters: it makes queue_mlc_size /
+#     queue_l1_size behave as hierarchical MSHR reservations rather than plain queues.
+#   * Per-cache READ/WRITE/PREFETCH queue sizes (a ChampSim RQ/WQ/PQ structure) do NOT
+#     exist in Scarab at ANY level and are therefore UNMODELED -- requested L1I 64/64/32
+#     and L2 32/32/16 are both dropped. Scarab instead has one shared mem_req_buffer plus
+#     per-stage queues (queue_mlc_size / queue_l1_size / queue_bus_out_size /
+#     queue_core_fill_size), none of which split by request direction. The only
+#     request-type differentiation available is PRIORITY (--mem_priority_*), not capacity.
+#   * Cache inclusion is NON-INCLUSIVE (NINE) and not configurable: nothing back-invalidates
+#     an inner level when an outer level evicts.
+#   * NO TLB IS MODELED AT ALL -- this is an absent mechanism, not an approximation, and is
+#     the largest fidelity gap in this file. Scarab has ZERO tlb parameters; the only TLB
+#     code in the simulator is two power-model counters (POWER_ITLB_ACCESS in icache_stage.c,
+#     POWER_DTLB_ACCESS in exec_stage.c). power_scarab_config.cc states it plainly: "Scarab:
+#     models perfect tlb" with total_misses hard-coded to 0, and its 128-entry figure is a
+#     literal in the McPAT XML emitter that has no effect on timing.
+#     Consequences: address translation is FREE (no latency), NEVER misses, and generates NO
+#     page-walk memory traffic. The requested ITLB/DTLB 64 entries / 4-way / 1-cycle / 8 MSHRs
+#     are all unmodelable -- there is no structure to size, no latency to set, and nothing
+#     that can miss. This matters for the datacenter workloads here: large-footprint server
+#     applications are often TLB-bound, and real page walks would compete with demand traffic
+#     for L2/LLC capacity, so a perfect TLB makes the cache hierarchy look cleaner than it is
+#     and understates pressure on any replacement-policy study run on this config.
+#     (--addr_translation below is a physical-address MAPPING scheme -- it affects cache
+#     indexing and DRAM row locality -- but it is not a TLB and carries no cost model.)
+#   * DRAM REFRESH INTERVAL IS NOT SETTABLE. ramulator.cc passes no tREFI/nREFI to ramulator,
+#     so refresh comes entirely from the chosen --ramulator_speed grade. Every DDR3 grade in
+#     ramulator's speed table uses nREFI = 7.8 us (e.g. 6240 cycles at 1.25 ns), i.e. a ~64 ms
+#     refresh window. The requested 32 ms window (tREFI 3.9 us) would need a ramulator patch;
+#     as configured the model refreshes HALF as often as the spec, so it slightly understates
+#     refresh overhead.
+#   * DRAM is DDR3. tCAS/tRCD/tRP/tRAS (6/6/6/13) are pinned by the spec and are CYCLE counts
+#     (= 7.5/7.5/7.5/16.25 ns at tCK 1.25 ns). If the source spec quotes those in NANOSECONDS
+#     instead -- ChampSim configs do -- the correct values are tCL/tRCD/tRP 5 and tRAS 10.
+#     Secondary timings (tCWL/tBL/tCCD/tWTR) are taken from ramulator's own DDR3-1600 speed
+#     table, not from the spec. Peak bandwidth is 1 ch x 8 B x 1600 MT/s = 12.8 GB/s.
+#   * Core frequency (4 GHz) is assumed (not given in the core spec); it sets the ns<->cycle
+#     bridge to DRAM. Change --chip_cycle_time to rescale.
+#   * The RS/FU execution topology is NOT part of the spec; it is inherited from PARAMS.kmhv3
+#     (known-good, aggressive) and is tunable. The branch predictor, BTB, RAS and DIB ARE
+#     spec'd and set accordingly.
+#   * Spec fields with NO Scarab equivalent, left unmodeled:
+#       - ifetch_buffer_size 64 / decode_buffer_size 32 / dispatch_buffer_size 32. Scarab's
+#         front end is FTQ (--fe_ftq_block_num) -> uop queue (--uop_queue_length) -> IDQ
+#         (--idq_size), which is a different decomposition; no 1:1 mapping exists, so these
+#         are left at their inherited values rather than guessed.
+#       - scheduler_size 128. Scarab sizes reservation stations per port (--rs_sizes, wired to
+#         --rs_connections and --fu_types). Current total 186 vs the spec's 128; collapsing to
+#         one unified RS means rewriting all three knobs together.
+#       - schedule_latency 0 / execute_latency 0. No Scarab knobs; these stages have no
+#         separate configurable latency.
+#       - mispredict_penalty 1. Scarab derives recovery cost structurally from the pipeline
+#         rather than as a flat penalty. --extra_redirect_cycles / --extra_recovery_cycles are
+#         the nearest additive knobs and are correctly left at 0.
+#   * register_file_size 128 is a SINGLE unified file in the spec; Scarab splits integer and
+#     vector. Both are set to 128, so the aggregate is 256 physical registers, not 128.
+#   * branch_predictor "ctagescl" is mapped to Scarab's --bp_mech tagescl (TAGE_SC_L_CONFIG_64KB).
+#     Confirm the spec's variant is the 64KB TAGE-SC-L; 'tagescl80' is the 80KB alternative.
+#   * Prefetching is DISABLED per the spec (--pref_framework_on 0). Note several individual
+#     pref_*_on flags default TRUE (including pref_ul1_on, the LLC trigger), but they are all
+#     inert: pref_init() and every pref_common.c entry point return early on
+#     !PREF_FRAMEWORK_ON, so nothing is allocated or trained.
+
+## Simulation Parameters
+--mode                          full
+--model                         cmp
+--sim_limit                     none
+# num_cores 1. Stated explicitly because --private_l1 divides L1_SIZE and L1_BANKS by it.
+--num_cores                     1
+# heartbeat_frequency 10000000 (Scarab default is 1000000)
+--heartbeat_interval            10000000
+# page_size 2 MB huge pages (Scarab default is 4096). Feeds --addr_translation below, so it
+# changes physical addressing and therefore cache indexing and DRAM row locality.
+# init_memory asserts L1_LINE_SIZE <= VA_PAGE_SIZE_BYTES and
+# LOG2(VA_PAGE_SIZE_BYTES) <= NUM_ADDR_NON_SIGN_EXTEND_BITS (21 <= 48 here); both hold.
+--va_page_size_bytes            2097152
+
+## Core Parameters
+
+# Femtoseconds; 4.0 GHz assumed (Mockingjay core frequency unspecified). Used for energy
+# and as the core<->DRAM cycle bridge.
+--chip_cycle_time               250000
+
+### Fetch Stage
+--fetch_off_path_ops            1
+
+# Decoupled frontend FTQ
+--fe_ftq_block_num              64
+
+#### ICache -- Mockingjay L1 I$: 32 KB, 8-way, 4-cycle
+--icache_size                   32768
+--icache_assoc                  8
+--icache_line_size              64
+--icache_latency                4
+--icache_read_ports             2
+
+### DIB (decoded instruction buffer) -- Scarab models this as the uop cache.
+### 256 entries, 8-way => 32 sets x 8 ways. uop_cache_width (uops held per entry) is not
+### part of the spec and is left at 8.
+--uop_cache_enable              1
+--uop_cache_width               4
+--uop_cache_lines               256
+--uop_cache_assoc               8
+--iprf_on_uop_cache_hit         1
+
+### Branch Predictor -- 64KB TAGE-SC-L.
+### 'tagescl' selects TAGE_SC_L_CONFIG_64KB in bp/tagescl.cc; 'tagescl80' is the 80KB
+### variant. (This replaces the kmhv3-inherited 'tage64k', which is a different predictor
+### from the CBP submodule, not TAGE-SC-L.)
+--cfs_per_cycle                 6
+--bp_update_at_retire           0
+--update_bp_off_path            1
+--bp_mech                       tagescl
+
+#### BTB -- 8192 entries, 8-way, FLAT (no L0/L1 hierarchy), no access latency.
+### Matches ChampSim's basic_btb, which is a single structure of sets=1024 x ways=8 = 8192
+### entries with NO latency constant at all -- the BTB resolves in the same cycle as the
+### prediction, and front-end cost comes from mispredict_penalty and the fetch pipeline.
+### The L0/L1 levels below were kmhv3 inheritance, not part of this spec, so they are off.
+### On btb_main_latency: bp.h's bp_btb_for_main() only tests BTB_MAIN_LATENCY <= BP_MAIN_LATENCY
+### (3) to decide whether the main BTB is usable, and ft.cc only consults the value in the
+### BTB_MAIN_LATENCY > BP_MAIN_LATENCY recovery path. So ANY value 0..3 is behaviourally
+### identical here; 1 is set as the plain "available immediately" encoding.
+--btb_mech                      generic
+--btb_entries                   8192
+--btb_assoc                     8
+--btb_main_latency              1
+# L0/L1 disabled -- the entries/assoc/latency lines below are inert, kept only so the
+# hierarchy can be restored by flipping the two *_present flags back to 1.
+--btb_l0_present                0
+--btb_l0_entries                128
+--btb_l0_assoc                  4
+--btb_l0_latency                1
+--btb_l1_present                0
+--btb_l1_entries                6144
+--btb_l1_assoc                  4
+--btb_l1_latency                2
+--btb_off_path_writes           1
+--perfect_nt_btb                0
+
+#### CRS (return address stack) -- 64 entries
+--enable_crs                    1
+--crs_entries                   64
+--crs_realistic                 1
+
+### iBP (ITTAGE)
+--enable_ibp                    1
+--ibtb_mech                     tc_tagged
+--ibtb_off_path_writes          1
+--tc_entries                    4096
+--tc_assoc                      4
+
+### Decode Stage
+# fetch_width 6 / decode_width 6. IC_ISSUE_WIDTH == DECODE_WIDTH, so this one knob sets both.
+--decode_width                  6
+# decode_latency 1 (was 5, kmhv3 inheritance)
+--decode_cycles                 1
+
+### Instruction Decode Queue
+# No clean mapping: ChampSim's ifetch_buffer_size 64 / decode_buffer_size 32 /
+# dispatch_buffer_size 32 are three separate buffers, where Scarab's front end is
+# FTQ (--fe_ftq_block_num) -> uop queue (--uop_queue_length) -> IDQ (--idq_size).
+# Left at 64 rather than guessed; see the caveat block.
+--idq_size                      64
+
+### Map Stage
+# dispatch_latency 1 (was 5, kmhv3 inheritance)
+--map_cycles                    1
+--reg_renaming_scheme               1
+# register_file_size 128. ChampSim has ONE unified physical register file; Scarab splits
+# integer and vector, so setting both to 128 gives 256 physical registers in aggregate
+# rather than the spec's 128. There is no single-file mode -- see the caveat block.
+--reg_table_integer_physical_size   128
+--reg_table_vector_physical_size    128
+
+### Issue Stage
+# execute_width 4
+--issue_width                   4
+
+--rs_fill_width                 0
+# RS / FU topology inherited from PARAMS.kmhv3 -- NOT changed to match the spec.
+# ChampSim has one unified scheduler_size 128; Scarab has per-RS sizes wired to
+# --rs_connections and --fu_types (a 10-port topology), so collapsing to a single 128-entry
+# RS would mean rewriting all three together. Current total is 97+70+19 = 186 entries vs the
+# spec's 128. --issue_width above still caps dispatch to 4/cycle regardless of port count.
+--rs_sizes                      97 70 19
+--rs_connections                b0100110011 b1000001100 b0011000000
+--fu_types                      b00100100111111100111001001111110010010011111110011100100111111 b10010000110111100011111001110111001000011011110001111100111011 b00000001000000001000000010000010000000100000000100000001000001 b00000001000000001000000010000010000000100000000100000001000001 b00000000110111100011011001110110000000011011110001101100111011 b01001000000000000111001001111110100100000000000011100100111111 b00000010000000010000000100000010000001000000001000000010000001 b00000010000000010000000100000010000001000000001000000010000001 b00000000000000000011001001110110000000000000000001100100111011 b00000001000000001000000010000010000000100000000100000001000001
+
+### Exec Stage
+
+### Load/Store Queue -- lq_size 128, sq_size 72
+--lsq_enable                    1
+--load_queue_entry_num          128
+--store_queue_entry_num         72
+
+### DCache. Size/assoc/latency are NOT from the spec above (which gives no L1D block) --
+### they are carried over and should be replaced when the L1D spec is available.
+### Ports do come from the spec: lq_width 2 -> read ports, sq_width 2 -> write ports.
+--dcache_size                   49152
+--dcache_assoc                  12
+--dcache_line_size              64
+--dcache_cycles                 5
+--dcache_read_ports             2
+--dcache_write_ports            2
+--dcache_banks                  8
+
+### Reorder/Retire Stage
+# RetireWidth = 5
+--node_ret_width                5
+# ROB = 352 entries
+--node_table_size               352
+
+--stores_do_not_block_window    1
+--prefs_do_not_block_window     1
+
+
+## Uncore  (Scarab naming: mlc = L2, l1_* = LLC)
+
+### L2  (mlc) -- 2 MB, 16-way, 10-cycle, 32 MSHRs, non-inclusive.
+### Non-inclusive needs no knob: Scarab never back-invalidates on an outer-level eviction
+### (the only cache_invalidate in the memory system is on the prefetch cache), so the
+### hierarchy is already NINE. The "if exclusive cache" comments in memory.c are stale --
+### no exclusivity is implemented and there is no param for it.
+### 32 MSHRs -> --queue_mlc_size 32 in the Memory section below.
+### Read/write/prefetch queues (32/32/16) have NO Scarab equivalent -- see the caveat block.
+--mlc_present                   1
+--mlc_size                      2097152
+--mlc_assoc                     16
+--mlc_line_size                 64
+--mlc_cycles                    10
+--mlc_banks                     8
+
+### LLC  (l1_*) -- 4 MB per core, private (1 per core), 16-way, 20-cycle, 64 MSHRs.
+### CAREFUL: with --private_l1 1, init_memory gives each core L1_SIZE / NUM_CORES (and
+### L1_BANKS / NUM_CORES), so --l1_size is the TOTAL, not the per-core size. At NUM_CORES 1
+### these coincide; for an N-core run set --l1_size to N * 4194304 to keep 4 MB per core.
+### Both L1_SIZE % NUM_CORES and L1_BANKS % NUM_CORES are asserted to be 0.
+### 64 MSHRs -> --queue_l1_size 64 in the Memory section below.
+--private_l1                    1
+--l1_size                       4194304
+--l1_assoc                      16
+--l1_line_size                  64
+--l1_cycles                     20
+--l1_banks                      8
+--l1_interleave_factor          64
+
+
+### Prefetcher -- disabled to isolate the replacement policy (flip to 1 to enable)
+--pref_framework_on             0
+--pref_stream_on                0
+
+
+### Memory
+--addr_translation              random
+
+--mem_priority_ifetch           0
+--mem_priority_dfetch           1
+--mem_priority_dstore           2
+--mem_priority_iprf             3
+--mem_priority_dprf             4
+--mem_priority_wb               5
+--mem_priority_wb_nodirty       5
+
+# Per-cache MSHR approximation (Scarab has no explicit per-cache MSHR knob):
+#   L1D = 16 outstanding
+--mem_req_buffer_entries        16
+#   L2  = 32 outstanding
+--queue_mlc_size                32
+#   LLC = 64 outstanding
+--queue_l1_size                 64
+--bus_width_in_bytes            8
+
+### DRAM (ramulator): DDR3, 800 MHz I/O clock (= 1600 MT/s, DDR is 2x the clock),
+### 1 channel x 1 rank x 8 banks, 64 GB, 6-6-6-13 tCAS/tRCD/tRP/tRAS.
+### Bandwidth: 1 ch x 8 B x 1600 MT/s = 12.8 GB/s (~12.5 GB/s/core at 1 core).
+###
+### DDR3 rather than DDR4 because the spec's 8 flat banks and 6-6-6-13 string are DDR3:
+### ramulator's DDR3 Level enum is {Channel, Rank, Bank, Row, Column} with NO bank-group
+### level, and every DDR3 org has exactly 8 banks. --ramulator_bankgroups is therefore
+### unused here and set to 1 so it does not read as meaningful.
+###
+### 64 GB = 8 banks x 524288 rows x 2048 cols x 8 B. Note capacity is not really a
+### constraint: --ramulator_use_rest_of_addr_as_row_addr is "on", so the row index absorbs
+### every remaining physical address bit and no two addresses ever alias regardless of the
+### row count (Memory.h reports dram_capacity = max_address). What these numbers actually
+### control is ROW SIZE -- cols x 8 B = 16 KB per row -- and hence row-buffer locality.
+--ramulator_standard            DDR3
+--ramulator_speed               DDR3_1600H
+--ramulator_org                 DDR3_8Gb_x8
+--ramulator_channels            1
+--ramulator_ranks               1
+# DDR3 has no bank groups; this value is ignored by the DDR3 model.
+--ramulator_bankgroups          1
+--ramulator_banks               8
+--ramulator_chip_width          8
+--ramulator_rows                524288
+--ramulator_cols                2048
+--ramulator_scheduling_policy   FRFCFS_Cap
+--ramulator_readq_entries       64
+--ramulator_writeq_entries      64
+--ramulator_record_cmd_trace    FALSE
+--ramulator_print_cmd_trace     FALSE
+# tCK = 1.25 ns => 800 MHz I/O clock => 1600 MT/s
+--ramulator_tCK                 1250000
+# 6-6-6-13 tCAS/tRCD/tRP/tRAS, IN CYCLES (Scarab's ramulator timing params are cycle counts).
+# At 1.25 ns/cycle that is 7.5 / 7.5 / 7.5 / 16.25 ns.
+--ramulator_tCL                 6
+--ramulator_tRCD                6
+--ramulator_tRCDR               6
+--ramulator_tRCDW               6
+--ramulator_tRP                 6
+--ramulator_tRPpb               6
+--ramulator_tRPab               6
+--ramulator_tRAS                13
+# secondary timings from ramulator's own DDR3-1600 speed table (DDR3.h), not pinned by the
+# spec. DDR3 has a single tCCD (4); the S/L split is a DDR4 bank-group concept, so both are
+# set to the DDR3 value.
+--ramulator_tCWL                8
+--ramulator_tBL                 4
+--ramulator_tCCD                4
+--ramulator_tCCDS               4
+--ramulator_tCCDL               4
+--ramulator_tWTR                6
+--ramulator_tWTRS               6
+--ramulator_tWTRL               6
+--dram_tech_in_nm               32
+
+## Other
+
+### Debug
+--debug_inst_start              0
+--debug_inst_stop              -1
+--debug_cycle_start             0
+--debug_cycle_stop             -1
+
+## Stats and Params
+--dump_params                   1
+--dump_stats                    1
+--dump_trace                    0
+
+####################################
+--set_off_path_confirmed        1
+--order_beyond_bus              1
+--mem_ooo_stores                1
+--mem_obey_store_dep            1
