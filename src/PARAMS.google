@@ -123,7 +123,7 @@
 --cfs_per_cycle                 6
 --bp_update_at_retire           0
 --update_bp_off_path            1
---bp_mech                       tagescl
+--bp_mech                       tage64k
 
 #### BTB -- 8192 entries, 8-way, FLAT (no L0/L1 hierarchy), no access latency.
 ### Matches ChampSim's basic_btb, which is a single structure of sets=1024 x ways=8 = 8192
