@@ -744,8 +744,19 @@ Off_Path_Reason Decoupled_FE::eval_off_path_reason(Op* op) {
 }
 
 void Decoupled_FE::check_consecutivity_and_push_to_ftq() {
-  if (ftq.size())
-    ASSERT(proc_id, current_ft_to_push->is_consecutive(*ftq.back()));
+  if (ftq.size()) {
+    const FT& prev_ft = *ftq.back();
+    Op* prev_last_op = prev_ft.get_last_op();
+    ASSERTM(proc_id, current_ft_to_push->is_consecutive(prev_ft),
+            "FT not consecutive: new FT starts at 0x%llx; previous FT ended_by:%d last_op pc:0x%llx "
+            "size:%u npc:0x%llx cf_type:%u bar_type:%u\n",
+            (unsigned long long)current_ft_to_push->get_start_addr(), (int)prev_ft.get_end_reason(),
+            (unsigned long long)(prev_last_op ? prev_last_op->inst_info->addr : 0),
+            prev_last_op ? prev_last_op->inst_info->trace_info.inst_size : 0,
+            (unsigned long long)(prev_last_op ? prev_last_op->oracle_info.npc : 0),
+            prev_last_op ? prev_last_op->inst_info->table_info.cf_type : 0,
+            prev_last_op ? prev_last_op->inst_info->table_info.bar_type : 0);
+  }
   if (CONFIDENCE_ENABLE && bp_id == MAIN_BP)
     conf->update(*current_ft_to_push);
   if (bp_id == MAIN_BP && recovery_addr) {
