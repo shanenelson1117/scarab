@@ -625,6 +625,14 @@ PATCH_REP:
       ctx_switch_barrier_.cf_type = CF_SYS;
       ctx_switch_barrier_.is_ifetch_barrier = 1;
       ctx_switch_barrier_.true_op_type = XED_ICLASS_SYSCALL;
+      // This is no longer the JMP create_dummy_jump() built, so it must not
+      // keep the JMP's encoding key: the instruction map and the uop decode
+      // cache are keyed on (pc, encoding), and a thread switch can land on a
+      // PC that was also gap-patched with a real JMP.  Sharing a key there
+      // means the two disagree on cf_type (CF_SYS vs CF_BR) and size under one
+      // map entry, which trips the consistency ASSERTs in trace_fe.cc and
+      // uop_generator.c.
+      set_fake_inst_encoding(&ctx_switch_barrier_, FAKE_INST_ENCODING_CTX_SWITCH);
       strcpy(ctx_switch_barrier_.pin_iclass, "CTX_SWITCH");
       _prior->info = &ctx_switch_barrier_;
       _prior->taken = true;
@@ -667,6 +675,12 @@ PATCH_REP:
     } else if (_prior->pc && non_seq &&
                (!is_rep || (_prior->pc != _info->pc && (_prior->pc + prior_isize) != _info->pc))) {
       gap_patch_jmp_ = create_dummy_jump(_prior->pc, _info->pc);
+      // Same reasoning as the context-switch barrier above: this JMP stands in
+      // for the real instruction at _prior->pc, so keep that instruction's
+      // length instead of create_dummy_jump()'s hardcoded 5 bytes, or the
+      // fall-through (addr + size) and the icache fetch boundaries are computed
+      // from a length the trace never had.
+      gap_patch_jmp_.size = prior_isize;
       gap_patch_jmp_.fake_inst = 0;
       gap_patch_jmp_.true_op_type = XED_ICLASS_JMP;
       _prior->info = &gap_patch_jmp_;
@@ -961,6 +975,7 @@ void TraceReaderMemtrace::fill_in_basic_info(ctype_pin_inst* info, instr_t* drin
   for (int ii = 8; (ii < 16) && (ii < instr_length(dcontext_, drinst)); ii++) {
     info->inst_binary_msb = (info->inst_binary_msb << 8) + instr_get_raw_byte(drinst, ii);
   }
+  fixup_reserved_inst_encoding(info);
 
   info->scarab_marker_roi_begin = false;
   info->scarab_marker_roi_end = false;

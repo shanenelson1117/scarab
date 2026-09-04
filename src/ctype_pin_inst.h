@@ -145,6 +145,44 @@ typedef struct ctype_pin_inst_struct {
 
 typedef ctype_pin_inst compressed_op;
 
+/* Instructions the frontends synthesize -- wrong-path NOPs, trace gap-patch
+ * jumps, core-sharded context-switch barriers -- have no architectural
+ * encoding.  Both the memtrace instruction map (frontend/pt_memtrace/
+ * trace_fe.cc) and the uop decode cache (pin/pin_lib/uop_generator.c) are keyed
+ * on (instruction_addr, inst_binary_lsb, inst_binary_msb), so leaving that
+ * encoding zeroed makes every synthetic alias every other synthetic -- and any
+ * real instruction with a zero encoding -- injected at the same PC.  Two
+ * different synthetics at one PC then trip the map-consistency ASSERTs, because
+ * they legitimately disagree on cf_type and size: a core-sharded trace that
+ * gap-patches a CF_BR jump and later hangs a CF_SYS thread-switch barrier off
+ * the same PC hits exactly that.
+ *
+ * Reserve a key per flavor instead: lsb == 0 with the flavor tag in msb.  The
+ * decoders keep real encodings out of this space (fixup_reserved_inst_encoding
+ * below), so a synthetic never shares a key with real code. */
+#define FAKE_INST_ENCODING_TAG_SHIFT 56
+#define FAKE_INST_ENCODING_NOP ((uint64_t)1 << FAKE_INST_ENCODING_TAG_SHIFT)
+#define FAKE_INST_ENCODING_JMP ((uint64_t)2 << FAKE_INST_ENCODING_TAG_SHIFT)
+#define FAKE_INST_ENCODING_CTX_SWITCH ((uint64_t)3 << FAKE_INST_ENCODING_TAG_SHIFT)
+
+static inline void set_fake_inst_encoding(ctype_pin_inst* inst, uint64_t tag) {
+  inst->inst_binary_lsb = 0;
+  inst->inst_binary_msb = tag;
+}
+
+/* Called by the decoders on every real instruction so the reserved key space
+ * above stays exclusive to synthetics.  A real x86 instruction cannot land in
+ * it -- msb is only populated once the encoding runs past inst_binary_lsb, and
+ * an all-zero lsb would mean eight leading 0x00 bytes, which decode as four
+ * separate 2-byte ADDs rather than one long instruction -- but the synthetic
+ * DR_ISA REGDEPS encodings carry no such guarantee, so nudge lsb instead of
+ * assuming.  Runs once per unique PC (the decode result is cached), and the
+ * nudged key stays unique among real instructions for the same reason. */
+static inline void fixup_reserved_inst_encoding(ctype_pin_inst* inst) {
+  if (inst->inst_binary_lsb == 0 && inst->inst_binary_msb != 0)
+    inst->inst_binary_lsb = 1;
+}
+
 static inline void init_ctype_pin_inst(ctype_pin_inst* inst) {
   memset(inst, 0, sizeof(ctype_pin_inst));
   inst->fetched_instruction = 1;
@@ -172,6 +210,7 @@ static inline ctype_pin_inst create_dummy_jump(uint64_t eip, uint64_t tgt) {
   inst.branch_target = tgt;
   inst.actually_taken = 1;
   inst.fake_inst = 1;
+  set_fake_inst_encoding(&inst, FAKE_INST_ENCODING_JMP);
   strcpy(inst.pin_iclass, "JMP");
   return inst;
 }
@@ -183,6 +222,7 @@ static inline ctype_pin_inst create_dummy_nop(uint64_t eip, Wrongpath_Nop_Mode_R
   inst.instruction_next_addr = eip + DUMMY_NOP_SIZE;
   inst.size = DUMMY_NOP_SIZE;
   inst.op_type = OP_NOP;
+  set_fake_inst_encoding(&inst, FAKE_INST_ENCODING_NOP);
   strcpy(inst.pin_iclass, "DUMMY_NOP");
   inst.fake_inst = 1;
   inst.fake_inst_reason = reason;

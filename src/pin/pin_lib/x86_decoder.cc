@@ -133,6 +133,7 @@ void fill_in_basic_info(ctype_pin_inst* info, const xed_decoded_inst_t* ins) {
   for (int ii = 0; (ii < 16) && (ii < info->size); ii++) {
     info->inst_binary_msb = (info->inst_binary_msb << 8) + XED_INS_Byte(ins, ii);
   }
+  fixup_reserved_inst_encoding(info);
 
   if (dump_marker_type(ins) == 1) {
     info->scarab_marker_roi_begin = true;
