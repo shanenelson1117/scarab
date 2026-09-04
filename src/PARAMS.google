@@ -116,14 +116,26 @@
 --uop_cache_assoc               8
 --iprf_on_uop_cache_hit         1
 
-### Branch Predictor -- 64KB TAGE-SC-L.
-### 'tagescl' selects TAGE_SC_L_CONFIG_64KB in bp/tagescl.cc; 'tagescl80' is the 80KB
-### variant. (This replaces the kmhv3-inherited 'tage64k', which is a different predictor
-### from the CBP submodule, not TAGE-SC-L.)
+### Branch Predictor. Spec says "ctagescl"; currently set to tage64k (a CBP-submodule TAGE,
+### NOT TAGE-SC-L). If the 64KB TAGE-SC-L is wanted instead, use --bp_mech tagescl
+### (TAGE_SC_L_CONFIG_64KB in bp/tagescl.cc); 'tagescl80' is the 80KB variant.
 --cfs_per_cycle                 6
 --bp_update_at_retire           0
 --update_bp_off_path            1
 --bp_mech                       tage64k
+
+### L0 (early) branch predictor DISABLED. The spec has a single branch_predictor and no early
+### predictor -- but bp_mech_l0 defaults to BIMODAL_BP and bp_l0_latency to 1, so
+### bp_l0_enabled() ((BP_MECH_L0 != NUM_BP) && (BP_L0_LATENCY > 0)) was silently TRUE and this
+### config has been running a two-level predictor. bp_l0_latency 0 is the disable; there is no
+### string for NUM_BP in bp_table.def, so bp_mech_l0 cannot be set to "none".
+### bp.c:213 then requires BP_MAIN_LATENCY == 1 on the no-L0 path. That also keeps
+### bp_btb_for_main()'s BTB_MAIN_LATENCY <= BP_MAIN_LATENCY test true at 1 <= 1, so the flat
+### main BTB stays reachable. (With L0 ON the constraints are instead BP_MAIN_LATENCY > 1 AND
+### BP_MAIN_LATENCY < DECODE_CYCLES -- unsatisfiable once decode_cycles is the spec's 1, which
+### is exactly the assert that fired.)
+--bp_l0_latency                 0
+--bp_main_latency               1
 
 #### BTB -- 8192 entries, 8-way, FLAT (no L0/L1 hierarchy), no access latency.
 ### Matches ChampSim's basic_btb, which is a single structure of sets=1024 x ways=8 = 8192
