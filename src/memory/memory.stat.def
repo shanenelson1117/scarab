@@ -869,6 +869,21 @@ DEF_STAT(  MLC_PREF_FILL,    DIST,  NO_RATIO  )
 DEF_STAT(  MLC_MOCKINGJAY_BYPASS         ,  COUNT,  NO_RATIO  )
 DEF_STAT(  L1_MOCKINGJAY_BYPASS          ,  COUNT,  NO_RATIO  )
 
+/* REPL_MARKED_RRIP (--marked_rrip_bypass): fills declined because they would have inserted at
+   basic into a set where every resident line was strictly more recently re-referenced. */
+DEF_STAT(  MLC_MARKED_BYPASS             ,  COUNT,  NO_RATIO  )
+DEF_STAT(  L1_MARKED_BYPASS              ,  COUNT,  NO_RATIO  )
+/* One-line stream buffer holding the last bypassed line (--marked_rrip_stream_buf).
+   *_SB_HIT / *_MARKED_BYPASS is the headline number: it says directly whether the buffer is
+   catching the reuse the bypass gave up. *_SB_EVICT counts occupants displaced by a later
+   bypass, *_SB_EVICT_DIRTY the subset a write had dirtied, which cost a writeback. */
+DEF_STAT(  MLC_MARKED_SB_HIT             ,  COUNT,  NO_RATIO  )
+DEF_STAT(  MLC_MARKED_SB_EVICT           ,  COUNT,  NO_RATIO  )
+DEF_STAT(  MLC_MARKED_SB_EVICT_DIRTY     ,  COUNT,  NO_RATIO  )
+DEF_STAT(  L1_MARKED_SB_HIT              ,  COUNT,  NO_RATIO  )
+DEF_STAT(  L1_MARKED_SB_EVICT            ,  COUNT,  NO_RATIO  )
+DEF_STAT(  L1_MARKED_SB_EVICT_DIRTY      ,  COUNT,  NO_RATIO  )
+
 DEF_STAT(  NORESET_L1_FILL               ,  COUNT,  NO_RATIO  )
 DEF_STAT(  NORESET_L1_FILL_NONPREF       ,  COUNT,  NO_RATIO  )
 DEF_STAT(  NORESET_L1_FILL_PREF          ,  COUNT,  NO_RATIO  )

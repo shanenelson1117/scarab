@@ -155,30 +155,78 @@ static inline Flag mockingjay_bypass_fill(Cache* cache, Mem_Req* req) {
    from the demanding load's membound fraction (td_mlc_req_load_frac walks req->op_ptrs and is
    likewise per-request, not per-level, despite the name). No usable signal -> nothing staged,
    and the line inserts at basic. */
-static inline void td_combined_stage_fill(Mem_Req* req, int instr_depth, int data_depth, double instr_thr,
-                                          double data_thr, int basic_rrpv) {
-  Flag have_rrpv = FALSE;
-  int  rrpv = 0;
+
+/* Compute the fill's RRPV WITHOUT staging it. Split out so the marked-RRIP bypass filter --
+   which runs before the writeback decision and can be abandoned by an early FAILURE return --
+   and the insert -- which must stage exactly once, after the last such return -- cannot
+   disagree about what this fill's RRPV would be. Pure: both fraction lookups only read state,
+   so calling this twice per fill changes nothing. */
+static inline void td_combined_calc_fill(Mem_Req* req, int instr_depth, int data_depth, double instr_thr,
+                                         double data_thr, int basic_rrpv, Flag* have_rrpv, int* rrpv) {
+  *have_rrpv = FALSE;
+  *rrpv = 0;
   if (req->type == MRT_IFETCH) {
     double fe_frac = 0.0;
     if (icache_fe_frac_for_line(req->proc_id, req->addr, &fe_frac)) {
-      rrpv = marked_rrip_rrpv_from_frac_basic(fe_frac, instr_depth, TD_FE_RRIP_EXTRAPOLATE,
-                                              (double)TD_FE_RRIP_EXTRAP_ANCHOR, instr_thr, basic_rrpv);
-      have_rrpv = TRUE;
+      *rrpv = marked_rrip_rrpv_from_frac_basic(fe_frac, instr_depth, TD_FE_RRIP_EXTRAPOLATE,
+                                               (double)TD_FE_RRIP_EXTRAP_ANCHOR, instr_thr, basic_rrpv);
+      *have_rrpv = TRUE;
     }
   } else {
     double frac = 0.0;
     Addr   frac_pc = 0;
     if (td_mlc_req_load_frac(req, &frac, &frac_pc)) {
-      rrpv = marked_rrip_rrpv_from_frac_basic(frac, data_depth, TD_LOAD_RRIP_EXTRAPOLATE,
-                                              (double)TD_LOAD_RRIP_EXTRAP_ANCHOR, data_thr, basic_rrpv);
-      have_rrpv = TRUE;
+      *rrpv = marked_rrip_rrpv_from_frac_basic(frac, data_depth, TD_LOAD_RRIP_EXTRAPOLATE,
+                                               (double)TD_LOAD_RRIP_EXTRAP_ANCHOR, data_thr, basic_rrpv);
+      *have_rrpv = TRUE;
     }
   }
+}
+
+static inline void td_combined_stage_fill(Mem_Req* req, int instr_depth, int data_depth, double instr_thr,
+                                          double data_thr, int basic_rrpv) {
+  Flag have_rrpv = FALSE;
+  int  rrpv = 0;
+  td_combined_calc_fill(req, instr_depth, data_depth, instr_thr, data_thr, basic_rrpv, &have_rrpv, &rrpv);
   // Stage the basic too, so an UNMARKED fill (prefetch / off-path / no demanding op) lands at
   // this set's basic rather than the global param's.
   cache_set_marked_next_basic(TRUE, basic_rrpv);
   cache_set_marked_next_insert(have_rrpv, rrpv);
+}
+
+/* TRUE if REPL_MARKED_RRIP would decline to allocate this fill in `cache`. The depths /
+   thresholds / basic come from the level's own duel or static configuration, so the bypass
+   decision is computed from exactly the values the insert would later stage.
+
+   Only an UNPROTECTED fill is a candidate -- one that lands at basic, either because nothing
+   staged a fraction (prefetch, off-path, no demanding op) or because the fraction did not
+   clear its class threshold. A MARKED line is never bypassed, however distant the set is.
+
+   Pure. Unlike mockingjay_bypass_fill there is no replacement-state update for the bypassed
+   fill: marked-RRIP has no sampler to train, the set is untouched, and in particular it does
+   not age. The asymmetry with the Mockingjay block is deliberate, not an omission. */
+static inline Flag marked_bypass_fill(Cache* cache, Mem_Req* req, int instr_depth, int data_depth, double instr_thr,
+                                      double data_thr, int basic_rrpv) {
+  Flag have_rrpv = FALSE;
+  int  rrpv = 0;
+
+  if (cache->repl_policy != REPL_MARKED_RRIP || !MARKED_RRIP_BYPASS)
+    return FALSE;
+  /* Never drop a writeback -- same reason mockingjay_bypass_fill refuses them: the request
+     carries the only copy of the dirty line. */
+  if (mockingjay_req_is_wb(req))
+    return FALSE;
+  /* --marked_rrip_bypass_pref, default OFF: a prefetch stages no fraction, so it always lands
+     at basic and is therefore the MOST likely thing this filter would decline. Excluding it by
+     default keeps the bypass from quietly gutting prefetch coverage. */
+  if (!MARKED_RRIP_BYPASS_PREF && mem_req_type_is_prefetch(req->type))
+    return FALSE;
+
+  td_combined_calc_fill(req, instr_depth, data_depth, instr_thr, data_thr, basic_rrpv, &have_rrpv, &rrpv);
+  if (have_rrpv && rrpv != basic_rrpv)
+    return FALSE;  // marked (protected) fill
+  /* The fill's RRPV is basic_rrpv here, whether or not a fraction was staged. */
+  return cache_marked_should_bypass(cache, req->addr, basic_rrpv);
 }
 
 /**************************************************************************************/
@@ -233,9 +281,12 @@ static Counter mlc_fill_seq_num = 1;
  *    inserts at basic, so basic is the dominant lever there; on D0 it only touches lines that
  *    fail the threshold. Switching D can therefore flip which B wins and vice versa, so the
  *    descent can oscillate rather than settle.
- *  - basic == 4 also suppresses AGING: srrip_update_evict only ages when no line sits at
- *    RRIP_DISTANT_VAL, so a group at 4 barely ages and its marked lines are pinned harder as a
- *    side effect. A win for such a group may come from that, not from the intended demotion. */
+ *  - with the DEFAULT (equality-based) eviction, basic == 4 also suppresses AGING:
+ *    srrip_update_evict only ages when no line sits at RRIP_DISTANT_VAL, so a group at 4 barely
+ *    ages and its marked lines are pinned harder as a side effect. A win for such a group may
+ *    come from that rather than from the intended demotion. --marked_rrip_argmax_evict removes
+ *    this confound: under argmax a basic == 4 group ages exactly like every other group, so a
+ *    basic-axis result there means what it says. */
 
 #define TD_DUEL_NDEPTH 3                        /* depth bins */
 #define TD_DUEL_NBASIC 3                        /* basic-RRPV candidates */
@@ -422,6 +473,96 @@ static void duel_cfg_for_addr(uns8 proc_id, Addr addr, int* depth_idx, int* basi
   }
   *depth_idx = g_duel_depth_sel[proc_id];
   *basic_val = duel_basic_now(proc_id);
+}
+
+/* Resolve the per-class depths / thresholds / basic RRPV a COMBINED-policy (--td_combined_on_mlc)
+ * fill for `addr` should use on the MLC. Static params, set-dueling and the dynamic selectors
+ * all resolve here, so the caller is uniform whichever is on.
+ *
+ * Factored out of mlc_fill_line so the marked-RRIP bypass filter -- which must run BEFORE
+ * get_next_repl_line -- and the staging call -- which must run after the last FAILURE return --
+ * read the same configuration. Depends only on (proc_id, addr): duel_cfg_for_addr and
+ * topdown_fe_bound_fraction are both per-proc lookups, so the two calls per fill agree.
+ * The MLC counterpart of l1duel_cfg_for_addr. */
+static void mlc_combined_cfg_for_addr(uns8 proc_id, Addr addr, int* instr_depth, int* data_depth, double* instr_thr,
+                                      double* data_thr, int* basic_rrpv) {
+  // per-class depths: static (td_fe/td_load_rrip_min_rrpv) or, under dynamic mode, chosen by
+  // the running front-end-bound vs mem-bound balance -- the dominant class stays deep, the
+  // other drops to basic; a balanced window keeps BOTH deep (the non-zero-sum region).
+  // Unprotected ("basic") RRPV for this fill. Normally the global --marked_rrip_basic_rrpv;
+  // under set dueling the duel owns it and picks it PER SET, so it is overwritten below.
+  const double off_thr = 1.0;  // fraction can't exceed 1 -> nothing qualifies -> all basic
+  *basic_rrpv = marked_rrip_basic_rrpv();
+  *instr_depth = TD_FE_RRIP_MIN_RRPV;
+  *data_depth = TD_LOAD_RRIP_MIN_RRPV;
+  *instr_thr = (double)TD_FE_RRIP_THRESH;
+  *data_thr = (double)TD_LOAD_REPLAY_THRESH;
+
+  if (TD_COMBINED_SET_DUEL) {
+    // Set dueling picks BOTH the (instr,data) depth bin and the basic RRPV: a leader set
+    // uses its own group's pair, a follower uses the selected (D_sel, B_sel). Thresholds
+    // stay per-class. Note basic_rrpv is reassigned first so the TD_DUEL_BASIC sentinel
+    // below resolves to this set's basic, not the global param.
+    int d_idx = 0;
+    duel_cfg_for_addr(proc_id, addr, &d_idx, basic_rrpv);
+    *instr_depth = (g_duel_instr[d_idx] == TD_DUEL_BASIC) ? *basic_rrpv : g_duel_instr[d_idx];
+    *data_depth = (g_duel_data[d_idx] == TD_DUEL_BASIC) ? *basic_rrpv : g_duel_data[d_idx];
+  } else if (TD_COMBINED_DYNAMIC_DEPTH || TD_COMBINED_DYNAMIC_THRESH) {
+    double fe = topdown_fe_bound_fraction(proc_id);
+    Flag fe_dom = (fe >= (double)TD_COMBINED_DYN_FE_HI);   // front-end-dominated window
+    Flag mem_dom = (fe <= (double)TD_COMBINED_DYN_FE_LO);  // memory-dominated window
+    if (TD_COMBINED_DYNAMIC_DEPTH && TD_COMBINED_DYN_BUCKETS >= 2) {
+      // GRADUATED depth: quantize fe_frac into N buckets and interpolate each class's depth.
+      // instr: basic (fe=0) -> suite max (fe=0.5) -> instr_extreme (fe=1); data is the mirror.
+      // Each bucket toward an end pushes that class more extreme, the other toward basic.
+      // The N buckets span the [fe_lo, fe_hi] WINDOW (not raw [0,1]): fe<=fe_lo pins to bucket 0
+      // (most memory-extreme), fe>=fe_hi to the top bucket (most fe-extreme), linear between.
+      // Set the window over the observed fe_frac range so all buckets resolve the real
+      // population and the most memory-bound workload lands in bucket 0.
+      uns    N = TD_COMBINED_DYN_BUCKETS;
+      double lo = (double)TD_COMBINED_DYN_FE_LO, hi = (double)TD_COMBINED_DYN_FE_HI;
+      double fe_n = (hi > lo) ? (fe - lo) / (hi - lo) : fe;  // normalize into the window
+      if (fe_n < 0.0)
+        fe_n = 0.0;
+      if (fe_n > 1.0)
+        fe_n = 1.0;
+      uns bi = (uns)(fe_n * (double)N);
+      if (bi >= N)
+        bi = N - 1;
+      // map bucket -> position so the END buckets sit ON the endpoints: bucket 0 -> p=0 (data
+      // at its full extreme, instr basic), bucket N-1 -> p=1 (instr full extreme, data basic).
+      double p = (double)bi / (double)(N - 1);  // [0,1], hits both extremes exactly
+      double bp = (double)*basic_rrpv;
+      double sm_i = (double)TD_FE_RRIP_MIN_RRPV, ex_i = (double)TD_COMBINED_DYN_INSTR_EXTREME;
+      double sm_d = (double)TD_LOAD_RRIP_MIN_RRPV, ex_d = (double)TD_COMBINED_DYN_DATA_EXTREME;
+      double id = (p >= 0.5) ? sm_i + (ex_i - sm_i) * (p - 0.5) / 0.5   // suite max -> instr extreme
+                             : bp + (sm_i - bp) * p / 0.5;              // basic -> suite max
+      double dd = (p <= 0.5) ? ex_d + (sm_d - ex_d) * p / 0.5           // data extreme -> suite max
+                             : sm_d + (bp - sm_d) * (p - 0.5) / 0.5;    // suite max -> basic
+      *instr_depth = (int)(id >= 0.0 ? id + 0.5 : id - 0.5);
+      *data_depth = (int)(dd >= 0.0 ? dd + 0.5 : dd - 0.5);
+    } else if (TD_COMBINED_DYNAMIC_DEPTH) {
+      // 3-bucket DEPTH: dominant class past the suite max (deeper), the other -> basic
+      if (fe_dom) {
+        *instr_depth = TD_COMBINED_DYN_INSTR_EXTREME;
+        *data_depth = *basic_rrpv;
+      } else if (mem_dom) {
+        *instr_depth = *basic_rrpv;
+        *data_depth = TD_COMBINED_DYN_DATA_EXTREME;
+      }
+    } else {
+      // move THRESHOLD: depths stay at the suite max; dominant class gets a lower threshold
+      // (broader coverage), the other is turned off (threshold above 1 -> nothing qualifies)
+      if (fe_dom) {
+        *instr_thr = (double)TD_COMBINED_DYN_INSTR_THR_EXTREME;
+        *data_thr = off_thr;
+      } else if (mem_dom) {
+        *instr_thr = off_thr;
+        *data_thr = (double)TD_COMBINED_DYN_DATA_THR_EXTREME;
+      }
+    }
+    // else balanced -> suite-max depths and nominal thresholds for both
+  }
 }
 /**************************************************************************************/
 /* Set dueling for the COMBINED LLC policy (--td_combined_l1_set_duel).
@@ -2032,6 +2173,12 @@ static Flag mem_complete_l1_access(Mem_Req* req, Mem_Queue_Entry* l1_queue_entry
   if (mj_l1_staged)
     cache_set_mockingjay_next_access(FALSE, 0, FALSE, FALSE, 0);
   req->l1_hit = data ? TRUE : FALSE;
+  /* A hit the data array missed and the one-line stream buffer caught (--marked_rrip_stream_buf).
+     It is a real hit and is already counted as one above; this only says where it came from.
+     L1_MARKED_SB_HIT / L1_MARKED_BYPASS is the headline ratio: does the buffer recover the
+     reuse the bypass gave up? Must be read right after the access it describes. */
+  if (data && cache_stream_buf_last_hit(&L1(req->proc_id)->cache))
+    STAT_EVENT(req->proc_id, L1_MARKED_SB_HIT);
 
   // LLC set dueling: score this demand access against its leader group, then advance the
   // window. Must run right after cache_access -- the protected-hits metric reads the
@@ -2264,6 +2411,9 @@ static Flag mem_complete_mlc_access(Mem_Req* req, Mem_Queue_Entry* mlc_queue_ent
   if (td_mlc_pred_staged)
     cache_set_hit_promote_frac(FALSE, 0.0);  // clear one-shot (consumed on hit; drop on miss)
   req->mlc_hit = data ? TRUE : FALSE;
+  /* A hit the data array missed and the one-line stream buffer caught -- see the L1 site. */
+  if (data && cache_stream_buf_last_hit(&MLC(req->proc_id)->cache))
+    STAT_EVENT(req->proc_id, MLC_MARKED_SB_HIT);
 
   // Set dueling: advance the selection window (instruction-clocked) once per MLC access.
   if (TD_COMBINED_ON_MLC && TD_COMBINED_SET_DUEL)
@@ -4633,6 +4783,83 @@ Flag l1_fill_line(Mem_Req* req) {
     return SUCCESS;
   }
 
+  /* REPL_MARKED_RRIP bypass (--marked_rrip_bypass): an unprotected fill whose RRPV would be
+     strictly more distant than every resident line in its set is not allocated at all -- it
+     would be the immediate next victim, so caching it can only evict something more useful.
+     Like the Mockingjay block above, this is checked before get_next_repl_line so no victim is
+     chosen and no writeback is scheduled for a fill that is not going to happen.
+
+     The fill's RRPV is computed with td_combined_calc_fill rather than the staging call further
+     down: staging is a one-shot, and staging it here would leave a stale RRPV behind for the
+     next fill whenever this path returns FAILURE. */
+  if (TD_COMBINED_ON_L1 && MARKED_RRIP_BYPASS && L1(req->proc_id)->cache.repl_policy == REPL_MARKED_RRIP) {
+    int    bp_instr_depth, bp_data_depth, bp_basic;
+    double bp_instr_thr, bp_data_thr;
+    l1duel_cfg_for_addr(req->proc_id, req->addr, &bp_instr_depth, &bp_data_depth, &bp_instr_thr, &bp_data_thr,
+                        &bp_basic);
+    if (marked_bypass_fill(&L1(req->proc_id)->cache, req, bp_instr_depth, bp_data_depth, bp_instr_thr, bp_data_thr,
+                           bp_basic)) {
+      Cache*   l1_cache = &L1(req->proc_id)->cache;
+      Flag     sb_valid = FALSE;
+      Addr     sb_line_addr = 0;
+      uns8     sb_proc_id = 0;
+      L1_Data* sb_old = (L1_Data*)cache_stream_buf_peek(l1_cache, &sb_valid, &sb_line_addr, &sb_proc_id);
+      L1_Data* sb_data;
+
+      /* --marked_rrip_stream_buf: the declined line goes into the one-line buffer, displacing
+         whatever was there. Drain a dirty occupant first, exactly as the main victim path does
+         below -- and BEFORE anything is mutated, so a failed writeback request can return
+         FAILURE and have the whole bypass decision re-run cleanly on the retry.
+         cache_stream_buf_peek and the bypass predicate are both pure, so nothing has been
+         changed at this point. */
+      if (sb_valid) {
+        if (!L1_WRITE_THROUGH && !L1_IGNORE_WB && sb_old->dirty) {
+          if (!new_mem_l1_wb_req(MRT_WB, sb_proc_id, sb_line_addr, L1_LINE_SIZE, 0, NULL, NULL, unique_count))
+            return FAILURE;
+          STAT_EVENT(req->proc_id, L1_MARKED_SB_EVICT_DIRTY);
+        }
+        STAT_EVENT(req->proc_id, L1_MARKED_SB_EVICT);
+      }
+
+      /* NULL when the buffer is off -- then the line is simply dropped, which is the
+         bypass-without-buffer ablation. */
+      sb_data = (L1_Data*)cache_stream_buf_install(l1_cache, req->proc_id, req->addr, &line_addr);
+      if (sb_data) {
+        /* The same payload fields the normal fill path sets at the bottom of this function.
+           The buffer is not a second write mechanism -- it IS the write path: a store that
+           hits it gets this pointer back from cache_access, mem_process_l1_hit_access marks it
+           dirty, and the displacement above writes it back. A line ENTERING the buffer is
+           always clean: writebacks are never bypassed and a bypassed fill is fresh from
+           memory, so only a later write hit can dirty it. */
+        sb_data->proc_id = req->proc_id;
+        sb_data->dirty = FALSE;
+        sb_data->prefetch = req->type == MRT_DPRF || req->type == MRT_IPRF || req->demand_match_prefetch;
+        sb_data->seen_prefetch = req->demand_match_prefetch;
+        sb_data->prefetcher_id = req->prefetcher_id;
+        sb_data->pref_distance = req->pref_distance;
+        sb_data->pref_loadPC = req->pref_loadPC;
+        sb_data->global_hist = req->global_hist;
+        sb_data->dcache_touch = FALSE;
+        sb_data->fetched_by_offpath = req->off_path;
+        sb_data->offpath_op_addr = req->oldest_op_addr;
+        sb_data->offpath_op_unique = req->oldest_op_unique_num;
+        sb_data->l0_modified_fetched_by_offpath = FALSE;
+        sb_data->l1miss_latency = cycle_count - req->l1_miss_cycle;
+        sb_data->fetch_cycle = cycle_count;
+        sb_data->onpath_use_cycle = req->off_path ? 0 : cycle_count;
+      }
+
+      /* No L1_FILL / eviction stats and no wp_process_l1_fill: nothing was filled and nothing
+         was evicted. Same shape as the Mockingjay bypass above. */
+      STAT_EVENT(req->proc_id, L1_MARKED_BYPASS);
+      req->l1_miss_satisfied = TRUE;
+      req->l1_miss_cycle = MAX_CTR;
+      if (TRACK_L1_MISS_DEPS || MARK_L1_MISSES)
+        mark_ops_as_l1_miss_satisfied(req);
+      return SUCCESS;
+    }
+  }
+
   /* Do not insert the line yet, just check which line we
      need to replace. If that line is dirty, it's possible
      that we won't be able to insert the writeback into the
@@ -4777,6 +5004,19 @@ Flag l1_fill_line(Mem_Req* req) {
 
   // REPL_MOCKINGJAY: hand the fill its PC / traffic class (consumed by the insert below).
   mockingjay_stage_access(&L1(req->proc_id)->cache, req);
+
+  /* The insert below silently drops this line from the one-line stream buffer if the buffer
+     holds it (it must not be resident in both). That is safe only while the dropped occupant
+     is clean, which it is: a write to a buffered line HITS the buffer, so no fill is ever
+     generated for one. cache_lib cannot see L1_Data.dirty, so the check lives here. */
+  if (L1(req->proc_id)->cache.sb_enabled) {
+    Flag     sb_valid = FALSE;
+    Addr     sb_line_addr = 0;
+    uns8     sb_proc_id = 0;
+    L1_Data* sb_old = (L1_Data*)cache_stream_buf_peek(&L1(req->proc_id)->cache, &sb_valid, &sb_line_addr, &sb_proc_id);
+    ASSERT(req->proc_id, !sb_valid || sb_line_addr != get_cache_line_addr(&L1(req->proc_id)->cache, req->addr) ||
+                             !sb_old->dirty);
+  }
 
   // Put prefetches in the right position for replacement
   // cmp FIXME prefetchers
@@ -4958,6 +5198,69 @@ Flag mlc_fill_line(Mem_Req* req) {
     return SUCCESS;
   }
 
+  /* REPL_MARKED_RRIP bypass (--marked_rrip_bypass): the LLC block in l1_fill_line documents
+     the reasoning; this is the same filter reading the MLC's own combined-policy
+     configuration. Checked before get_next_repl_line so no victim is chosen and no writeback
+     is scheduled for a fill that is not going to happen. */
+  if (TD_COMBINED_ON_MLC && MARKED_RRIP_BYPASS && MLC(req->proc_id)->cache.repl_policy == REPL_MARKED_RRIP) {
+    int    bp_instr_depth, bp_data_depth, bp_basic;
+    double bp_instr_thr, bp_data_thr;
+    mlc_combined_cfg_for_addr(req->proc_id, req->addr, &bp_instr_depth, &bp_data_depth, &bp_instr_thr, &bp_data_thr,
+                              &bp_basic);
+    if (marked_bypass_fill(&MLC(req->proc_id)->cache, req, bp_instr_depth, bp_data_depth, bp_instr_thr, bp_data_thr,
+                           bp_basic)) {
+      Cache*    mlc_cache = &MLC(req->proc_id)->cache;
+      Flag      sb_valid = FALSE;
+      Addr      sb_line_addr = 0;
+      uns8      sb_proc_id = 0;
+      MLC_Data* sb_old = (MLC_Data*)cache_stream_buf_peek(mlc_cache, &sb_valid, &sb_line_addr, &sb_proc_id);
+      MLC_Data* sb_data;
+
+      /* Drain a dirty occupant before it is displaced, and before anything is mutated, so a
+         failed writeback request returns FAILURE with the bypass decision re-runnable. */
+      if (sb_valid) {
+        if (!MLC_WRITE_THROUGH && sb_old->dirty) {
+          if (!new_mem_mlc_wb_req(MRT_WB, sb_proc_id, sb_line_addr, MLC_LINE_SIZE, 1, NULL, NULL, unique_count))
+            return FAILURE;
+          STAT_EVENT(req->proc_id, MLC_MARKED_SB_EVICT_DIRTY);
+        }
+        STAT_EVENT(req->proc_id, MLC_MARKED_SB_EVICT);
+      }
+
+      /* NULL when the buffer is off -- then the line is simply dropped, which is the
+         bypass-without-buffer ablation. Otherwise fill in the same payload fields the normal
+         MLC fill sets at the bottom of this function; the buffer IS the write path, so a later
+         write hit dirties this payload and the displacement above writes it back. A line
+         ENTERING the buffer is always clean (writebacks are never bypassed). */
+      sb_data = (MLC_Data*)cache_stream_buf_install(mlc_cache, req->proc_id, req->addr, &line_addr);
+      if (sb_data) {
+        sb_data->proc_id = req->proc_id;
+        sb_data->dirty = FALSE;
+        sb_data->prefetch = req->type == MRT_DPRF || req->type == MRT_IPRF || req->type == MRT_UOCPRF ||
+                            req->type == MRT_FDIPPRFON || req->type == MRT_FDIPPRFOFF || req->demand_match_prefetch;
+        sb_data->seen_prefetch = req->demand_match_prefetch;
+        sb_data->prefetcher_id = req->prefetcher_id;
+        sb_data->pref_loadPC = req->pref_loadPC;
+        sb_data->global_hist = req->global_hist;
+        sb_data->dcache_touch = FALSE;
+        sb_data->fetched_by_offpath = req->off_path;
+        sb_data->offpath_op_addr = req->oldest_op_addr;
+        sb_data->offpath_op_unique = req->oldest_op_unique_num;
+        sb_data->l0_modified_fetched_by_offpath = FALSE;
+        sb_data->mlc_miss_latency = cycle_count - req->mlc_miss_cycle;
+        sb_data->fetch_cycle = cycle_count;
+        sb_data->onpath_use_cycle = req->off_path ? 0 : cycle_count;
+      }
+
+      STAT_EVENT(req->proc_id, MLC_MARKED_BYPASS);
+      ASSERT(req->proc_id, req->mlc_miss_cycle != MAX_CTR);
+      ASSERT(req->proc_id, req->mlc_miss);
+      req->mlc_miss_satisfied = TRUE;
+      req->mlc_miss_cycle = MAX_CTR;
+      return SUCCESS;
+    }
+  }
+
   /* Do not insert the line yet, just check which line we
      need to replace. If that line is dirty, it's possible
      that we won't be able to insert the writeback into the
@@ -5061,82 +5364,12 @@ Flag mlc_fill_line(Mem_Req* req) {
   // membound fraction (td_load_rrip_* knobs). No demanding op (prefetch/store) -> basic. Each
   // class keeps its own minimum RRPV and threshold.
   if (TD_COMBINED_ON_MLC) {
-    // per-class depths: static (td_fe/td_load_rrip_min_rrpv) or, under dynamic mode, chosen by
-    // the running front-end-bound vs mem-bound balance -- the dominant class stays deep, the
-    // other drops to basic; a balanced window keeps BOTH deep (the non-zero-sum region).
-    // Unprotected ("basic") RRPV for this fill. Normally the global --marked_rrip_basic_rrpv;
-    // under set dueling the duel owns it and picks it PER SET, so it is overwritten below.
-    int          basic_rrpv = marked_rrip_basic_rrpv();
-    const double off_thr = 1.0;     // fraction can't exceed 1 -> nothing qualifies -> all basic
-    int    instr_depth = TD_FE_RRIP_MIN_RRPV;
-    int    data_depth = TD_LOAD_RRIP_MIN_RRPV;
-    double instr_thr = (double)TD_FE_RRIP_THRESH;
-    double data_thr = (double)TD_LOAD_REPLAY_THRESH;
-    if (TD_COMBINED_SET_DUEL) {
-      // Set dueling picks BOTH the (instr,data) depth bin and the basic RRPV: a leader set
-      // uses its own group's pair, a follower uses the selected (D_sel, B_sel). Thresholds
-      // stay per-class. Note basic_rrpv is reassigned first so the TD_DUEL_BASIC sentinel
-      // below resolves to this set's basic, not the global param.
-      int d_idx = 0;
-      duel_cfg_for_addr(req->proc_id, req->addr, &d_idx, &basic_rrpv);
-      instr_depth = (g_duel_instr[d_idx] == TD_DUEL_BASIC) ? basic_rrpv : g_duel_instr[d_idx];
-      data_depth = (g_duel_data[d_idx] == TD_DUEL_BASIC) ? basic_rrpv : g_duel_data[d_idx];
-    } else if (TD_COMBINED_DYNAMIC_DEPTH || TD_COMBINED_DYNAMIC_THRESH) {
-      double fe = topdown_fe_bound_fraction(req->proc_id);
-      Flag fe_dom = (fe >= (double)TD_COMBINED_DYN_FE_HI);   // front-end-dominated window
-      Flag mem_dom = (fe <= (double)TD_COMBINED_DYN_FE_LO);  // memory-dominated window
-      if (TD_COMBINED_DYNAMIC_DEPTH && TD_COMBINED_DYN_BUCKETS >= 2) {
-        // GRADUATED depth: quantize fe_frac into N buckets and interpolate each class's depth.
-        // instr: basic (fe=0) -> suite max (fe=0.5) -> instr_extreme (fe=1); data is the mirror.
-        // Each bucket toward an end pushes that class more extreme, the other toward basic.
-        // The N buckets span the [fe_lo, fe_hi] WINDOW (not raw [0,1]): fe<=fe_lo pins to bucket 0
-        // (most memory-extreme), fe>=fe_hi to the top bucket (most fe-extreme), linear between.
-        // Set the window over the observed fe_frac range so all buckets resolve the real
-        // population and the most memory-bound workload lands in bucket 0.
-        uns    N = TD_COMBINED_DYN_BUCKETS;
-        double lo = (double)TD_COMBINED_DYN_FE_LO, hi = (double)TD_COMBINED_DYN_FE_HI;
-        double fe_n = (hi > lo) ? (fe - lo) / (hi - lo) : fe;  // normalize into the window
-        if (fe_n < 0.0)
-          fe_n = 0.0;
-        if (fe_n > 1.0)
-          fe_n = 1.0;
-        uns bi = (uns)(fe_n * (double)N);
-        if (bi >= N)
-          bi = N - 1;
-        // map bucket -> position so the END buckets sit ON the endpoints: bucket 0 -> p=0 (data
-        // at its full extreme, instr basic), bucket N-1 -> p=1 (instr full extreme, data basic).
-        double p = (double)bi / (double)(N - 1);  // [0,1], hits both extremes exactly
-        double bp = (double)basic_rrpv;
-        double sm_i = (double)TD_FE_RRIP_MIN_RRPV, ex_i = (double)TD_COMBINED_DYN_INSTR_EXTREME;
-        double sm_d = (double)TD_LOAD_RRIP_MIN_RRPV, ex_d = (double)TD_COMBINED_DYN_DATA_EXTREME;
-        double id = (p >= 0.5) ? sm_i + (ex_i - sm_i) * (p - 0.5) / 0.5   // suite max -> instr extreme
-                               : bp + (sm_i - bp) * p / 0.5;              // basic -> suite max
-        double dd = (p <= 0.5) ? ex_d + (sm_d - ex_d) * p / 0.5           // data extreme -> suite max
-                               : sm_d + (bp - sm_d) * (p - 0.5) / 0.5;    // suite max -> basic
-        instr_depth = (int)(id >= 0.0 ? id + 0.5 : id - 0.5);
-        data_depth = (int)(dd >= 0.0 ? dd + 0.5 : dd - 0.5);
-      } else if (TD_COMBINED_DYNAMIC_DEPTH) {
-        // 3-bucket DEPTH: dominant class past the suite max (deeper), the other -> basic
-        if (fe_dom) {
-          instr_depth = TD_COMBINED_DYN_INSTR_EXTREME;
-          data_depth = basic_rrpv;
-        } else if (mem_dom) {
-          instr_depth = basic_rrpv;
-          data_depth = TD_COMBINED_DYN_DATA_EXTREME;
-        }
-      } else {
-        // move THRESHOLD: depths stay at the suite max; dominant class gets a lower threshold
-        // (broader coverage), the other is turned off (threshold above 1 -> nothing qualifies)
-        if (fe_dom) {
-          instr_thr = (double)TD_COMBINED_DYN_INSTR_THR_EXTREME;
-          data_thr = off_thr;
-        } else if (mem_dom) {
-          instr_thr = off_thr;
-          data_thr = (double)TD_COMBINED_DYN_DATA_THR_EXTREME;
-        }
-      }
-      // else balanced -> suite-max depths and nominal thresholds for both
-    }
+    // Depths / thresholds / basic resolve in mlc_combined_cfg_for_addr (static params, set
+    // dueling, or the dynamic selectors). It is also what the bypass filter above consulted,
+    // so the two cannot disagree about this fill.
+    int    instr_depth, data_depth, basic_rrpv;
+    double instr_thr, data_thr;
+    mlc_combined_cfg_for_addr(req->proc_id, req->addr, &instr_depth, &data_depth, &instr_thr, &data_thr, &basic_rrpv);
     td_combined_stage_fill(req, instr_depth, data_depth, instr_thr, data_thr, basic_rrpv);
   }
   // marked-RRIP on MLC: derive the fill's initial RRPV from the demanding load's on-demand
@@ -5170,6 +5403,18 @@ Flag mlc_fill_line(Mem_Req* req) {
 
   // REPL_MOCKINGJAY: hand the fill its PC / traffic class (consumed by the insert below).
   mockingjay_stage_access(&MLC(req->proc_id)->cache, req);
+
+  /* See the identical check in l1_fill_line: the insert below drops a matching stream-buffer
+     occupant, which is only safe while that occupant is clean. */
+  if (MLC(req->proc_id)->cache.sb_enabled) {
+    Flag      sb_valid = FALSE;
+    Addr      sb_line_addr = 0;
+    uns8      sb_proc_id = 0;
+    MLC_Data* sb_old = (MLC_Data*)cache_stream_buf_peek(&MLC(req->proc_id)->cache, &sb_valid, &sb_line_addr,
+                                                        &sb_proc_id);
+    ASSERT(req->proc_id, !sb_valid || sb_line_addr != get_cache_line_addr(&MLC(req->proc_id)->cache, req->addr) ||
+                             !sb_old->dirty);
+  }
 
   // Put prefetches in the right position for replacement
   // cmp FIXME prefetchers

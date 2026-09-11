@@ -144,11 +144,60 @@ DEF_PARAM(td_load_rrip_mark, TD_LOAD_RRIP_MARK, Flag, Flag, FALSE, )
    Default 3 = RRIP_DISTANT_VAL-1. NOTE this is NOT the lowest priority: srrip_update_evict
    evicts on reference_val == RRIP_DISTANT_VAL (4), so 3 is one aging round above the floor
    and 4 is evict-on-arrival. Setting it to 4 makes unmarked lines the first victims (a
-   BRRIP-distant / pseudo-bypass insertion). Values ABOVE 4 are unsafe -- the eviction test is
-   an exact equality, so such a line would never match and would age forever -- and are clamped
-   to 4. Negative values are allowed (they protect unmarked lines) but make the "marked"
+   BRRIP-distant / pseudo-bypass insertion). Values ABOVE 4 are clamped to 4. With the default
+   equality-based eviction they are outright unsafe -- the test is an exact equality, so such a
+   line would never match and would age forever. Under --marked_rrip_argmax_evict they are
+   safe (the argmax has no upper bound), but the clamp is kept anyway so flipping that knob
+   does not silently move existing configurations, and the set duel only uses {2,3,4} in any
+   case. Negative values are allowed (they protect unmarked lines) but make the "marked"
    distinction meaningless unless td_*_min_rrpv is pushed lower still. */
 DEF_PARAM(marked_rrip_basic_rrpv, MARKED_RRIP_BASIC_RRPV, int, int, 3, )
+/* Marked-RRIP victim selection. FALSE (default) = the stock SRRIP scan: find a line at exactly
+   RRIP_DISTANT_VAL, otherwise increment every RRPV in the set and rescan. TRUE = evict the
+   ARGMAX of reference_val (lowest way index wins ties, as the scan did) and age the set by
+   exactly +1 per real eviction.
+   Argmax is cheaper (O(assoc) per eviction however deep td_*_min_rrpv goes, rather than
+   O(assoc * distance-to-the-top)) and removes the upper bound on insert values. It is NOT
+   behavior-neutral: the top of the set now floats in roughly [basic, basic+assoc] instead of
+   being pinned at 4, so promoting a hit to RRPV 0 buys ~assoc aging rounds of life instead of
+   ~4. Expect every number to move, and re-run the td_*_rrip_min_rrpv depth sweep on top of it
+   before carrying any depth conclusion across. */
+DEF_PARAM(marked_rrip_argmax_evict, MARKED_RRIP_ARGMAX_EVICT, Flag, Flag, FALSE, )
+/* Argmax mode only: age a set once every N real evictions instead of on every one (one counter
+   per set). N=1 (default) is age-always. Larger N makes RRPVs decay more slowly relative to the
+   eviction rate, i.e. protection lasts N times longer in eviction terms. Ignored when
+   --marked_rrip_argmax_evict is off, where aging is driven by the equality test instead. */
+DEF_PARAM(marked_rrip_age_period, MARKED_RRIP_AGE_PERIOD, uns, uns, 1, )
+/* Marked-RRIP allocation filter. When TRUE, a fill that would insert at BASIC (unprotected)
+   into a set where every resident line already has a strictly lower RRPV is not inserted at
+   all: it would be the immediate next victim, so caching it can only evict something more
+   useful. A MARKED line is never bypassed, nor is a writeback (that would lose the dirty
+   line), nor a set with a free way. Nothing is aged and no replacement state is touched --
+   unlike Mockingjay's bypass, there is no sampler to train. */
+DEF_PARAM(marked_rrip_bypass, MARKED_RRIP_BYPASS, Flag, Flag, FALSE, )
+/* Relax the bypass test from max(set) < incoming to max(set) <= incoming. A tie means the
+   incoming line may or may not be the immediate victim, depending on the way-index tie-break,
+   so it is excluded by default; this knob is for measuring whether including it helps. */
+DEF_PARAM(marked_rrip_bypass_ties, MARKED_RRIP_BYPASS_TIES, Flag, Flag, FALSE, )
+/* Whether PREFETCH fills are eligible for the bypass. FALSE (default) = never bypass them.
+   Prefetches stage no fraction, so they always land at basic and are therefore the MOST likely
+   thing the filter would decline -- which could quietly gut prefetch coverage rather than
+   filter dead lines. Off by default so that cannot happen unmeasured; turn it on to test the
+   other reading (that a prefetch nobody wants is exactly what should be dropped), keeping in
+   mind PREF_INSERT_* already has its own opinions about prefetch placement. */
+DEF_PARAM(marked_rrip_bypass_pref, MARKED_RRIP_BYPASS_PREF, Flag, Flag, FALSE, )
+/* One-line stream buffer, per cache: holds the line the bypass filter most recently declined.
+   It is probed in parallel with the data array on every access, so a bypassed line that is
+   re-referenced promptly is still a hit; a later bypass displaces it (writing it back first if
+   a write has since dirtied it). Independent of --marked_rrip_bypass on purpose:
+   bypass-without-buffer is the cleaner ablation and deserves to be a configuration of its own.
+   The buffer does nothing at all when bypass is off, since nothing ever enters it.
+   A buffer hit is served IN PLACE: the line is not promoted into its set, because promotion
+   would undo the bypass on exactly the streaming pattern the buffer exists to catch. (The
+   plan's --marked_rrip_sb_promote A/B is deliberately not implemented; a promoting variant
+   would have to carry the payload's dirty bit into the inserted line, which the in-place
+   design never has to think about.) */
+DEF_PARAM(marked_rrip_stream_buf, MARKED_RRIP_STREAM_BUF, Flag, Flag, FALSE, )
 /* Marked-RRIP (REPL_MARKED_RRIP) protects memory-bound load lines. The demanding load's
    memory-bound fraction is computed ON DEMAND at fill (td_mem_cycles/td_window_cycles, as
    the record pass measures it) -- no record CSV, so --td_load_dir / --td_load_replay_key

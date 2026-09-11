@@ -94,6 +94,103 @@ uns ext_cache_index(Cache* cache, Addr addr, Addr* tag, Addr* line_addr) {
 }
 
 /**************************************************************************************/
+/* REPL_MARKED_RRIP one-line stream buffer (--marked_rrip_stream_buf).
+ *
+ * Holds the single line most recently declined by the bypass filter
+ * (cache_marked_should_bypass). It is architecturally PARALLEL to the data array: every
+ * cache_access that misses in the sets probes it, and a hit is served from it directly without
+ * touching any set's replacement state. Promoting the line back into a set would undo the
+ * bypass on exactly the streaming pattern the buffer exists to catch.
+ *
+ * The buffer is shared by all sets, so a tag does not identify a line by itself: two addresses
+ * in different sets can carry the same tag (cache_index masks the set bits out of the tag).
+ * Every compare below is on the LINE ADDRESS as well, which is unique. */
+
+/* Probe the buffer. Returns the occupant's payload on a hit and records the hit on the cache
+ * for the caller's stat; NULL otherwise. Never updates replacement state. Call only after the
+ * data array has already missed. */
+static inline void* stream_buf_access(Cache* cache, Addr addr, Addr* line_addr) {
+  Addr tag;
+
+  if (!cache->sb_enabled || !cache->sb.valid)
+    return NULL;
+
+  (void)cache_index(cache, addr, &tag, line_addr);
+  if (cache->sb.tag != tag || cache->sb.base != *line_addr)
+    return NULL;
+
+  cache->sb_last_hit = TRUE;
+  return cache->sb.data;
+}
+
+/* Drop a buffered line that is about to become resident in a set. The same line must never be
+ * in both places: a bypassed line can be re-requested, fail the bypass test the second time,
+ * and then be inserted normally.
+ *
+ * A dirty occupant dropped here would lose its data. That cannot happen under the current
+ * flow -- a write to a line in the buffer HITS the buffer (cache_access returns the buffer's
+ * payload, which is what the write dirties), so no fill is ever generated for a line the
+ * buffer already holds. cache_lib cannot read the payload's dirty bit to assert it; the fill
+ * paths in memory.c check it where the payload type is visible. */
+static inline void stream_buf_invalidate(Cache* cache, Addr addr) {
+  Addr tag, line_addr;
+
+  if (!cache->sb_enabled || !cache->sb.valid)
+    return;
+
+  (void)cache_index(cache, addr, &tag, &line_addr);
+  if (cache->sb.tag == tag && cache->sb.base == line_addr) {
+    cache->sb.valid = FALSE;
+    cache->sb.tag = 0;
+    cache->sb.base = 0;
+  }
+}
+
+void* cache_stream_buf_peek(Cache* cache, Flag* valid, Addr* line_addr, uns8* proc_id) {
+  if (!cache->sb_enabled || !cache->sb.valid) {
+    *valid = FALSE;
+    *line_addr = 0;
+    *proc_id = 0;
+    return NULL;
+  }
+  *valid = TRUE;
+  *line_addr = cache->sb.base;
+  *proc_id = cache->sb.proc_id;
+  return cache->sb.data;
+}
+
+void* cache_stream_buf_install(Cache* cache, uns8 proc_id, Addr addr, Addr* line_addr) {
+  Addr tag;
+
+  (void)cache_index(cache, addr, &tag, line_addr);
+  if (!cache->sb_enabled)
+    return NULL;
+
+  cache->sb.proc_id = proc_id;
+  cache->sb.valid = TRUE;
+  cache->sb.tag = tag;
+  cache->sb.base = *line_addr;
+  cache->sb.last_access_time = sim_time;
+  cache->sb.insertion_time = sim_time;
+  cache->sb.pw_start_addr = addr;
+  cache->sb.pref = FALSE;
+  cache->sb.dirty = FALSE;
+  cache->sb.outcome = FALSE;
+  /* The line is not in a set, so no RRPV governs it; keep the fields neutral rather than
+     meaningful, so nothing reads them as replacement state by accident. */
+  cache->sb.reference_val = 0;
+  cache->sb.marked_promote_rrpv = 0;
+  cache->sb.marked_protected = FALSE;
+  /* sb_enabled implies a real malloc'd payload (see general_action_init). */
+  memset(cache->sb.data, 0, cache->data_size);
+  return cache->sb.data;
+}
+
+Flag cache_stream_buf_last_hit(Cache* cache) {
+  return cache->sb_last_hit;
+}
+
+/**************************************************************************************/
 /* init_cache: */
 
 void init_cache(Cache* cache, const char* name, uns cache_size, uns assoc, uns line_size, uns data_size,
@@ -103,6 +200,14 @@ void init_cache(Cache* cache, const char* name, uns cache_size, uns assoc, uns l
   uns ii, jj;
 
   DEBUG(0, "Initializing cache called '%s'.\n", name);
+
+  /* REPL_MARKED_RRIP extras, cleared for EVERY cache before any policy dispatch. Cache structs
+     are malloc'd (e.g. mem->uncores), so these must not be left holding garbage: cache_access
+     reads sb_enabled on every access. general_action_init turns them on where they apply. */
+  cache->marked_age_ctr = NULL;
+  cache->sb_enabled = FALSE;
+  cache->sb_last_hit = FALSE;
+  memset(&cache->sb, 0, sizeof(cache->sb));
 
   if (repl_policy >= REPL_VOID) {
     init_cache_strategy(cache, name, cache_size, assoc, line_size, data_size, repl_policy);
@@ -217,8 +322,22 @@ void* cache_access(Cache* cache, Addr addr, Addr* line_addr, Flag update_repl) {
   uns ii;
   void* line_data = NULL;
 
-  if (cache->repl_policy >= REPL_VOID)
-    return cache_access_strategy(cache, addr, line_addr, update_repl);
+  cache->sb_last_hit = FALSE;
+
+  if (cache->repl_policy >= REPL_VOID) {
+    void* strategy_data = cache_access_strategy(cache, addr, line_addr, update_repl);
+    if (strategy_data)
+      return strategy_data;
+    /* Parallel one-line stream-buffer probe (--marked_rrip_stream_buf). A no-op unless this
+       cache runs REPL_MARKED_RRIP with the buffer enabled. Architecturally parallel, so a hit
+       costs no extra latency (Scarab charges cache latency at the request level, not here),
+       and it never updates replacement state -- so update_repl has nothing to do here.
+       Callers that probe with update_repl==FALSE (warmup / oracle lookups) see buffer hits
+       too. That is correct, it is a real hit, but it does shift their hit accounting.
+       The non-strategy path below needs no probe: sb_enabled requires REPL_MARKED_RRIP, which
+       is above REPL_VOID and therefore always takes this branch. */
+    return stream_buf_access(cache, addr, line_addr);
+  }
 
   if (cache->repl_policy == REPL_IDEAL_STORAGE) {
     return access_ideal_storage(cache, set, tag, addr);
@@ -440,6 +559,9 @@ void cache_invalidate(Cache* cache, Addr addr, Addr* line_addr) {
 
   if (cache->repl_policy == REPL_IDEAL)
     invalidate_unsure_line(cache, set, tag);
+
+  /* An invalidated line must not survive in the one-line stream buffer either. */
+  stream_buf_invalidate(cache, addr);
 }
 
 /**
@@ -1099,6 +1221,12 @@ void reset_cache(Cache* cache) {
       cache->entries[ii][jj].valid = FALSE;
     }
   }
+
+  /* Hygiene: nothing calls reset_cache today, but a reset that left the one-line stream buffer
+     populated would resurrect a line the sets no longer hold. */
+  cache->sb.valid = FALSE;
+  cache->sb.tag = 0;
+  cache->sb.base = 0;
 }
 
 /**************************************************************************************/
@@ -1268,6 +1396,13 @@ void* cache_insert_strategy(Cache* cache, uns8 proc_id, Addr addr, Addr* line_ad
 
   DEBUG(0, "%s, %d: Insert Strategy\n", cache->name, cache->repl_policy);
 
+  /* The line is about to become resident, so it must not also remain in the stream buffer.
+     cache_insert_replpos does this with its cache_invalidate sanity check, but a strategy
+     policy never reaches that line -- cache_insert short-circuits straight to here -- so the
+     clear has to be explicit. See stream_buf_invalidate for why the dropped occupant cannot
+     be dirty. */
+  stream_buf_invalidate(cache, addr);
+
   // update_evict -> action_repl -> update_insert
   // External func also directly call it
   new_line = repl_policy_func_table[policy].update_evict(cache, proc_id, set, &repl_index, NULL, FALSE);
@@ -1384,6 +1519,27 @@ void general_action_init(Cache* cache, const char* name, uns cache_size, uns ass
         memset(cache->entries[ii][jj].data, 0, data_size);
       } else
         cache->entries[ii][jj].data = INIT_CACHE_DATA_VALUE;
+    }
+  }
+
+  /* REPL_MARKED_RRIP extras. init_cache already cleared these for every cache, so a policy
+     that does not want them is well-defined without touching anything here. */
+  if (repl_policy == REPL_MARKED_RRIP) {
+    /* --marked_rrip_age_period N > 1: per-set counter for the /N aging variant. */
+    if (MARKED_RRIP_AGE_PERIOD > 1)
+      cache->marked_age_ctr = (uns*)calloc(num_sets, sizeof(uns));
+
+    /* --marked_rrip_stream_buf: the one-line victim buffer. A real Cache_Entry with a full
+       data_size payload, so the caller's dirty bit and the existing writeback path work on it
+       with no second mechanism -- which is exactly why a cache with no payload (data_size 0,
+       i.e. INIT_CACHE_DATA_VALUE placeholders) does not get one: there would be nothing for
+       the caller to fill in or write back. The LLC and MLC both have real payloads. */
+    if (MARKED_RRIP_STREAM_BUF && data_size) {
+      cache->sb_enabled = TRUE;
+      cache->sb.valid = FALSE;
+      cache->sb.marked_protected = FALSE;
+      cache->sb.data = (void*)malloc(data_size);
+      memset(cache->sb.data, 0, data_size);
     }
   }
 }
@@ -1551,7 +1707,9 @@ void srrip_update_insert(Cache* cache, uns8 proc_id, uns set, uns way, void* arg
  *                                    fraction. min may be negative (protection stronger than
  *                                    RRPV 0). Anchor < 0 defaults to the replay threshold.
  * On a hit the line is promoted to min(0, its inserted RRPV) (marked_rrip_update_hit) so
- * aging can't erase the protection; eviction/aging reuse SRRIP (srrip_update_evict). */
+ * aging can't erase the protection. Eviction is marked_rrip_update_evict, which by default is
+ * plain srrip_update_evict and under --marked_rrip_argmax_evict switches to argmax victim
+ * selection with +1 aging. */
 /* Insert one-shot: the caller precomputes the RRPV (from whichever signal / knob set applies
    to its cache -- L1D/L2 membound, L1I front-end-bound, ...) so the policy stays agnostic. */
 static Flag g_marked_rrip_have_rrpv = FALSE;
@@ -1562,10 +1720,13 @@ static Flag   g_marked_rrip_hit_have_frac = FALSE;
 static double g_marked_rrip_hit_frac      = 0.0;
 
 /* The "basic" (unprotected) initial RRPV, from --marked_rrip_basic_rrpv. Clamped to
- * RRIP_DISTANT_VAL: srrip_update_evict selects on reference_val == RRIP_DISTANT_VAL (an exact
- * equality), so a line inserted above that value could never match it and would age without
- * bound while never being chosen as a victim. Single definition so cache_lib and every caller
- * that precomputes an RRPV agree on where "unprotected" sits. */
+ * RRIP_DISTANT_VAL. The clamp was originally a correctness requirement: srrip_update_evict
+ * selects on reference_val == RRIP_DISTANT_VAL (an exact equality), so a line inserted above
+ * that could never match and would age without bound while never being chosen as a victim.
+ * Under --marked_rrip_argmax_evict that is no longer true -- the argmax has no upper bound --
+ * but the clamp stays so existing configurations do not shift when the knob is flipped, and
+ * because the set duel only ever uses {2, 3, 4} anyway. Single definition so cache_lib and
+ * every caller that precomputes an RRPV agree on where "unprotected" sits. */
 int marked_rrip_basic_rrpv(void) {
   int basic = MARKED_RRIP_BASIC_RRPV;
   return (basic > (int)RRIP_DISTANT_VAL) ? (int)RRIP_DISTANT_VAL : basic;
@@ -1681,6 +1842,118 @@ void marked_rrip_update_hit(Cache* cache, uns set, uns way, void* arg) {
   g_marked_rrip_hit_have_frac = FALSE;                  // consume the one-shot
 
   cache_debug_print_set(cache, set, way, CACHE_EVENT_HIT);
+}
+
+/* Eviction for REPL_MARKED_RRIP.
+ *
+ * --marked_rrip_argmax_evict OFF (the default): defer to srrip_update_evict, so every existing
+ * descriptor reproduces today's behavior exactly.
+ *
+ * ON: take the ARGMAX of reference_val instead of scanning for an exact RRIP_DISTANT_VAL, and
+ * age the set by exactly +1 per real eviction. Consequences:
+ *  - no upper bound on the insert value is needed. The exact-equality test was the only reason
+ *    the basic RRPV had to be clamped to RRIP_DISTANT_VAL;
+ *  - aging costs O(assoc) per eviction however negative td_*_min_rrpv is, instead of
+ *    O(assoc * (RRIP_DISTANT_VAL - max));
+ *  - the top of the set FLOATS rather than being pinned at RRIP_DISTANT_VAL. In an all-basic
+ *    16-way set a line inserted at basic becomes the argmax after roughly `assoc` evictions,
+ *    so values cycle in about [basic, basic + assoc]; the whole range is bounded by
+ *    [min_rrpv, basic + assoc]. reference_val is a signed int, so there is no overflow risk,
+ *    but this is WIDER than the old [min_rrpv, RRIP_DISTANT_VAL].
+ *  - hit promotion therefore gets stronger for free: marked_rrip_update_hit still promotes to
+ *    min(0, inserted RRPV), but with the top floating near assoc that buys ~assoc aging rounds
+ *    of life rather than ~4. The depth sweep must be re-run on top of this before any depth
+ *    conclusion carries over.
+ *
+ * if_external == TRUE marks the get_next_repl_line PEEK, not a real eviction: select the victim
+ * but do NOT age. The victim is chosen twice per fill -- once by the peek that decides whether
+ * a writeback is needed, once by cache_insert -- and more than twice when the writeback request
+ * fails and the fill is retried. The old delta-aging was idempotent across those calls (the
+ * second found a line already at RRIP_DISTANT_VAL and aged by zero); +1 aging is not, so the
+ * flag is what keeps one fill from aging the set repeatedly. ship_update_evict uses it the same
+ * way. With aging suppressed and the selection a pure argmax, the peek and the insert that
+ * follows always name the same way. */
+Cache_Entry* marked_rrip_update_evict(Cache* cache, uns8 proc_id, uns set, uns* way, void* arg, Flag if_external);
+Cache_Entry* marked_rrip_update_evict(Cache* cache, uns8 proc_id, uns set, uns* way, void* arg, Flag if_external) {
+  int ii;
+  int max_val;
+  uns max_way;
+
+  if (!MARKED_RRIP_ARGMAX_EVICT)
+    return srrip_update_evict(cache, proc_id, set, way, arg, if_external);
+
+  /* A free way is always taken, and taking one ages nothing (same rule as srrip_update_evict,
+     whose invalid-way branch breaks out of the aging loop). */
+  for (ii = 0; ii < cache->assoc; ii++) {
+    if (!cache->entries[set][ii].valid) {
+      *way = ii;
+      cache_debug_print_set(cache, set, *way, CACHE_EVENT_EVICT);
+      return &cache->entries[set][*way];
+    }
+  }
+
+  /* Strict > so the LOWEST way index wins ties -- the tie-break the old first-match scan had. */
+  max_val = cache->entries[set][0].reference_val;
+  max_way = 0;
+  for (ii = 1; ii < cache->assoc; ii++) {
+    if (cache->entries[set][ii].reference_val > max_val) {
+      max_val = cache->entries[set][ii].reference_val;
+      max_way = ii;
+    }
+  }
+  *way = max_way;
+
+  if (!if_external) {
+    /* --marked_rrip_age_period N: age once every N real evictions of this set, so RRPVs decay
+       N times more slowly relative to the eviction rate. Period 1 (the default) ages always
+       and allocates no counter. */
+    Flag age = TRUE;
+    if (MARKED_RRIP_AGE_PERIOD > 1 && cache->marked_age_ctr) {
+      cache->marked_age_ctr[set] = (cache->marked_age_ctr[set] + 1) % MARKED_RRIP_AGE_PERIOD;
+      age = (cache->marked_age_ctr[set] == 0) ? TRUE : FALSE;
+    }
+    if (age) {
+      for (ii = 0; ii < cache->assoc; ii++)
+        cache->entries[set][ii].reference_val++;
+    }
+  }
+
+  cache_debug_print_set(cache, set, *way, CACHE_EVENT_EVICT);
+  return &cache->entries[set][*way];
+}
+
+/* See the declaration in cache_lib.h for the contract. The set is read and nothing is written:
+   a bypassed fill leaves marked-RRIP's state completely untouched, including its aging, which
+   is why there is no note_bypass counterpart to Mockingjay's. */
+Flag cache_marked_should_bypass(Cache* cache, Addr addr, int insert_rrpv) {
+  Addr tag, line_addr;
+  uns  set, ii;
+  int  max_val;
+
+  if (cache->repl_policy != REPL_MARKED_RRIP || !MARKED_RRIP_BYPASS)
+    return FALSE;
+
+  set = cache_index(cache, addr, &tag, &line_addr);
+
+  /* A free way is always filled: nothing is displaced, so there is nothing to protect. Same
+     rule cache_mockingjay_should_bypass uses. */
+  for (ii = 0; ii < cache->assoc; ii++) {
+    if (!cache->entries[set][ii].valid)
+      return FALSE;
+  }
+
+  max_val = cache->entries[set][0].reference_val;
+  for (ii = 1; ii < cache->assoc; ii++) {
+    if (cache->entries[set][ii].reference_val > max_val)
+      max_val = cache->entries[set][ii].reference_val;
+  }
+
+  /* Strict by default: on a tie the incoming line may or may not be the immediate victim,
+     depending on the way-index tie-break, so ties are not bypassed. --marked_rrip_bypass_ties
+     relaxes the test to <= for the A/B. */
+  if (MARKED_RRIP_BYPASS_TIES)
+    return (max_val <= insert_rrpv) ? TRUE : FALSE;
+  return (max_val < insert_rrpv) ? TRUE : FALSE;
 }
 
 Cache_Entry* srrip_update_evict(Cache* cache, uns8 proc_id, uns set, uns* way, void* arg, Flag if_external) {
@@ -2533,7 +2806,7 @@ struct repl_policy_func repl_policy_func_table[NUM_REPL] = {
   { REPL_BRRIP,   brrip_action_init,    general_action_repl,  nru_update_hit,     brrip_update_insert,  srrip_update_evict  },
   { REPL_DRRIP,   drrip_action_init,    general_action_repl,  nru_update_hit,     drrip_update_insert,  drrip_update_evict  },
   { REPL_SHIP,    ship_action_init,     general_action_repl,  ship_update_hit,    ship_update_insert,   ship_update_evict   },
-  { REPL_MARKED_RRIP, general_action_init, general_action_repl, marked_rrip_update_hit, marked_rrip_update_insert, srrip_update_evict },
+  { REPL_MARKED_RRIP, general_action_init, general_action_repl, marked_rrip_update_hit, marked_rrip_update_insert, marked_rrip_update_evict },
   { REPL_PLRU_TREE, plru_action_init,   general_action_repl,  plru_update_hit,    plru_update_insert,   plru_update_evict   },
   { REPL_MOCKINGJAY, mockingjay_action_init, general_action_repl, mockingjay_update_hit, mockingjay_update_insert, mockingjay_update_evict },
   { REPL_VOID,    NULL,                 NULL,                 NULL,               NULL,                 NULL                },

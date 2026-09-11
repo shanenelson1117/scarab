@@ -164,6 +164,28 @@ typedef struct Cache_struct {
 
   /* For repl with predictor */
   void* predictor;
+
+  /* REPL_MARKED_RRIP, --marked_rrip_age_period > 1: one aging counter per set. The argmax
+     eviction path bumps RRPVs only when this rolls over, so a set ages once every N real
+     evictions instead of on every one. NULL for every other policy (and for period 1). */
+  uns* marked_age_ctr;
+
+  /* --marked_rrip_stream_buf: single-entry victim buffer holding the line the bypass filter
+     most recently declined to allocate. Probed in parallel with the data array on every
+     access; a hit is served in place and touches NO set's replacement state (the line is not
+     in a set). `sb.data` is a full data_size payload, so the caller's dirty bit and the
+     existing writeback path work on it unchanged.
+
+     The buffer is shared by every set, so a tag alone does not identify a line -- two
+     addresses in different sets can carry the same tag. Every compare is on the line address
+     (`base`) as well.
+
+     sb_last_hit records whether the most recent cache_access on THIS cache was served by the
+     buffer rather than the array; it is cleared at the top of every access, so a caller reads
+     it right after the access it belongs to (see cache_stream_buf_last_hit). */
+  Flag sb_enabled;
+  Flag sb_last_hit;
+  Cache_Entry sb;
 } Cache;
 
 /**************************************************************************************/
@@ -225,6 +247,33 @@ Flag cache_marked_last_hit_protected(void);
  * (or never called) keeps the legacy min(0, inserted RRPV) hit behavior. One-shot: consumed
  * by the next marked_rrip hit. */
 void cache_set_hit_promote_frac(Flag have, double frac);
+
+/* REPL_MARKED_RRIP allocation filter (--marked_rrip_bypass). TRUE when a fill arriving at
+ * `insert_rrpv` would be strictly more distant than every resident line in its set -- i.e. it
+ * would be the very next victim, so caching it can only evict something more useful. Only
+ * meaningful for an UNPROTECTED fill; callers must not offer a marked line. Scarab's
+ * update_evict must name a way, so the caller checks this BEFORE cache_insert and skips the
+ * fill entirely. Pure -- it reads state but does not change it. FALSE for any cache not
+ * running REPL_MARKED_RRIP, whenever --marked_rrip_bypass is off, and whenever the set has an
+ * invalid way (a free way is always taken, matching the Mockingjay rule). Writebacks must
+ * never be bypassed -- that is the caller's check, as it is for Mockingjay.
+ * Unlike Mockingjay there is NO state update for a bypassed fill: marked-RRIP has no sampler
+ * to train, the set is untouched, and in particular it does not age. */
+Flag cache_marked_should_bypass(Cache* cache, Addr addr, int insert_rrpv);
+/* Peek the one-line stream buffer's current occupant so the caller can drain it before it is
+ * displaced. Returns its data payload (NULL when the buffer is empty or disabled) and, via
+ * out-params, whether it is valid plus the line address to write back and the proc that owns
+ * it. cache_lib cannot read the payload's dirty bit, so the caller does that. Pure. */
+void* cache_stream_buf_peek(Cache* cache, Flag* valid, Addr* line_addr, uns8* proc_id);
+/* Install `addr` as the stream buffer's occupant, discarding the previous one. The caller MUST
+ * have drained a dirty previous occupant first (see cache_stream_buf_peek). Returns the new
+ * occupant's data pointer, zeroed, for the caller to fill in as it would a normal fill; NULL
+ * if the buffer is disabled, in which case the fill is simply dropped. */
+void* cache_stream_buf_install(Cache* cache, uns8 proc_id, Addr addr, Addr* line_addr);
+/* TRUE if the most recent cache_access on `cache` was served by the stream buffer rather than
+ * the data array. Cleared at the top of every access, so read it immediately after the one it
+ * describes. Exists because cache_lib.c keeps no stats of its own. */
+Flag cache_stream_buf_last_hit(Cache* cache);
 
 /* REPL_MOCKINGJAY: the strategy dispatcher passes no per-access context, so the accessing
  * PC / traffic class is staged one-shot right before the cache_access or cache_insert that
