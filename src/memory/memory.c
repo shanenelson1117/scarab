@@ -1800,6 +1800,19 @@ Flag mem_process_l1_hit_access(Mem_Req* req, Mem_Queue_Entry* l1_queue_entry, Ad
     STAT_EVENT(req->proc_id, L1_HIT);
     STAT_EVENT(req->proc_id, CORE_L1_HIT);
     STAT_EVENT(req->proc_id, L1_HIT_ONPATH + req->off_path);
+    /* --membound_stats: did this demand hit land on a line a membound (resp. FE-bound) access
+       brought in? Counted HERE, beside L1_HIT, and deliberately NOT next to the cache_access
+       in mem_complete_l1_access: that function returns FALSE and is re-run on a later cycle
+       whenever the access cannot complete (writeback unschedulable, queue full), so a counter
+       placed there fires once per RETRY and can exceed L1_HIT itself. Sharing this guard also
+       matches the population -- L1_HIT counts only the three demand types, so a counter that
+       also caught prefetch and writeback hits would not be comparable with it. */
+    if (MEMBOUND_STATS && membound_in_roi()) {
+      if (cache_last_hit_membound(&L1(req->proc_id)->cache))
+        STAT_EVENT(req->proc_id, L1_MEMBOUND_HIT);
+      else if (cache_last_hit_fe_bound(&L1(req->proc_id)->cache))
+        STAT_EVENT(req->proc_id, L1_FEBOUND_HIT);
+    }
     if (0 && DEBUG_EXC_INSERTS) {
       printf("addr:%s hit in L1 type:%s\n", hexstr64s(req->addr), Mem_Req_Type_str(req->type));
     }
@@ -1903,6 +1916,14 @@ Flag mem_process_mlc_hit_access(Mem_Req* req, Mem_Queue_Entry* mlc_queue_entry, 
       STAT_EVENT(req->proc_id, MLC_HIT);
       STAT_EVENT(req->proc_id, CORE_MLC_HIT);
       STAT_EVENT(req->proc_id, MLC_HIT_ONPATH + req->off_path);
+      /* --membound_stats: see the matching block beside L1_HIT for why it lives here and not
+         next to the cache_access (retry double-counting + request-type mismatch). */
+      if (MEMBOUND_STATS && membound_in_roi()) {
+        if (cache_last_hit_membound(&MLC(req->proc_id)->cache))
+          STAT_EVENT(req->proc_id, MLC_MEMBOUND_HIT);
+        else if (cache_last_hit_fe_bound(&MLC(req->proc_id)->cache))
+          STAT_EVENT(req->proc_id, MLC_FEBOUND_HIT);
+      }
       if (0 && DEBUG_EXC_INSERTS) {
         printf("addr:%s hit in MLC type:%s\n", hexstr64s(req->addr), Mem_Req_Type_str(req->type));
       }
@@ -2241,15 +2262,7 @@ static Flag mem_complete_l1_access(Mem_Req* req, Mem_Queue_Entry* l1_queue_entry
      reuse the bypass gave up? Must be read right after the access it describes. */
   if (data && cache_stream_buf_last_hit(&L1(req->proc_id)->cache))
     STAT_EVENT(req->proc_id, L1_MARKED_SB_HIT);
-  /* --membound_stats: a hit on a line that was brought in by a membound (resp. FE-bound)
-     access. Read immediately after cache_access -- the flag is cleared at the top of the next
-     one. Counted before FORCE_L1_MISS clears `data` below, so it reflects the real array. */
-  if (MEMBOUND_STATS && membound_in_roi() && data) {
-    if (cache_last_hit_membound(&L1(req->proc_id)->cache))
-      STAT_EVENT(req->proc_id, L1_MEMBOUND_HIT);
-    else if (cache_last_hit_fe_bound(&L1(req->proc_id)->cache))
-      STAT_EVENT(req->proc_id, L1_FEBOUND_HIT);
-  }
+
 
   // LLC set dueling: score this demand access against its leader group, then advance the
   // window. Must run right after cache_access -- the protected-hits metric reads the
@@ -2485,13 +2498,7 @@ static Flag mem_complete_mlc_access(Mem_Req* req, Mem_Queue_Entry* mlc_queue_ent
   /* A hit the data array missed and the one-line stream buffer caught -- see the L1 site. */
   if (data && cache_stream_buf_last_hit(&MLC(req->proc_id)->cache))
     STAT_EVENT(req->proc_id, MLC_MARKED_SB_HIT);
-  /* --membound_stats: see the matching block at the L1 access site. */
-  if (MEMBOUND_STATS && membound_in_roi() && data) {
-    if (cache_last_hit_membound(&MLC(req->proc_id)->cache))
-      STAT_EVENT(req->proc_id, MLC_MEMBOUND_HIT);
-    else if (cache_last_hit_fe_bound(&MLC(req->proc_id)->cache))
-      STAT_EVENT(req->proc_id, MLC_FEBOUND_HIT);
-  }
+
 
   // Set dueling: advance the selection window (instruction-clocked) once per MLC access.
   if (TD_COMBINED_ON_MLC && TD_COMBINED_SET_DUEL)
