@@ -194,6 +194,68 @@ static inline void td_combined_stage_fill(Mem_Req* req, int instr_depth, int dat
   cache_set_marked_next_insert(have_rrpv, rrpv);
 }
 
+/* --membound_stats_roi: are we past the warmup boundary, i.e. inside the region of interest?
+
+   Under --full_warmup the ordinary stat reset NEVER RUNS. sim.c only calls reset_stats(FALSE)
+   when WARMUP is set, and --full_warmup leaves WARMUP at 0; the FULL_WARMUP path instead just
+   DUMPS a .warmup snapshot and snapshots period_last_inst_count / period_last_cycle_count,
+   without zeroing a single counter. That is exactly why Periodic_Cycles (a delta against those
+   snapshots) is target-only while every DEF_STAT counter -- both <NAME>_count and
+   <NAME>_total_count -- spans warmup + target. So an ROI-only counter has to gate itself.
+
+   warmup_dump_done[0] is set the moment core 0 crosses FULL_WARMUP, which is the same instant
+   the period_last_* snapshots are taken. Gating here therefore puts these counters on exactly
+   the same window as Periodic_Instructions / Periodic_Cycles, so they can be divided by them.
+
+   With --warmup instead of --full_warmup, reset_stats(FALSE) does run at the boundary and
+   already clears <NAME>_count, so no gate is needed and this returns TRUE throughout. */
+static inline Flag membound_in_roi(void) {
+  if (!MEMBOUND_STATS_ROI)
+    return TRUE;  // count the whole run, warmup included
+  if (!FULL_WARMUP)
+    return TRUE;  // no full-warmup boundary; --warmup's reset_stats already scopes the counters
+  return warmup_dump_done && warmup_dump_done[0];
+}
+
+/* --membound_stats: classify a fill by the signal of the access that caused it, and stage the
+   result for the cache_insert that follows.
+
+   This runs at FILL, not at miss, because that is the only point the signal exists: a load's
+   membound fraction is td_mem_cycles / td_window_cycles, accumulated cycle by cycle over its
+   dispatch->done window by lsq_tag_inflight_loads, so when the miss is issued the window has
+   barely started and the fraction is meaningless. topdown_load_record emits at completion for
+   the same reason.
+
+   Data and instruction lines use separate signals and separate gates and are mutually
+   exclusive: a data fill is classified from the demanding load's membound fraction against
+   TD_LOAD_REPLAY_THRESH, an instruction fill from the L1I fetch miss's front-end-bound
+   fraction against TD_FE_RRIP_THRESH. Deliberately the SAME gates the marked-RRIP policy uses,
+   so "membound" means one thing across the policy and the instrumentation.
+
+   Both fraction lookups are pure reads, and the whole thing is skipped when --membound_stats
+   is off, so this costs nothing in an unrelated run. Returns the classification so the caller
+   can also count the miss and its merges. */
+static inline void membound_classify_fill(Mem_Req* req, Flag* is_membound, Flag* is_fe_bound) {
+  *is_membound = FALSE;
+  *is_fe_bound = FALSE;
+  if (!MEMBOUND_STATS)
+    return;
+  if (req->type == MRT_IFETCH) {
+    double fe_frac = 0.0;
+    if (icache_fe_frac_for_line(req->proc_id, req->addr, &fe_frac) && fe_frac > (double)TD_FE_RRIP_THRESH)
+      *is_fe_bound = TRUE;
+  } else {
+    double frac = 0.0;
+    Addr   frac_pc = 0;
+    /* td_mlc_req_load_frac walks req->op_ptrs head-first and takes the FIRST valid demanding
+       load. Merges append with sl_list_add_tail, so that is normally the load whose miss
+       created this request -- i.e. "the first miss". Note the walk skips stale/freed op slots,
+       so if the original op is gone this falls through to a merged one. */
+    if (td_mlc_req_load_frac(req, &frac, &frac_pc) && frac > (double)TD_LOAD_REPLAY_THRESH)
+      *is_membound = TRUE;
+  }
+}
+
 /* TRUE if REPL_MARKED_RRIP would decline to allocate this fill in `cache`. The depths /
    thresholds / basic come from the level's own duel or static configuration, so the bypass
    decision is computed from exactly the values the insert would later stage.
@@ -2179,6 +2241,15 @@ static Flag mem_complete_l1_access(Mem_Req* req, Mem_Queue_Entry* l1_queue_entry
      reuse the bypass gave up? Must be read right after the access it describes. */
   if (data && cache_stream_buf_last_hit(&L1(req->proc_id)->cache))
     STAT_EVENT(req->proc_id, L1_MARKED_SB_HIT);
+  /* --membound_stats: a hit on a line that was brought in by a membound (resp. FE-bound)
+     access. Read immediately after cache_access -- the flag is cleared at the top of the next
+     one. Counted before FORCE_L1_MISS clears `data` below, so it reflects the real array. */
+  if (MEMBOUND_STATS && membound_in_roi() && data) {
+    if (cache_last_hit_membound(&L1(req->proc_id)->cache))
+      STAT_EVENT(req->proc_id, L1_MEMBOUND_HIT);
+    else if (cache_last_hit_fe_bound(&L1(req->proc_id)->cache))
+      STAT_EVENT(req->proc_id, L1_FEBOUND_HIT);
+  }
 
   // LLC set dueling: score this demand access against its leader group, then advance the
   // window. Must run right after cache_access -- the protected-hits metric reads the
@@ -2414,6 +2485,13 @@ static Flag mem_complete_mlc_access(Mem_Req* req, Mem_Queue_Entry* mlc_queue_ent
   /* A hit the data array missed and the one-line stream buffer caught -- see the L1 site. */
   if (data && cache_stream_buf_last_hit(&MLC(req->proc_id)->cache))
     STAT_EVENT(req->proc_id, MLC_MARKED_SB_HIT);
+  /* --membound_stats: see the matching block at the L1 access site. */
+  if (MEMBOUND_STATS && membound_in_roi() && data) {
+    if (cache_last_hit_membound(&MLC(req->proc_id)->cache))
+      STAT_EVENT(req->proc_id, MLC_MEMBOUND_HIT);
+    else if (cache_last_hit_fe_bound(&MLC(req->proc_id)->cache))
+      STAT_EVENT(req->proc_id, MLC_FEBOUND_HIT);
+  }
 
   // Set dueling: advance the selection window (instruction-clocked) once per MLC access.
   if (TD_COMBINED_ON_MLC && TD_COMBINED_SET_DUEL)
@@ -3687,6 +3765,11 @@ Flag mem_adjust_matching_request(Mem_Req* req, Mem_Req_Type type, Addr addr, uns
   }
 
   req->req_count++;
+  /* --membound_stats: a second (or later) DEMAND access missed on this line while the first
+     miss was still in flight. Counted here but classified at fill: whether the FIRST miss was
+     membound is not knowable yet -- its load's dispatch->done window has not finished. */
+  if (type == MRT_IFETCH || type == MRT_DFETCH || type == MRT_DSTORE)
+    req->demand_merge_count++;
   return SUCCESS_MERGED;
 }
 
@@ -3993,6 +4076,7 @@ static void mem_init_new_req(Mem_Req* new_req, Mem_Req_Type type, Mem_Queue_Type
   new_req->first_stalling_cycle = mem_req_type_is_stalling(type) ? new_req->start_cycle : MAX_CTR;
   new_req->op_count = 0;
   new_req->req_count = 1;
+  new_req->demand_merge_count = 0;
   new_req->done_func = done_func;
   new_req->mlc_hit = FALSE;
   new_req->mlc_miss = FALSE;
@@ -5002,6 +5086,38 @@ Flag l1_fill_line(Mem_Req* req) {
     td_combined_stage_fill(req, l1_instr_depth, l1_data_depth, l1_instr_thr, l1_data_thr, l1_basic);
   }
 
+
+  /* --membound_stats: classify this fill, stage the classification for the cache_insert below,
+     and count the miss it completes. The fill is the attribution point for the MISS too: a
+     miss cannot be classified when it is issued (the load's window has not accumulated), so
+     "membound misses" are counted here, once per line actually fetched.
+     MERGES: demand_merge_count is how many further demand accesses missed on this same line
+     while it was in flight. Classified now, by the first miss's signal, which is exactly the
+     definition wanted -- the re-misses themselves need not be membound. */
+  {
+    Flag mb_fill = FALSE, fe_fill = FALSE;
+    membound_classify_fill(req, &mb_fill, &fe_fill);
+    /* Stage the bit even during warmup: a line filled before the ROI that is REUSED inside it
+       must still be recognisable as membound, or the hit counter would miss it. Only the
+       counting below is scoped to the ROI. */
+    cache_set_next_fill_bound(mb_fill, fe_fill);
+    if (MEMBOUND_STATS && membound_in_roi()) {
+      if (mb_fill) {
+        STAT_EVENT(req->proc_id, L1_MEMBOUND_FILL);
+        if (req->demand_merge_count) {
+          STAT_EVENT(req->proc_id, L1_MEMBOUND_MERGE);
+          INC_STAT_EVENT(req->proc_id, L1_MEMBOUND_MERGE_REQS, req->demand_merge_count);
+        }
+      } else if (fe_fill) {
+        STAT_EVENT(req->proc_id, L1_FEBOUND_FILL);
+        if (req->demand_merge_count) {
+          STAT_EVENT(req->proc_id, L1_FEBOUND_MERGE);
+          INC_STAT_EVENT(req->proc_id, L1_FEBOUND_MERGE_REQS, req->demand_merge_count);
+        }
+      }
+    }
+  }
+
   // REPL_MOCKINGJAY: hand the fill its PC / traffic class (consumed by the insert below).
   mockingjay_stage_access(&L1(req->proc_id)->cache, req);
 
@@ -5399,6 +5515,38 @@ Flag mlc_fill_line(Mem_Req* req) {
       }
     }
     cache_set_marked_next_insert(have_rrpv, rrpv);
+  }
+
+
+  /* --membound_stats: classify this fill, stage the classification for the cache_insert below,
+     and count the miss it completes. The fill is the attribution point for the MISS too: a
+     miss cannot be classified when it is issued (the load's window has not accumulated), so
+     "membound misses" are counted here, once per line actually fetched.
+     MERGES: demand_merge_count is how many further demand accesses missed on this same line
+     while it was in flight. Classified now, by the first miss's signal, which is exactly the
+     definition wanted -- the re-misses themselves need not be membound. */
+  {
+    Flag mb_fill = FALSE, fe_fill = FALSE;
+    membound_classify_fill(req, &mb_fill, &fe_fill);
+    /* Stage the bit even during warmup: a line filled before the ROI that is REUSED inside it
+       must still be recognisable as membound, or the hit counter would miss it. Only the
+       counting below is scoped to the ROI. */
+    cache_set_next_fill_bound(mb_fill, fe_fill);
+    if (MEMBOUND_STATS && membound_in_roi()) {
+      if (mb_fill) {
+        STAT_EVENT(req->proc_id, MLC_MEMBOUND_FILL);
+        if (req->demand_merge_count) {
+          STAT_EVENT(req->proc_id, MLC_MEMBOUND_MERGE);
+          INC_STAT_EVENT(req->proc_id, MLC_MEMBOUND_MERGE_REQS, req->demand_merge_count);
+        }
+      } else if (fe_fill) {
+        STAT_EVENT(req->proc_id, MLC_FEBOUND_FILL);
+        if (req->demand_merge_count) {
+          STAT_EVENT(req->proc_id, MLC_FEBOUND_MERGE);
+          INC_STAT_EVENT(req->proc_id, MLC_FEBOUND_MERGE_REQS, req->demand_merge_count);
+        }
+      }
+    }
   }
 
   // REPL_MOCKINGJAY: hand the fill its PC / traffic class (consumed by the insert below).

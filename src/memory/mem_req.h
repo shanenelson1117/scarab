@@ -139,6 +139,12 @@ struct Mem_Req_struct {
   List op_uniques;
   uns op_count;                              /* number of ops that are waiting for the miss */
   uns req_count;                             /* number of requests coalesced into this one */
+  /* --membound_stats: how many additional DEMAND accesses missed on this line and merged into
+     this already-in-flight request. Distinct from req_count, which counts every coalesced
+     request including prefetch and writeback matches. Read at fill, where the demanding load's
+     membound fraction finally exists, to classify the merge -- the merge itself happens before
+     that signal is available, so it cannot be classified when it occurs. */
+  uns demand_merge_count;
   Flag (*done_func)(struct Mem_Req_struct*); /* pointer to function to call when
                                                 the memory request is finished
                                               */

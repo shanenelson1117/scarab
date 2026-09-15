@@ -884,6 +884,47 @@ DEF_STAT(  L1_MARKED_SB_HIT              ,  COUNT,  NO_RATIO  )
 DEF_STAT(  L1_MARKED_SB_EVICT            ,  COUNT,  NO_RATIO  )
 DEF_STAT(  L1_MARKED_SB_EVICT_DIRTY      ,  COUNT,  NO_RATIO  )
 
+/* --membound_stats. Classification is done AT FILL (a load's membound fraction only exists
+   once its dispatch->done window has run), and data vs instruction lines use separate signals
+   and separate gates, so a line is membound OR fe-bound OR neither.
+
+   *_FILL        one per line actually fetched whose causing access cleared its gate. This is
+                 the MPKI numerator: unique misses, NOT total missing accesses -- accesses that
+                 merged into an in-flight miss are counted by *_MERGE_REQS instead. Total
+                 membound missing accesses = L1_MEMBOUND_FILL + L1_MEMBOUND_MERGE_REQS.
+   *_HIT         hits on a resident line whose bit is set, i.e. reuse of a line that a
+                 membound (resp. FE-bound) access brought in. *_HIT / *_FILL is the payoff
+                 ratio the marking is meant to move.
+   *_MERGE       fills whose FIRST miss cleared the gate AND which had >= 1 further demand
+                 access miss on the line while it was in flight. The re-misses themselves are
+                 not required to be membound.
+   *_MERGE_REQS  total such re-misses, so *_MERGE_REQS / *_MERGE is the average pile-up depth
+                 behind one membound miss.
+
+   WINDOW: scoped to the REGION OF INTEREST by --membound_stats_roi (default TRUE), i.e. they
+   count only after core 0 crosses --full_warmup. That is the same instant the period_last_*
+   snapshots are taken, so these share a window with Periodic_Instructions / Periodic_Cycles
+   and MAY be divided by them -- membound MPKI = 1000 * L1_MEMBOUND_FILL / Periodic_Instructions.
+   The gate is required because under --full_warmup reset_stats never runs, so an ungated
+   DEF_STAT counter would span warmup + target like Cumulative_*. Set --membound_stats_roi 0
+   for whole-run counts, which must then be paired with Cumulative_Instructions instead. */
+DEF_STAT(  L1_MEMBOUND_FILL              ,  COUNT,  NO_RATIO  )
+DEF_STAT(  L1_MEMBOUND_HIT               ,  COUNT,  NO_RATIO  )
+DEF_STAT(  L1_MEMBOUND_MERGE             ,  COUNT,  NO_RATIO  )
+DEF_STAT(  L1_MEMBOUND_MERGE_REQS        ,  COUNT,  NO_RATIO  )
+DEF_STAT(  L1_FEBOUND_FILL               ,  COUNT,  NO_RATIO  )
+DEF_STAT(  L1_FEBOUND_HIT                ,  COUNT,  NO_RATIO  )
+DEF_STAT(  L1_FEBOUND_MERGE              ,  COUNT,  NO_RATIO  )
+DEF_STAT(  L1_FEBOUND_MERGE_REQS         ,  COUNT,  NO_RATIO  )
+DEF_STAT(  MLC_MEMBOUND_FILL             ,  COUNT,  NO_RATIO  )
+DEF_STAT(  MLC_MEMBOUND_HIT              ,  COUNT,  NO_RATIO  )
+DEF_STAT(  MLC_MEMBOUND_MERGE            ,  COUNT,  NO_RATIO  )
+DEF_STAT(  MLC_MEMBOUND_MERGE_REQS       ,  COUNT,  NO_RATIO  )
+DEF_STAT(  MLC_FEBOUND_FILL              ,  COUNT,  NO_RATIO  )
+DEF_STAT(  MLC_FEBOUND_HIT               ,  COUNT,  NO_RATIO  )
+DEF_STAT(  MLC_FEBOUND_MERGE             ,  COUNT,  NO_RATIO  )
+DEF_STAT(  MLC_FEBOUND_MERGE_REQS        ,  COUNT,  NO_RATIO  )
+
 DEF_STAT(  NORESET_L1_FILL               ,  COUNT,  NO_RATIO  )
 DEF_STAT(  NORESET_L1_FILL_NONPREF       ,  COUNT,  NO_RATIO  )
 DEF_STAT(  NORESET_L1_FILL_PREF          ,  COUNT,  NO_RATIO  )

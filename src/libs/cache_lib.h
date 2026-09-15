@@ -102,6 +102,18 @@ typedef struct Cache_Entry_struct {
                                Sticky for the line's lifetime -- marked_promote_rrpv is
                                rewritten on every hit, so it cannot answer this after the
                                first reuse. Read by the set-duel "protected hits" metric. */
+  /* --membound_stats: what the ACCESS THAT BROUGHT THIS LINE IN looked like, recorded at fill
+     and sticky for the line's lifetime. Independent of the replacement policy, so these hold
+     under SRRIP / tPLRU / Mockingjay exactly as under REPL_MARKED_RRIP -- unlike
+     marked_protected, which is only written by marked_rrip_update_insert and additionally
+     folds in where `basic` sat for that set.
+     A line is classified from the fill-time fraction, because that is the only point the
+     signal exists: td_mem_cycles / td_window_cycles accumulates over the load's dispatch->done
+     window (lsq_tag_inflight_loads), so at MISS time the window has barely started and the
+     fraction is meaningless. Data and instruction lines are classified on separate gates and
+     are mutually exclusive -- a line is one or the other or neither. */
+  Flag membound_fill;  /* data line, demanding load's membound fraction > TD_LOAD_REPLAY_THRESH */
+  Flag fe_bound_fill;  /* instruction line, fetch miss's FE-bound fraction > TD_FE_RRIP_THRESH */
   Flag outcome;       /* for replacement policy */
 } Cache_Entry;
 
@@ -186,6 +198,14 @@ typedef struct Cache_struct {
   Flag sb_enabled;
   Flag sb_last_hit;
   Cache_Entry sb;
+
+  /* --membound_stats: did the most recent cache_access on THIS cache hit a line that had been
+     brought in by a membound (resp. FE-bound) access? Cleared at the top of every access, so a
+     caller reads it immediately after the access it describes. Same publish-one-shot idea as
+     cache_marked_last_hit_protected, but per-cache rather than global, so the LLC and MLC
+     cannot clobber each other. cache_lib.c keeps no stats of its own; memory.c counts. */
+  Flag last_hit_membound;
+  Flag last_hit_fe_bound;
 } Cache;
 
 /**************************************************************************************/
@@ -247,6 +267,18 @@ Flag cache_marked_last_hit_protected(void);
  * (or never called) keeps the legacy min(0, inserted RRPV) hit behavior. One-shot: consumed
  * by the next marked_rrip hit. */
 void cache_set_hit_promote_frac(Flag have, double frac);
+
+/* --membound_stats: stage how the NEXT fill into any cache should be classified, one-shot, in
+ * the same style as cache_set_marked_next_insert. The caller computes it (only memory.c can --
+ * the membound / FE-bound fractions live on the op and the icache stage), and the next
+ * cache_insert stamps it onto the line it allocates. Consumed and cleared by that insert, so a
+ * fill that never happens (bypass, or an early FAILURE return) cannot leak its classification
+ * onto an unrelated later fill. Both FALSE = the line is neither, which is the default. */
+void cache_set_next_fill_bound(Flag membound, Flag fe_bound);
+/* TRUE if the most recent cache_access on `cache` hit a line that had been brought in by a
+ * membound (resp. FE-bound) access. Valid only immediately after that access. */
+Flag cache_last_hit_membound(Cache* cache);
+Flag cache_last_hit_fe_bound(Cache* cache);
 
 /* REPL_MARKED_RRIP allocation filter (--marked_rrip_bypass). TRUE when a fill arriving at
  * `insert_rrpv` would be strictly more distant than every resident line in its set -- i.e. it

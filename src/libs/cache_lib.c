@@ -94,6 +94,37 @@ uns ext_cache_index(Cache* cache, Addr addr, Addr* tag, Addr* line_addr) {
 }
 
 /**************************************************************************************/
+/* --membound_stats: one-shot classification for the next fill (see cache_lib.h).
+ *
+ * Staged by memory.c right before a cache_insert and consumed by whichever insert path runs:
+ * general_action_repl for the strategy policies (>= REPL_VOID), cache_insert_replpos for the
+ * rest -- REPL_TRUE_LRU, the DEFAULT for both the LLC and the MLC, is on the latter path, so
+ * both have to consume it or the bit would be silently dead in the default configuration. */
+static Flag g_next_fill_membound = FALSE;
+static Flag g_next_fill_fe_bound = FALSE;
+
+void cache_set_next_fill_bound(Flag membound, Flag fe_bound) {
+  g_next_fill_membound = membound;
+  g_next_fill_fe_bound = fe_bound;
+}
+
+/* Stamp the staged classification onto a freshly allocated line and clear the one-shot. */
+static inline void consume_fill_bound(Cache_Entry* line) {
+  line->membound_fill = g_next_fill_membound;
+  line->fe_bound_fill = g_next_fill_fe_bound;
+  g_next_fill_membound = FALSE;
+  g_next_fill_fe_bound = FALSE;
+}
+
+Flag cache_last_hit_membound(Cache* cache) {
+  return cache->last_hit_membound;
+}
+
+Flag cache_last_hit_fe_bound(Cache* cache) {
+  return cache->last_hit_fe_bound;
+}
+
+/**************************************************************************************/
 /* REPL_MARKED_RRIP one-line stream buffer (--marked_rrip_stream_buf).
  *
  * Holds the single line most recently declined by the bypass filter
@@ -207,6 +238,8 @@ void init_cache(Cache* cache, const char* name, uns cache_size, uns assoc, uns l
   cache->marked_age_ctr = NULL;
   cache->sb_enabled = FALSE;
   cache->sb_last_hit = FALSE;
+  cache->last_hit_membound = FALSE;
+  cache->last_hit_fe_bound = FALSE;
   memset(&cache->sb, 0, sizeof(cache->sb));
 
   if (repl_policy >= REPL_VOID) {
@@ -246,6 +279,8 @@ void init_cache(Cache* cache, const char* name, uns cache_size, uns assoc, uns l
     /* allocate memory for all of the data elements in each line */
     for (jj = 0; jj < assoc; jj++) {
       cache->entries[ii][jj].valid = FALSE;
+      cache->entries[ii][jj].membound_fill = FALSE;
+      cache->entries[ii][jj].fe_bound_fill = FALSE;
       if (data_size) {
         cache->entries[ii][jj].data = (void*)malloc(data_size);
         memset(cache->entries[ii][jj].data, 0, data_size);
@@ -323,6 +358,8 @@ void* cache_access(Cache* cache, Addr addr, Addr* line_addr, Flag update_repl) {
   void* line_data = NULL;
 
   cache->sb_last_hit = FALSE;
+  cache->last_hit_membound = FALSE;
+  cache->last_hit_fe_bound = FALSE;
 
   if (cache->repl_policy >= REPL_VOID) {
     void* strategy_data = cache_access_strategy(cache, addr, line_addr, update_repl);
@@ -351,6 +388,12 @@ void* cache_access(Cache* cache, Addr addr, Addr* line_addr, Flag update_repl) {
       ASSERT(0, line->data);
       DEBUG(0, "Found line in cache '%s' at (set %u, way %u, base 0x%s)\n", cache->name, set, ii,
             hexstr64s(line->base));
+
+      /* --membound_stats: publish how this line was brought in, for the caller's hit counter.
+         Independent of update_repl -- a warmup/oracle probe that hits a membound line has
+         still hit one. */
+      cache->last_hit_membound = line->membound_fill;
+      cache->last_hit_fe_bound = line->fe_bound_fill;
 
       if (update_repl) {
         if (line->pref) {
@@ -450,6 +493,7 @@ void* cache_insert_replpos(Cache* cache, uns8 proc_id, Addr addr, Addr* line_add
 
   new_line->pw_start_addr = addr;  // only means anything for uop cache
   new_line->marked_promote_rrpv = RRIP_DISTANT_VAL - 1;  // neutral; set at marked-RRIP insert
+  consume_fill_bound(new_line);    // --membound_stats: non-strategy path (incl. REPL_TRUE_LRU)
 
   switch (insert_repl_policy) {
     case INSERT_REPL_DEFAULT:
@@ -554,6 +598,10 @@ void cache_invalidate(Cache* cache, Addr addr, Addr* line_addr) {
       line->tag = 0;
       line->valid = FALSE;
       line->base = 0;
+      /* --membound_stats: the classification describes a line that is no longer here. Clearing
+         it stops a later fill that stages nothing from inheriting the old line's bits. */
+      line->membound_fill = FALSE;
+      line->fe_bound_fill = FALSE;
     }
   }
 
@@ -1439,6 +1487,10 @@ void* cache_access_strategy(Cache* cache, Addr addr, Addr* line_addr, Flag updat
     Cache_Entry* line = &cache->entries[set][ii];
 
     if (line->valid && line->tag == tag) {
+      /* --membound_stats: see the matching publish in cache_access. */
+      cache->last_hit_membound = line->membound_fill;
+      cache->last_hit_fe_bound = line->fe_bound_fill;
+
       if (update_repl)
         repl_policy_func_table[policy].update_hit(cache, set, ii, NULL);
 
@@ -1514,6 +1566,8 @@ void general_action_init(Cache* cache, const char* name, uns cache_size, uns ass
     for (jj = 0; jj < assoc; jj++) {
       cache->entries[ii][jj].valid = FALSE;
       cache->entries[ii][jj].marked_protected = FALSE;
+      cache->entries[ii][jj].membound_fill = FALSE;
+      cache->entries[ii][jj].fe_bound_fill = FALSE;
       if (data_size) {
         cache->entries[ii][jj].data = (void*)malloc(data_size);
         memset(cache->entries[ii][jj].data, 0, data_size);
@@ -1550,6 +1604,7 @@ void general_action_repl(Cache* cache, Cache_Entry* new_line, uns8 proc_id, Addr
   new_line->valid = TRUE;
   new_line->tag = tag;
   new_line->base = *line_addr;
+  consume_fill_bound(new_line);  // --membound_stats: strategy path (>= REPL_VOID)
 }
 
 /**************************************************************************************/

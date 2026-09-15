@@ -152,6 +152,55 @@ DEF_PARAM(td_load_rrip_mark, TD_LOAD_RRIP_MARK, Flag, Flag, FALSE, )
    case. Negative values are allowed (they protect unmarked lines) but make the "marked"
    distinction meaningless unless td_*_min_rrpv is pushed lower still. */
 DEF_PARAM(marked_rrip_basic_rrpv, MARKED_RRIP_BASIC_RRPV, int, int, 3, )
+/* Membound / FE-bound line instrumentation. When TRUE, every fill into the LLC and the MLC is
+   classified by the signal of the access that caused it -- a data fill by the demanding load's
+   membound fraction against --td_load_replay_thresh, an instruction fill by the L1I fetch
+   miss's front-end-bound fraction against --td_fe_rrip_thresh -- and the result is recorded as
+   a sticky bit on the cache line (Cache_Entry.membound_fill / .fe_bound_fill). Enables the
+   L1_/MLC_ MEMBOUND_* and FEBOUND_* stats: fills (= misses), hits on marked lines, and merges.
+
+   The bit is set at FILL, not at miss, because that is the only point the signal exists: a
+   load's membound fraction accumulates over its dispatch->done window, so at miss time the
+   window has not run yet. The same is true of the miss and merge counters, which are therefore
+   attributed at fill as well.
+
+   Independent of the replacement policy -- it works under REPL_TRUE_LRU (the default for both
+   levels), SRRIP, Mockingjay and REPL_MARKED_RRIP alike -- so membound hit rates are
+   comparable across policies. That is what distinguishes it from Cache_Entry.marked_protected,
+   which only exists under REPL_MARKED_RRIP and also encodes where that set's `basic` sat.
+   Default FALSE: costs nothing, and changes nothing, in a run that does not ask for it.
+
+   SET THE GATES EXPLICITLY. This knob reuses the policy's thresholds rather than owning its
+   own, and --td_load_replay_thresh DEFAULTS TO 0.0. Leaving it unset makes the data-side test
+   "fraction > 0", so a line counts as membound if its demanding load had even ONE memory-bound
+   cycle in its window -- i.e. nearly every demand-load fill -- while the instruction side still
+   uses a real gate (--td_fe_rrip_thresh defaults to 0.5). That asymmetry is silent and makes
+   MEMBOUND_* meaningless. Any descriptor enabling --membound_stats should pin BOTH gates; the
+   marked-RRIP sweeps use load 0.5 / fe 0.7. */
+DEF_PARAM(membound_stats, MEMBOUND_STATS, Flag, Flag, FALSE, )
+/* Scope the membound/FE-bound counters to the REGION OF INTEREST (post-warmup) rather than the
+   whole run. TRUE by default, because the whole-run reading is almost never the one wanted.
+
+   This gate is necessary, not cosmetic. Under --full_warmup the normal stat reset never runs:
+   sim.c calls reset_stats(FALSE) only when WARMUP is set, and --full_warmup leaves WARMUP at 0.
+   The FULL_WARMUP path merely dumps a .warmup snapshot and records period_last_inst_count /
+   period_last_cycle_count -- it zeroes nothing. That is why Periodic_Cycles (a delta against
+   those snapshots) is target-only while every DEF_STAT counter spans warmup + target. Without
+   this gate the membound counters would be full-run numbers that silently mix windows the
+   moment they were divided by Periodic_Instructions.
+
+   The gate opens when core 0 crosses --full_warmup, the same instant the period_last_*
+   snapshots are taken, so these counters share a window with Periodic_* exactly.
+
+   NOTE the line's classification bit is still stamped during warmup. A line filled before the
+   ROI and reused inside it is correctly counted as a membound hit; only the counting is
+   scoped. One boundary effect remains by construction: a miss issued during warmup whose FILL
+   lands after the boundary is counted, since the fill is the only point the signal exists.
+
+   Set FALSE to get whole-run counts (equivalent to the old behavior), e.g. to compare against
+   Cumulative_Instructions. With --warmup instead of --full_warmup this knob is inert: the real
+   reset_stats runs at the boundary and already scopes <NAME>_count. */
+DEF_PARAM(membound_stats_roi, MEMBOUND_STATS_ROI, Flag, Flag, TRUE, )
 /* Marked-RRIP victim selection. FALSE (default) = the stock SRRIP scan: find a line at exactly
    RRIP_DISTANT_VAL, otherwise increment every RRPV in the set and rescan. TRUE = evict the
    ARGMAX of reference_val (lowest way index wins ties, as the scan did) and age the set by
