@@ -225,6 +225,29 @@ static inline void td_stamp_op_outcome(Mem_Req* req, Flag is_mlc, Flag hit) {
   }
 }
 
+/* --marked_load_record / --marked_load_replay: a load that JOINS a request already in flight
+   (mem_adjust_matching_request appends it to req->op_ptrs) arrives after td_stamp_op_outcome may
+   have already walked that list for the L2 and/or LLC access -- nothing would ever stamp it, so
+   it read NA at those levels despite a dcache MISS. Copy whatever the request has already
+   resolved. Levels not yet resolved are left alone: this load is now on op_ptrs, so the normal
+   stamp at that access will reach it (including a retried access, which re-stamps the list).
+   mlc_miss / l1_miss are set by mem_process_{mlc,l1}_miss_access when the access resolves as a
+   miss; mlc_hit / l1_hit by mem_complete_{mlc,l1}_access. */
+static inline void td_stamp_joining_op(Mem_Req* req, Op* op) {
+  if (!MARKED_LOAD_RECORD && !MARKED_LOAD_REPLAY)
+    return;
+  if (!op || op->inst_info->table_info.mem_type != MEM_LD)
+    return;
+  if (req->mlc_hit)
+    op->td_mlc_outcome = TD_CACHE_HIT;
+  else if (req->mlc_miss)
+    op->td_mlc_outcome = TD_CACHE_MISS;
+  if (req->l1_hit)
+    op->td_llc_outcome = TD_CACHE_HIT;
+  else if (req->l1_miss)
+    op->td_llc_outcome = TD_CACHE_MISS;
+}
+
 /* --membound_stats_roi: are we past the warmup boundary, i.e. inside the region of interest?
 
    Under --full_warmup the ordinary stat reset NEVER RUNS. sim.c only calls reset_stats(FALSE)
@@ -3639,6 +3662,7 @@ Flag mem_adjust_matching_request(Mem_Req* req, Mem_Req_Type type, Addr addr, uns
     *op_ptr = op;
     op_unique = sl_list_add_tail(&req->op_uniques);
     *op_unique = op->unique_num;
+    td_stamp_joining_op(req, op);  /* inherit L2/LLC outcomes this request already resolved */
 
     if (op->inst_info->table_info.mem_type == MEM_ST && !op->off_path)
       req->dirty_l0 = TRUE;

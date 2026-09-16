@@ -320,10 +320,18 @@ void marked_load_finish(void) {
     td_load_mkdir_p(TD_LOAD_DIR);
     FILE* fp = fopen(path, "wb");
     ASSERTM(p, fp, "--marked_load_record: cannot write '%s'\n", path);
-    uns64 nbits = g_mload_idx[p];              /* only the ordinals actually retired */
+    uns64 nbits = g_mload_idx[p];              /* every retired load, marked or not */
     uns64 nbytes = (nbits + 7) / 8;
+    /* The buffer is only grown when a bit is SET, so it reaches the last MARKED load -- but the
+       file must cover every RETIRED load, and loads keep retiring after the last marked one.
+       Without this the fwrite below read past the end of the buffer (garbage bits = random
+       loads silently entering the replay population, or a crash), and a record run that marked
+       nothing wrote a header with no body. mload_ensure zero-fills the growth, so every load past
+       the last marked one correctly reads as unmarked. */
+    if (nbits)
+      mload_ensure(p, nbits - 1);
     fwrite(&nbits, sizeof(nbits), 1, fp);
-    if (nbytes && g_mload_bits[p])
+    if (nbytes)
       fwrite(g_mload_bits[p], 1, nbytes, fp);
     fclose(fp);
   }
