@@ -170,6 +170,13 @@ DEF_PARAM(marked_rrip_basic_rrpv, MARKED_RRIP_BASIC_RRPV, int, int, 3, )
    which only exists under REPL_MARKED_RRIP and also encodes where that set's `basic` sat.
    Default FALSE: costs nothing, and changes nothing, in a run that does not ask for it.
 
+   SELF-CONTAINED: this flag opens the per-load window measurement itself (topdown_idq_update), so
+   --td_load_track_enable is NOT needed and should be left off -- that flag's only additional
+   effect is to write two per-load CSVs, one row per retired load, which are very large.
+   The FE-bound half is the exception: the front-end window still has its own gate
+   (TD_FE_RRIP_MARK || TD_FE_RRIP_ON_MLC || TD_COMBINED_ON_MLC || TD_COMBINED_ON_L1), so FEBOUND_*
+   stays zero on a policy-free baseline.
+
    SET THE GATES EXPLICITLY. This knob reuses the policy's thresholds rather than owning its
    own, and --td_load_replay_thresh DEFAULTS TO 0.0. Leaving it unset makes the data-side test
    "fraction > 0", so a line counts as membound if its demanding load had even ONE memory-bound
@@ -185,8 +192,10 @@ DEF_PARAM(membound_stats, MEMBOUND_STATS, Flag, Flag, FALSE, )
    different configurations (op->unique_num is handed out at FETCH and consumed by wrong-path
    ops, so it moves with branch-predictor behaviour). Retirement is on-path only, so the
    sequence follows the trace's architectural order in every run.
-   Requires --td_load_track_enable 1 (or another gate) so the per-load window is measured; see
-   topdown_idq_update. Pair with --membound_stats 0: recording needs no line bits. */
+   Opens the per-load window measurement by itself (topdown_idq_update), so it does NOT need
+   --td_load_track_enable -- leave that off unless you also want its two per-load CSVs, which are
+   one row per retired load and very large. Pair with --membound_stats 0: recording needs no
+   line bits. */
 DEF_PARAM(marked_load_record, MARKED_LOAD_RECORD, Flag, Flag, FALSE, )
 /* Marked-load REPLAY run. Reads the bitmap a --marked_load_record run wrote for the SAME trace
    and --td_load_dir, and for every retiring load whose bit is set counts the L2 and LLC outcome

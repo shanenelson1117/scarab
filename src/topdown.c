@@ -123,10 +123,22 @@ void topdown_bp_recovery(uns proc_id, Op* op) {
 
 void topdown_idq_update(uns proc_id, int count_available, int count_issued, int count_issued_on_path) {
   // per-load memory-boundness tracking: classify this cycle and tag every in-flight load's window
-  // (needed by the record pass, the in-sim gap-tracking mode, and the on-demand marked-RRIP
-  // policy which reads td_mem_cycles/td_window_cycles at fill time -- no record CSV)
+  // (needed by the record pass, the in-sim gap-tracking mode, the on-demand marked-RRIP policy
+  // which reads td_mem_cycles/td_window_cycles at fill time, and the membound accounting).
+  //
+  // MEMBOUND_STATS and MARKED_LOAD_RECORD open this gate ON THEIR OWN, so the accounting does not
+  // need --td_load_track_enable -- which additionally writes two per-load CSVs (one row per
+  // retired load) and is far too heavy to turn on just to get counters. That CSV writer is gated
+  // separately, on TD_LOAD_TRACK_ENABLE alone, in topdown_load_record.
+  //
+  // Opening this gate is behaviour-neutral: it only increments td_window_cycles/td_mem_cycles, and
+  // every reader of those is independently gated (TD_LOAD_RRIP_MARK, TD_COMBINED_*, bypass,
+  // TD_LOAD_EVICT_TRACK, TD_LOAD_TRACK_ENABLE, or the accounting flags themselves).
+  //
+  // MARKED_LOAD_REPLAY is deliberately NOT listed: replay counts outcomes by ordinal and never
+  // reads a window, so it does not pay for the per-cycle walk of the load queue.
   if (TD_LOAD_TRACK_ENABLE || TD_LOAD_EVICT_TRACK || TD_LOAD_RRIP_MARK || TD_COMBINED_ON_MLC ||
-      TD_COMBINED_ON_L1) {
+      TD_COMBINED_ON_L1 || MEMBOUND_STATS || MARKED_LOAD_RECORD) {
     Flag backend_stall = (count_issued == 0 && idq_stage_get_stage_data()->op_count > 0);
     Flag mem_bound_cycle = backend_stall && (lsq_get_in_flight_load_num() > 0);
     lsq_tag_inflight_loads(mem_bound_cycle);
@@ -328,28 +340,42 @@ void marked_load_finish(void) {
 void topdown_load_retire(uns proc_id, Op* op) {
   if (op->inst_info->table_info.mem_type != MEM_LD)
     return;
-  if (op->td_window_cycles == 0)
+
+  // The stable identity: this load's retired-load ordinal. It MUST advance for every retiring
+  // load, BEFORE any other early return. It previously sat after a `td_window_cycles == 0`
+  // return, which broke both halves of record/replay:
+  //   - a replay run does not open the window-tagging gate (it does not need a window), so every
+  //     load has td_window_cycles == 0 there -- the ordinal would never advance and nothing would
+  //     ever be counted;
+  //   - even with the gate open, whether a given load ends up with a zero-length window depends
+  //     on timing, which the policy under test changes, so the two runs' ordinals could drift
+  //     apart and silently match the wrong instances.
+  const Flag  mload = MARKED_LOAD_RECORD || MARKED_LOAD_REPLAY;
+  const uns64 ord   = mload ? g_mload_idx[proc_id]++ : 0;
+
+  const Flag have_window = (op->td_window_cycles != 0);
+  if (have_window) {
+    // in-sim eviction tracking: distinct fills into set(l) between exceeding reuses of line l
+    if (TD_LOAD_EVICT_TRACK)
+      td_load_evict_note_access(op);
+
+    // The per-load membound CSVs (PC- and address-keyed). Gated INSIDE topdown_load_record on
+    // TD_LOAD_TRACK_ENABLE alone, so the accounting flags never cause them to be written.
+    topdown_load_record(proc_id, op);
+  }
+
+  if (!mload)
     return;
-
-  // in-sim eviction tracking: distinct fills into set(l) between exceeding reuses of line l
-  if (TD_LOAD_EVICT_TRACK)
-    td_load_evict_note_access(op);
-
-  // The per-load membound CSVs (PC- and address-keyed), emitted once per retiring load.
-  topdown_load_record(proc_id, op);
-
-  if (!MARKED_LOAD_RECORD && !MARKED_LOAD_REPLAY)
-    return;
-
-  // The stable identity: this load's retired-load ordinal. Advanced for EVERY retiring load in
-  // both runs, so the two runs agree bit-for-bit on which ordinal is which load.
-  const uns64 ord = g_mload_idx[proc_id]++;
 
   if (MARKED_LOAD_RECORD) {
-    double frac = (double)op->td_mem_cycles / (double)op->td_window_cycles;
-    if (frac > (double)TD_LOAD_REPLAY_THRESH) {
-      mload_ensure(proc_id, ord);
-      g_mload_bits[proc_id][ord >> 3] |= (uns8)(1u << (ord & 7));
+    // A load with no measured window cannot be classified; it is left unmarked (bit clear) but
+    // still consumed its ordinal above, so later loads keep their correct positions.
+    if (have_window) {
+      double frac = (double)op->td_mem_cycles / (double)op->td_window_cycles;
+      if (frac > (double)TD_LOAD_REPLAY_THRESH) {
+        mload_ensure(proc_id, ord);
+        g_mload_bits[proc_id][ord >> 3] |= (uns8)(1u << (ord & 7));
+      }
     }
     return;
   }
