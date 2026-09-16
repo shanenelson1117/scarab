@@ -126,6 +126,12 @@ typedef struct Dp_Info_struct {
 /**************************************************************************************/
 /* typedef in globals/global_types.h */
 
+/* --marked_load_replay: per-op cache outcome carried to retirement (Op.td_mlc_outcome /
+   td_llc_outcome). NA is not a miss: it means the level was never consulted. */
+#define TD_CACHE_NA   0
+#define TD_CACHE_HIT  1
+#define TD_CACHE_MISS 2
+
 struct Op_struct {
   // {{{ op_pool stuff --- don't use outside of op pool management
   Flag op_pool_valid;  // is op allocated from the op_pool?
@@ -177,7 +183,16 @@ struct Op_struct {
   Counter td_window_cycles; // top-down per-load: cycles this load was in its dispatch->done window
   Counter td_mem_cycles;    // top-down per-load: subset of td_window_cycles classified memory-bound
   Flag td_forced_l1_hit;    // td_load_replay: load was force-completed at L1 latency; fill must not re-wake it
-  Flag td_recorded;         // td_load record: this load's membound row was already emitted at completion (emit once)
+  Flag td_recorded;         // td_load record: this load's membound row was already emitted (emit once)
+  /* --marked_load_replay: the L2 / LLC outcome this load experienced, carried from the access
+     (where hit/miss is resolved) to RETIREMENT (where the marked-load membership test runs).
+     TD_CACHE_NA means the level was never consulted -- a load satisfied by store-forwarding
+     never probes the L1D, an L1D hit never reaches the L2, and an
+     L2 hit never reaches the LLC -- so "not accessed" is a distinct and common third state and
+     must not be conflated with a miss. Zeroed by op_pool_setup_op's memset. */
+  uns8 td_dcache_outcome;
+  uns8 td_mlc_outcome;
+  uns8 td_llc_outcome;
   // }}}
 
   // {{{ path and fetch info

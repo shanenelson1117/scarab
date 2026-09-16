@@ -348,13 +348,13 @@ void lsq_tag_inflight_loads(Flag mem_bound_cycle) {
     // is well-defined for any load that returns, on-path or off-path.
     Flag in_window = (op->done_cycle == 0) || (cycle_count < op->done_cycle);
     if (!in_window) {
-      // Load has completed (its data is available to the pipeline). Emit its membound record
-      // row exactly once, here at completion, so the record matches where the marked-RRIP policy
-      // writes the RRPV (at the fill, when the data returns) rather than at retirement. This is
-      // path-agnostic -- off-path loads complete but never retire, so recording at completion is
-      // what lets any load that returns be recorded, mirroring the policy's path-agnostic write.
-      if (!op->td_recorded)
-        topdown_load_record(op->proc_id, op);  // idempotent; sets td_recorded when it writes
+      // Load has completed; its window is closed and td_mem_cycles/td_window_cycles are final.
+      // The record is NOT emitted here. It is emitted at RETIREMENT (topdown_load_retire), which
+      // makes the recorded sequence ON-PATH ONLY and therefore reproducible across runs: retired
+      // loads follow the trace order, whereas the set of loads that merely COMPLETE includes
+      // wrong-path loads whose count depends on branch prediction and so differs between
+      // configs. That stability is what lets a record run and a replay run agree on which
+      // dynamic load instance is which.
       continue;
     }
 

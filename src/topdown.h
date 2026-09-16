@@ -50,6 +50,10 @@ void topdown_load_retire(uns proc_id, Op* op);
  * Path-agnostic: any load that returns is recorded, on- or off-path. */
 void topdown_load_record(uns proc_id, Op* op);
 void topdown_done(uns proc_id);
+/* --marked_load_record: write the per-core retired-load membound bitmap. Called once at the end
+   of simulation; a no-op unless recording. See the block comment in topdown.c for the format
+   and for why the retired-load ordinal is the identity. */
+void marked_load_finish(void);
 /* Front-end-bound fraction fe/(fe+mem) over the dynamic-depth window (0.5 until warm). */
 double topdown_fe_bound_fraction(uns8 proc_id);
 

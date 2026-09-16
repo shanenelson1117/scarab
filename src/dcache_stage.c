@@ -51,6 +51,8 @@
 #include "prefetcher/stream_pref.h"
 
 #include "cmp_model.h"
+#include "libs/cache_lib.h"
+#include "memory/memory.h"
 #include "map.h"
 #include "model.h"
 #include "statistics.h"
@@ -597,9 +599,20 @@ static inline void dcache_cacheline_hit(Op* op, Addr line_addr, Dcache_Data* lin
 
   /* update stats */
   dcache_hit_wp_collect_stats(line, op);
+  /* --marked_load_replay: carry the dcache outcome to retirement, where the marked-load
+     membership test runs. Set directly on the op (unlike the L2/LLC, which must walk the
+     request's op list) because the dcache resolves hit/miss with the op in hand. */
+  op->td_dcache_outcome = TD_CACHE_HIT;
   if (!op->off_path) {
     STAT_EVENT(op->proc_id, DCACHE_HIT);
     STAT_EVENT(op->proc_id, DCACHE_HIT_ONPATH);
+    /* --membound_stats: a hit on a line a membound access brought in. Counted beside
+       DCACHE_HIT under the same on-path guard, so DCACHE_MEMBOUND_HIT <= DCACHE_HIT holds by
+       construction. cache_last_hit_membound is still valid here: the only access to dc->dcache
+       is the one in update_dcache_stage that led to this call, and the flag is per-cache, so
+       the intervening dc_pref_cache probe cannot clear it. */
+    if (MEMBOUND_STATS && membound_in_roi() && cache_last_hit_membound(&dc->dcache))
+      STAT_EVENT(op->proc_id, DCACHE_MEMBOUND_HIT);
   } else {
     STAT_EVENT(op->proc_id, DCACHE_HIT_OFFPATH);
   }
@@ -621,6 +634,14 @@ static inline void dcache_cacheline_hit(Op* op, Addr line_addr, Dcache_Data* lin
 }
 
 static inline void dcache_cacheline_miss(Op* op, Addr line_addr) {
+  /* --marked_load_replay: td_dcache_outcome is NOT stamped here. It is stamped only on the one
+     exit below that actually issues a memory request, so that "dcache MISS" implies the next
+     level was consulted -- which is what makes the cross-level identities hold:
+         MLC_NA == DCACHE_HIT + DCACHE_NA
+         L1_NA  == MLC_NA + MLC_HIT
+     The other two MEM_LD exits leave it at NA, correctly: a load satisfied by store-forwarding
+     never took data from the array, and a load that found no miss buffer is retried later and
+     will be stamped by whichever access finally resolves it. */
   if (op->inst_info->table_info.mem_type == MEM_ST)
     STAT_EVENT(op->proc_id, POWER_DCACHE_WRITE_MISS);
   else
@@ -655,6 +676,12 @@ static inline void dcache_cacheline_miss(Op* op, Addr line_addr) {
         STAT_EVENT(op->proc_id, DCACHE_MISS_WAITMEM);
         break;
       }
+
+      /* Request issued: this load genuinely missed the dcache and the L2 will now be consulted,
+         so the cross-level identity holds from here. Stamped after the request rather than at
+         function entry so the two exits above stay NA. Also covers the --td_load_replay
+         force-hit exit below, which still issued this request. */
+      op->td_dcache_outcome = TD_CACHE_MISS;
 
       if (PREF_UPDATE_ON_WRONGPATH || !op->off_path) {
         pref_dl0_miss(line_addr, op->inst_info->addr);
@@ -854,6 +881,42 @@ static inline Dcache_Data* dcache_fill_get_cacheline(Mem_Req* req) {
     // hit predictor: teach this load PC how membound it is when it actually misses
     if (have_frac && TD_LOAD_RRIP_HIT_PREDICT)
       td_load_pc_pred_update(frac_pc, frac);
+  }
+
+  /* --membound_stats: classify this fill by the demanding load that caused it, stage the bit
+     for the cache_insert below, and count the miss it completes. Same rule and same gate as the
+     L2/LLC classifier in memory.c: a data line is membound iff the oldest still-valid demanding
+     load's membound fraction exceeds --td_load_replay_thresh. There is no FE-bound counterpart
+     here -- the dcache holds only data.
+     Independent of TD_LOAD_RRIP_MARK above: that block only runs when the marked-RRIP policy is
+     on the dcache, whereas the accounting must work under any replacement policy. */
+  {
+    Flag mb_fill = FALSE;
+    if (MEMBOUND_STATS) {
+      Op** cop_p = (Op**)list_start_head_traversal(&req->op_ptrs);
+      Counter* cop_u = (Counter*)list_start_head_traversal(&req->op_uniques);
+      for (; cop_p; cop_p = (Op**)list_next_element(&req->op_ptrs),
+                    cop_u = (Counter*)list_next_element(&req->op_uniques)) {
+        Op* cop = *cop_p;
+        if (!cop || !cop_u || cop->unique_num != *cop_u || !cop->op_pool_valid)
+          continue;  // stale/freed op slot
+        if (cop->inst_info->table_info.mem_type != MEM_LD || cop->td_window_cycles == 0)
+          continue;
+        double cfrac = (double)cop->td_mem_cycles / (double)cop->td_window_cycles;
+        mb_fill = (cfrac > (double)TD_LOAD_REPLAY_THRESH) ? TRUE : FALSE;
+        break;  // oldest valid demanding load
+      }
+    }
+    /* Stage the bit even outside the ROI: a line filled during warmup and reused inside it must
+       still be recognisable. Only the counting below is ROI-scoped. */
+    cache_set_next_fill_bound(mb_fill, FALSE);
+    if (MEMBOUND_STATS && mb_fill && membound_in_roi()) {
+      STAT_EVENT(dc->proc_id, DCACHE_MEMBOUND_FILL);
+      if (req->demand_merge_count) {
+        STAT_EVENT(dc->proc_id, DCACHE_MEMBOUND_MERGE);
+        INC_STAT_EVENT(dc->proc_id, DCACHE_MEMBOUND_MERGE_REQS, req->demand_merge_count);
+      }
+    }
   }
 
   data = (Dcache_Data*)cache_insert(&dc->dcache, dc->proc_id, req->addr, &line_addr, &repl_line_addr);

@@ -925,6 +925,37 @@ DEF_STAT(  MLC_FEBOUND_HIT               ,  COUNT,  NO_RATIO  )
 DEF_STAT(  MLC_FEBOUND_MERGE             ,  COUNT,  NO_RATIO  )
 DEF_STAT(  MLC_FEBOUND_MERGE_REQS        ,  COUNT,  NO_RATIO  )
 
+/* --marked_load_replay: the L2 / LLC outcome of loads that the RECORD run measured as membound.
+   Counted at RETIREMENT, on the identity of the retired-load ordinal, and scoped to the region
+   of interest -- so these share the Periodic_Instructions window and may be divided by it.
+   *_NA means the level was never consulted (an L1D hit never reaches the L2; an L2 hit never
+   reaches the LLC). HIT + MISS + NA == MARKED_LOAD_RETIRED at each level, so NA is what keeps
+   a hit rate honest: use MISS/(HIT+MISS), never MISS/RETIRED.
+   MARKED_LOAD_BEYOND_RECORD counts retiring loads past the end of the recorded bitmap -- it
+   must be 0; anything else means the two runs did not cover the same instruction window. */
+DEF_STAT(  MARKED_LOAD_RETIRED            ,  COUNT,  NO_RATIO  )
+DEF_STAT(  MARKED_LOAD_BEYOND_RECORD      ,  COUNT,  NO_RATIO  )
+DEF_STAT(  MLC_MARKED_LOAD_HIT            ,  COUNT,  NO_RATIO  )
+DEF_STAT(  MLC_MARKED_LOAD_MISS           ,  COUNT,  NO_RATIO  )
+DEF_STAT(  MLC_MARKED_LOAD_NA             ,  COUNT,  NO_RATIO  )
+DEF_STAT(  L1_MARKED_LOAD_HIT             ,  COUNT,  NO_RATIO  )
+DEF_STAT(  L1_MARKED_LOAD_MISS            ,  COUNT,  NO_RATIO  )
+DEF_STAT(  L1_MARKED_LOAD_NA              ,  COUNT,  NO_RATIO  )
+
+/* --membound_stats / --marked_load_replay at the L1 DATA CACHE. The dcache holds only data, so
+   there is no FEBOUND counterpart here -- instruction fills never reach it.
+   DCACHE_MEMBOUND_FILL/HIT/MERGE mirror the L1_/MLC_ definitions one level up.
+   DCACHE_MARKED_LOAD_* is the retire-time outcome for loads the record run marked; *_NA here
+   means the load never probed the dcache at all (store-to-load forwarding, or a forced L1 hit
+   under --td_load_replay), which is a real third state and not a hit. */
+DEF_STAT(  DCACHE_MEMBOUND_FILL           ,  COUNT,  NO_RATIO  )
+DEF_STAT(  DCACHE_MEMBOUND_HIT            ,  COUNT,  NO_RATIO  )
+DEF_STAT(  DCACHE_MEMBOUND_MERGE          ,  COUNT,  NO_RATIO  )
+DEF_STAT(  DCACHE_MEMBOUND_MERGE_REQS     ,  COUNT,  NO_RATIO  )
+DEF_STAT(  DCACHE_MARKED_LOAD_HIT         ,  COUNT,  NO_RATIO  )
+DEF_STAT(  DCACHE_MARKED_LOAD_MISS        ,  COUNT,  NO_RATIO  )
+DEF_STAT(  DCACHE_MARKED_LOAD_NA          ,  COUNT,  NO_RATIO  )
+
 DEF_STAT(  NORESET_L1_FILL               ,  COUNT,  NO_RATIO  )
 DEF_STAT(  NORESET_L1_FILL_NONPREF       ,  COUNT,  NO_RATIO  )
 DEF_STAT(  NORESET_L1_FILL_PREF          ,  COUNT,  NO_RATIO  )

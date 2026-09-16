@@ -178,6 +178,25 @@ DEF_PARAM(marked_rrip_basic_rrpv, MARKED_RRIP_BASIC_RRPV, int, int, 3, )
    MEMBOUND_* meaningless. Any descriptor enabling --membound_stats should pin BOTH gates; the
    marked-RRIP sweeps use load 0.5 / fe 0.7. */
 DEF_PARAM(membound_stats, MEMBOUND_STATS, Flag, Flag, FALSE, )
+/* Marked-load RECORD run. Writes one bit per RETIRED LOAD to
+   <td_load_dir>/<trace>_marked_loads_pNN, set iff that dynamic load instance's membound
+   fraction exceeded --td_load_replay_thresh. Identity is the load's retired-load ordinal --
+   the Nth load to retire on that core -- which is the only identity stable across two runs of
+   different configurations (op->unique_num is handed out at FETCH and consumed by wrong-path
+   ops, so it moves with branch-predictor behaviour). Retirement is on-path only, so the
+   sequence follows the trace's architectural order in every run.
+   Requires --td_load_track_enable 1 (or another gate) so the per-load window is measured; see
+   topdown_idq_update. Pair with --membound_stats 0: recording needs no line bits. */
+DEF_PARAM(marked_load_record, MARKED_LOAD_RECORD, Flag, Flag, FALSE, )
+/* Marked-load REPLAY run. Reads the bitmap a --marked_load_record run wrote for the SAME trace
+   and --td_load_dir, and for every retiring load whose bit is set counts the L2 and LLC outcome
+   that load actually experienced (carried from its access to retirement in Op.td_mlc_outcome /
+   td_llc_outcome). Population is fixed by the record run while the policy varies -- which is
+   the point, because the membound fraction is endogenous: the policy changes the very stall the
+   fraction is measured from, so re-classifying in the policy run would move the population and
+   confound the comparison. Report results as "loads that WOULD HAVE BEEN membound under the
+   record configuration". A missing record file is fatal, not silent. */
+DEF_PARAM(marked_load_replay, MARKED_LOAD_REPLAY, Flag, Flag, FALSE, )
 /* Scope the membound/FE-bound counters to the REGION OF INTEREST (post-warmup) rather than the
    whole run. TRUE by default, because the whole-run reading is almost never the one wanted.
 

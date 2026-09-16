@@ -194,6 +194,37 @@ static inline void td_combined_stage_fill(Mem_Req* req, int instr_depth, int dat
   cache_set_marked_next_insert(have_rrpv, rrpv);
 }
 
+/* --marked_load_record / --marked_load_replay: stamp one cache level's outcome onto every load
+   waiting on this request, so it survives to RETIREMENT, where the marked-load membership test
+   runs. Hit/miss is resolved here, at access time; the test cannot happen here because a load's
+   stable identity (its retired-load ordinal) only exists at retire.
+
+   Idempotent by construction: it assigns a constant, so the retry re-entry of
+   mem_complete_*_access -- which re-runs whenever the access cannot complete -- cannot corrupt
+   it. That is exactly the hazard that made the earlier hit COUNTER wrong in the same function.
+
+   The op_uniques walk mirrors td_mlc_req_load_frac: an op slot can be freed and reused while a
+   request is in flight, so a slot is only trusted when its unique_num still matches. */
+static inline void td_stamp_op_outcome(Mem_Req* req, Flag is_mlc, Flag hit) {
+  if (!MARKED_LOAD_RECORD && !MARKED_LOAD_REPLAY)
+    return;
+  Op** op_p = (Op**)list_start_head_traversal(&req->op_ptrs);
+  Counter* op_u = (Counter*)list_start_head_traversal(&req->op_uniques);
+  for (; op_p; op_p = (Op**)list_next_element(&req->op_ptrs),
+               op_u = (Counter*)list_next_element(&req->op_uniques)) {
+    Op* op = *op_p;
+    if (!op || !op_u || op->unique_num != *op_u || !op->op_pool_valid)
+      continue;  // stale/freed op slot
+    if (op->inst_info->table_info.mem_type != MEM_LD)
+      continue;
+    uns8 v = hit ? TD_CACHE_HIT : TD_CACHE_MISS;
+    if (is_mlc)
+      op->td_mlc_outcome = v;
+    else
+      op->td_llc_outcome = v;
+  }
+}
+
 /* --membound_stats_roi: are we past the warmup boundary, i.e. inside the region of interest?
 
    Under --full_warmup the ordinary stat reset NEVER RUNS. sim.c only calls reset_stats(FALSE)
@@ -209,7 +240,7 @@ static inline void td_combined_stage_fill(Mem_Req* req, int instr_depth, int dat
 
    With --warmup instead of --full_warmup, reset_stats(FALSE) does run at the boundary and
    already clears <NAME>_count, so no gate is needed and this returns TRUE throughout. */
-static inline Flag membound_in_roi(void) {
+Flag membound_in_roi(void) {
   if (!MEMBOUND_STATS_ROI)
     return TRUE;  // count the whole run, warmup included
   if (!FULL_WARMUP)
@@ -2256,6 +2287,7 @@ static Flag mem_complete_l1_access(Mem_Req* req, Mem_Queue_Entry* l1_queue_entry
   if (mj_l1_staged)
     cache_set_mockingjay_next_access(FALSE, 0, FALSE, FALSE, 0);
   req->l1_hit = data ? TRUE : FALSE;
+  td_stamp_op_outcome(req, FALSE, req->l1_hit);   /* carry LLC outcome to retire */
   /* A hit the data array missed and the one-line stream buffer caught (--marked_rrip_stream_buf).
      It is a real hit and is already counted as one above; this only says where it came from.
      L1_MARKED_SB_HIT / L1_MARKED_BYPASS is the headline ratio: does the buffer recover the
@@ -2495,6 +2527,7 @@ static Flag mem_complete_mlc_access(Mem_Req* req, Mem_Queue_Entry* mlc_queue_ent
   if (td_mlc_pred_staged)
     cache_set_hit_promote_frac(FALSE, 0.0);  // clear one-shot (consumed on hit; drop on miss)
   req->mlc_hit = data ? TRUE : FALSE;
+  td_stamp_op_outcome(req, TRUE, req->mlc_hit);   /* carry L2 outcome to retire */
   /* A hit the data array missed and the one-line stream buffer caught -- see the L1 site. */
   if (data && cache_stream_buf_last_hit(&MLC(req->proc_id)->cache))
     STAT_EVENT(req->proc_id, MLC_MARKED_SB_HIT);

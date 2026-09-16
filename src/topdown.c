@@ -32,6 +32,8 @@
 #include "topdown.h"
 
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 #include "globals/assert.h"
 #include "globals/global_defs.h"
@@ -47,6 +49,7 @@
 #include "node_stage.h"
 #include "op.h"
 #include "td_load_replay.h"
+#include "memory/memory.h"
 
 const static uns64 TOPDOWN_SCALE_FACTOR = 10000;
 const static int TOPDOWN_RECOVERY_DEPTH = 2;
@@ -215,11 +218,112 @@ void topdown_exec_update(uns proc_id, uns8 fus_busy) {
   }
 }
 
+/**************************************************************************************/
+/* Marked-load record / replay (--marked_load_record, --marked_load_replay).
+ *
+ * THE IDENTITY. A dynamic load instance is identified by its RETIRED-LOAD ORDINAL: the Nth
+ * load to retire on this core. That is the only identity stable across two runs of different
+ * configurations. op->unique_num is not -- it is handed out at FETCH and consumed by wrong-path
+ * ops too, so it shifts with branch-predictor behaviour, which shifts with cache configuration.
+ * Retired loads, by contrast, follow the trace's architectural order in every run. A separate
+ * per-load counter is used rather than inst_count because one instruction can decode to
+ * several uops (and in principle more than one load), so instruction index is not 1:1 here.
+ *
+ * RECORD RUN writes a bitmap with one bit per retired load: set iff that load's membound
+ * fraction (td_mem_cycles/td_window_cycles, final once the load has completed) exceeded
+ * --td_load_replay_thresh. The bitmap is indexed by ordinal, so it is ~1 bit per load rather
+ * than a row per load.
+ *
+ * REPLAY RUN reloads the bitmap, re-derives the same ordinals, and for each retiring load whose
+ * bit is set counts the L2/LLC outcome that op carried from its access (Op.td_mlc_outcome /
+ * td_llc_outcome, stamped by td_stamp_op_outcome in memory.c). The population is therefore
+ * FIXED BY THE BASELINE while the treatment varies -- which is the point: the membound fraction
+ * is endogenous (the policy changes the very stall it is measured from), so classifying in the
+ * policy run would move the population and confound the comparison. Read the resulting stats as
+ * "loads that WOULD HAVE BEEN membound under the record run's configuration".
+ *
+ * The file is keyed by the sanitized trace path (td_load_derive_csv_path), the one per-simpoint
+ * token both runs share. */
+
+static uns8* g_mload_bits[MAX_NUM_PROCS];      /* bitmap, indexed by retired-load ordinal */
+static uns64 g_mload_cap[MAX_NUM_PROCS];       /* allocated bits */
+static uns64 g_mload_idx[MAX_NUM_PROCS];       /* next retired-load ordinal */
+static Flag  g_mload_loaded[MAX_NUM_PROCS];    /* replay: bitmap read attempted */
+static uns64 g_mload_valid[MAX_NUM_PROCS];     /* replay: bits actually present in the file */
+
+static void mload_path(uns proc_id, char* out, size_t sz) {
+  char suffix[MAX_STR_LENGTH + 1];
+  snprintf(suffix, sizeof(suffix), "marked_loads_p%02u", proc_id);
+  td_load_derive_csv_path(TD_LOAD_DIR, suffix, out, sz);
+}
+
+static void mload_ensure(uns proc_id, uns64 bit) {
+  if (bit < g_mload_cap[proc_id])
+    return;
+  uns64 want = g_mload_cap[proc_id] ? g_mload_cap[proc_id] : (1ULL << 20);
+  while (want <= bit)
+    want <<= 1;
+  uns64 old_bytes = (g_mload_cap[proc_id] + 7) / 8;
+  uns64 new_bytes = (want + 7) / 8;
+  g_mload_bits[proc_id] = (uns8*)realloc(g_mload_bits[proc_id], new_bytes);
+  ASSERT(proc_id, g_mload_bits[proc_id]);
+  memset(g_mload_bits[proc_id] + old_bytes, 0, new_bytes - old_bytes);
+  g_mload_cap[proc_id] = want;
+}
+
+/* Replay: read the record run's bitmap once. A missing file is fatal rather than silently
+   counting nothing -- an empty marked-load population looks exactly like "the policy helped
+   every marked load", which is the worst way to be wrong. */
+static void mload_load(uns proc_id) {
+  if (g_mload_loaded[proc_id])
+    return;
+  g_mload_loaded[proc_id] = TRUE;
+
+  char path[MAX_STR_LENGTH + 1];
+  mload_path(proc_id, path, sizeof(path));
+  FILE* fp = fopen(path, "rb");
+  ASSERTM(proc_id, fp, "--marked_load_replay: cannot open record file '%s'. Run the baseline "
+                       "first with --marked_load_record 1 and the same --td_load_dir.\n", path);
+  uns64 nbits = 0;
+  size_t got = fread(&nbits, sizeof(nbits), 1, fp);
+  ASSERTM(proc_id, got == 1, "--marked_load_replay: '%s' is truncated (no header).\n", path);
+  uns64 nbytes = (nbits + 7) / 8;
+  g_mload_bits[proc_id] = (uns8*)calloc(1, nbytes ? nbytes : 1);
+  ASSERT(proc_id, g_mload_bits[proc_id]);
+  got = fread(g_mload_bits[proc_id], 1, nbytes, fp);
+  ASSERTM(proc_id, got == nbytes, "--marked_load_replay: '%s' truncated body (%llu of %llu "
+                                  "bytes).\n", path, (unsigned long long)got,
+          (unsigned long long)nbytes);
+  fclose(fp);
+  g_mload_cap[proc_id] = nbits;
+  g_mload_valid[proc_id] = nbits;
+}
+
+void marked_load_finish(void) {
+  if (!MARKED_LOAD_RECORD)
+    return;
+  for (uns p = 0; p < NUM_CORES; p++) {
+    char path[MAX_STR_LENGTH + 1];
+    mload_path(p, path, sizeof(path));
+    td_load_mkdir_p(TD_LOAD_DIR);
+    FILE* fp = fopen(path, "wb");
+    ASSERTM(p, fp, "--marked_load_record: cannot write '%s'\n", path);
+    uns64 nbits = g_mload_idx[p];              /* only the ordinals actually retired */
+    uns64 nbytes = (nbits + 7) / 8;
+    fwrite(&nbits, sizeof(nbits), 1, fp);
+    if (nbytes && g_mload_bits[p])
+      fwrite(g_mload_bits[p], 1, nbytes, fp);
+    fclose(fp);
+  }
+}
+
 /*
- * Called at retirement of a load. Handles the in-sim eviction tracking (which is
- * retire-scoped). The membound record CSV is NOT written here -- it is emitted at
- * COMPLETION by topdown_load_record(), so the record matches where the marked-RRIP
- * policy writes the RRPV (at the fill, when the load's data returns).
+ * Called at retirement of a load -- the anchor for everything retire-scoped.
+ *
+ * The membound record row IS written here (not at completion). Retirement is on-path only, so
+ * the recorded sequence follows the trace's architectural order and is reproducible across
+ * configurations; recording at completion also caught wrong-path loads, whose count varies with
+ * branch prediction and so made the sequence useless for matching instances between runs.
  */
 void topdown_load_retire(uns proc_id, Op* op) {
   if (op->inst_info->table_info.mem_type != MEM_LD)
@@ -231,13 +335,58 @@ void topdown_load_retire(uns proc_id, Op* op) {
   if (TD_LOAD_EVICT_TRACK)
     td_load_evict_note_access(op);
 
-  // Race-safety fallback: a load can complete and retire in the same cycle before
-  // lsq_tag_inflight_loads observes its completion transition (node_stage retire runs before
-  // the idq/lsq tag each cycle). topdown_load_record is idempotent (td_recorded guard) and uses
-  // the same completion-anchored window, so the emitted value is identical to an at-completion
-  // emit; this only guarantees such a load is not dropped. Off-path loads never retire, so they
-  // are covered solely by the completion hook.
+  // The per-load membound CSVs (PC- and address-keyed), emitted once per retiring load.
   topdown_load_record(proc_id, op);
+
+  if (!MARKED_LOAD_RECORD && !MARKED_LOAD_REPLAY)
+    return;
+
+  // The stable identity: this load's retired-load ordinal. Advanced for EVERY retiring load in
+  // both runs, so the two runs agree bit-for-bit on which ordinal is which load.
+  const uns64 ord = g_mload_idx[proc_id]++;
+
+  if (MARKED_LOAD_RECORD) {
+    double frac = (double)op->td_mem_cycles / (double)op->td_window_cycles;
+    if (frac > (double)TD_LOAD_REPLAY_THRESH) {
+      mload_ensure(proc_id, ord);
+      g_mload_bits[proc_id][ord >> 3] |= (uns8)(1u << (ord & 7));
+    }
+    return;
+  }
+
+  // ---- replay ----
+  mload_load(proc_id);
+  if (ord >= g_mload_valid[proc_id]) {
+    // The replay run retired more loads than the record run did. The two runs execute the same
+    // architectural stream, so this means they did not cover the same window (different
+    // inst_limit / warmup, or a truncated record). Count it rather than guessing.
+    STAT_EVENT(proc_id, MARKED_LOAD_BEYOND_RECORD);
+    return;
+  }
+  if (!(g_mload_bits[proc_id][ord >> 3] & (uns8)(1u << (ord & 7))))
+    return;  // this instance was not membound in the record run
+
+  // Scope to the region of interest, the same window the membound counters use, so a
+  // marked-load MPKI can be divided by Periodic_Instructions.
+  if (!membound_in_roi())
+    return;
+
+  STAT_EVENT(proc_id, MARKED_LOAD_RETIRED);
+  switch (op->td_dcache_outcome) {
+    case TD_CACHE_HIT:  STAT_EVENT(proc_id, DCACHE_MARKED_LOAD_HIT);  break;
+    case TD_CACHE_MISS: STAT_EVENT(proc_id, DCACHE_MARKED_LOAD_MISS); break;
+    default:            STAT_EVENT(proc_id, DCACHE_MARKED_LOAD_NA);   break;
+  }
+  switch (op->td_mlc_outcome) {
+    case TD_CACHE_HIT:  STAT_EVENT(proc_id, MLC_MARKED_LOAD_HIT);  break;
+    case TD_CACHE_MISS: STAT_EVENT(proc_id, MLC_MARKED_LOAD_MISS); break;
+    default:            STAT_EVENT(proc_id, MLC_MARKED_LOAD_NA);   break;
+  }
+  switch (op->td_llc_outcome) {
+    case TD_CACHE_HIT:  STAT_EVENT(proc_id, L1_MARKED_LOAD_HIT);  break;
+    case TD_CACHE_MISS: STAT_EVENT(proc_id, L1_MARKED_LOAD_MISS); break;
+    default:            STAT_EVENT(proc_id, L1_MARKED_LOAD_NA);   break;
+  }
 }
 
 /*
@@ -387,4 +536,5 @@ void topdown_done(uns proc_id) {
 
   /* Close the in-sim eviction-tracking log (td_load_evict_track mode) */
   td_load_evict_finish();
+  marked_load_finish();   /* --marked_load_record: flush the retired-load bitmap */
 }
