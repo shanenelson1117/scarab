@@ -920,6 +920,19 @@ static inline Dcache_Data* dcache_fill_get_cacheline(Mem_Req* req) {
   }
 
   data = (Dcache_Data*)cache_insert(&dc->dcache, dc->proc_id, req->addr, &line_addr, &repl_line_addr);
+
+  /* --early_evict_stats: residency of the line this fill displaced, thresholded against the
+     dcache's own access latency. Read immediately after the insert; cache_last_evict_age
+     returns FALSE when the fill took a free way, which is not an eviction. */
+  if (EARLY_EVICT_STATS && early_evict_in_roi()) {
+    Counter evict_age;
+    if (cache_last_evict_age(&dc->dcache, &evict_age)) {
+      STAT_EVENT(dc->proc_id, DCACHE_EVICT);
+      if (evict_age < (Counter)EARLY_EVICT_LAT_MULT * (Counter)DCACHE_CYCLES)
+        STAT_EVENT(dc->proc_id, DCACHE_EARLY_EVICT);
+    }
+  }
+
   ASSERT(dc->proc_id, req->emitted_cycle);
   ASSERT(dc->proc_id, cycle_count >= req->emitted_cycle);
   ASSERT(dc->proc_id, ((int)req->mlc_hit + (int)req->l1_hit) < 2);

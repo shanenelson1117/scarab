@@ -271,6 +271,22 @@ Flag membound_in_roi(void) {
   return warmup_dump_done && warmup_dump_done[0];
 }
 
+/* --early_evict_stats: same target-only window as membound_in_roi, on its own gate.
+
+   See that function for why an ROI-scoped counter has to gate itself under --full_warmup: the
+   ordinary reset_stats never runs, so every DEF_STAT counter otherwise spans warmup + target
+   while Periodic_* does not. Gating here puts *_EVICT / *_EARLY_EVICT on exactly the window
+   Periodic_Instructions and Periodic_Cycles measure, so they may be divided by those.
+
+   Separate from membound_in_roi rather than sharing it because that one answers to
+   --membound_stats_roi; the early-eviction counters are always target-only and must not change
+   window when an unrelated knob moves. */
+Flag early_evict_in_roi(void) {
+  if (!FULL_WARMUP)
+    return TRUE;  // no full-warmup boundary; --warmup's reset_stats already scopes the counters
+  return warmup_dump_done && warmup_dump_done[0];
+}
+
 /* --membound_stats: classify a fill by the signal of the access that caused it, and stage the
    result for the cache_insert that follows.
 
@@ -5233,6 +5249,19 @@ Flag l1_fill_line(Mem_Req* req) {
     data = (L1_Data*)cache_insert(&L1(req->proc_id)->cache, req->proc_id, req->addr, &line_addr, &repl_line_addr);
   }
 
+  /* --early_evict_stats: residency of the line the insert above displaced. Read immediately
+     after the insert -- both branches above go through cache_lib's insert paths, and the
+     published value is overwritten by the next insert on this cache. cache_last_evict_age
+     returns FALSE when the fill took a free way, which is not an eviction. */
+  if (EARLY_EVICT_STATS && early_evict_in_roi()) {
+    Counter evict_age;
+    if (cache_last_evict_age(&L1(req->proc_id)->cache, &evict_age)) {
+      STAT_EVENT(req->proc_id, L1_EVICT);
+      if (evict_age < (Counter)EARLY_EVICT_LAT_MULT * (Counter)L1_CYCLES)
+        STAT_EVENT(req->proc_id, L1_EARLY_EVICT);
+    }
+  }
+
   STAT_EVENT(req->proc_id, NORESET_L1_FILL);
   if (mem_req_type_is_prefetch(req->type) || req->demand_match_prefetch)
     STAT_EVENT(req->proc_id, NORESET_L1_FILL_PREF);
@@ -5647,6 +5676,18 @@ Flag mlc_fill_line(Mem_Req* req) {
   } else {
     data = (MLC_Data*)cache_insert(&MLC(req->proc_id)->cache, req->proc_id, req->addr, &line_addr, &repl_line_addr);
   }
+
+  /* --early_evict_stats: see the matching block in the L1 fill for why this reads immediately
+     after the insert. */
+  if (EARLY_EVICT_STATS && early_evict_in_roi()) {
+    Counter evict_age;
+    if (cache_last_evict_age(&MLC(req->proc_id)->cache, &evict_age)) {
+      STAT_EVENT(req->proc_id, MLC_EVICT);
+      if (evict_age < (Counter)EARLY_EVICT_LAT_MULT * (Counter)MLC_CYCLES)
+        STAT_EVENT(req->proc_id, MLC_EARLY_EVICT);
+    }
+  }
+
   /* this will make it bring the line into the mlc and then modify it */
   data->proc_id = req->proc_id;
 
@@ -5954,6 +5995,19 @@ L1_Data* l1_pref_cache_access(Mem_Req* req) {
 
   if (pref_data) {
     data = cache_insert(&L1(req->proc_id)->cache, req->proc_id, req->addr, &line_addr, &repl_line_addr);
+
+    /* --early_evict_stats: promoting a line out of the prefetch cache is a real LLC fill and
+       can evict, so it is counted on the same footing as the ordinary fill path above. Only
+       reachable when the separate prefetch L1 cache is configured. */
+    if (EARLY_EVICT_STATS && early_evict_in_roi()) {
+      Counter evict_age;
+      if (cache_last_evict_age(&L1(req->proc_id)->cache, &evict_age)) {
+        STAT_EVENT(req->proc_id, L1_EVICT);
+        if (evict_age < (Counter)EARLY_EVICT_LAT_MULT * (Counter)L1_CYCLES)
+          STAT_EVENT(req->proc_id, L1_EARLY_EVICT);
+      }
+    }
+
     STAT_EVENT(req->proc_id, L1_DATA_EVICT);
     STAT_EVENT(req->proc_id, L1_PREF_MOVE_L1);
     if (data) {

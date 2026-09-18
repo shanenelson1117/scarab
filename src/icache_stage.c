@@ -122,6 +122,30 @@ static inline void wp_process_icache_fill(Icache_Data* line, Mem_Req* req);
 
 static inline void icache_footprint_record(Addr line_addr);
 
+/* --early_evict_stats: count the eviction, if any, caused by the icache fill that just ran.
+ *
+ * A helper rather than four copies because the icache has four distinct paths that insert into
+ * ic->icache (the ideal-L2 fill, the ordinary miss fill, the prefetch fill, and promotion out
+ * of the prefetch icache), and all of them must count or the ratio understates.
+ *
+ * Call IMMEDIATELY after the cache_insert it belongs to: cache_last_evict_age describes the
+ * most recent insert on that cache only, and returns FALSE when the fill took a free way,
+ * which is not an eviction. Threshold is the icache's own access latency, per --early_evict_*;
+ * ICACHE_LATENCY is in core.param.def while the two knobs live in memory.param.def, both of
+ * which this file already includes. */
+static inline void icache_record_evict(void) {
+  Counter evict_age;
+
+  if (!EARLY_EVICT_STATS || !early_evict_in_roi())
+    return;
+  if (!cache_last_evict_age(&ic->icache, &evict_age))
+    return;
+
+  STAT_EVENT(ic->proc_id, ICACHE_EVICT);
+  if (evict_age < (Counter)EARLY_EVICT_LAT_MULT * (Counter)ICACHE_LATENCY)
+    STAT_EVENT(ic->proc_id, ICACHE_EARLY_EVICT);
+}
+
 static inline Flag is_fetch_barrier_op(Op* op) {
   return (op->inst_info->table_info.bar_type & BAR_FETCH) || IS_CALLSYS(&op->inst_info->table_info);
 }
@@ -420,6 +444,7 @@ Inst_Info** lookup_icache() {
       Addr dummy_repl_line_addr;
       line =
           (Inst_Info**)cache_insert(&ic->icache, ic->proc_id, ic->fetch_addr, &dummy_line_addr, &dummy_repl_line_addr);
+      icache_record_evict();  // --early_evict_stats
       icache_footprint_record(dummy_line_addr);
     } else
       STAT_EVENT(ic->proc_id, L2_IDEAL_MISS_ICACHE);
@@ -1121,6 +1146,7 @@ Flag icache_fill_line(Mem_Req* req)  // cmp FIXME maybe needed to be optimized
       cache_set_marked_next_insert(td_fe_have_rrpv, td_fe_rrpv);
     }
     ic->line = (Inst_Info**)cache_insert(&ic->icache, ic->proc_id, ic->fetch_addr, &ic->line_addr, &repl_line_addr);
+    icache_record_evict();  // --early_evict_stats
     DEBUG(ic->proc_id, "Got line switch into ic fetch %llx\n", ic->line_addr);
     STAT_EVENT(ic->proc_id, ICACHE_FILL);
     icache_footprint_record(ic->line_addr);
@@ -1196,6 +1222,7 @@ Flag icache_fill_line(Mem_Req* req)  // cmp FIXME maybe needed to be optimized
     if (TD_FE_RRIP_MARK)
       cache_set_marked_next_insert(FALSE, 0);
     line = (Inst_Info**)cache_insert(&ic->icache, ic->proc_id, req->addr, &dummy_addr, &repl_line_addr);
+    icache_record_evict();  // --early_evict_stats
     icache_footprint_record(dummy_addr);
 
     if (WP_COLLECT_STATS) {  // cmp IGNORE
@@ -1284,6 +1311,7 @@ Inst_Info** ic_pref_cache_access(void) {
   if (line) {
     inserted_line =
         (Inst_Info**)cache_insert(&ic->icache, ic->proc_id, ic->fetch_addr, &ic->line_addr, &repl_line_addr);
+    icache_record_evict();  // --early_evict_stats
     icache_footprint_record(ic->line_addr);
     DEBUG(ic->proc_id, "ic_pref cache hit:fetch_addr:0x%s \n", hexstr64(ic->fetch_addr));
     STAT_EVENT(ic->proc_id, IC_PREF_MOVE_IC);

@@ -166,6 +166,27 @@ DEF_PARAM(  map_stage_consume_from_icache_and_uoc_same_cycle, MAP_STAGE_CONSUME_
 // max uops in queue = uop_queue_length * (UOP_CACHE_WIDTH)
 DEF_PARAM(  uop_queue_length               , UOP_QUEUE_LENGTH                , uns    , uns     , 7                      ,       )
 
+/* --early_evict_stats: count lines replaced soon after they were filled.
+ *
+ * At every fill into the L1I, L1D, MLC and L1 (Scarab's name for the LLC), the line being
+ * replaced has its residency measured -- cycle_count at eviction minus cycle_count at its own
+ * fill -- and is counted as an eviction, plus as an EARLY eviction if that residency is below
+ * that cache's threshold. The clock runs from FILL, not from last access, so a line that was
+ * hit repeatedly and then replaced still counts as short-lived; this measures residency, not
+ * dead time.
+ *
+ * The threshold is per cache and derived, not absolute: EARLY_EVICT_LAT_MULT times that
+ * cache's own access latency in cycles (DCACHE_CYCLES, ICACHE_LATENCY, MLC_CYCLES, L1_CYCLES).
+ * At the default multiplier of 2 and the default latencies that is 4 / 6 / 24 / 48 cycles --
+ * deliberately tight, so a hit counts only lines replaced practically on arrival. Raise the
+ * multiplier to widen the window; it is a knob precisely so that sweeping it needs no rebuild.
+ *
+ * Both counters are TARGET-ONLY: they are gated on early_evict_in_roi(), so under
+ * --full_warmup they start at the warmup boundary and are on the same window as
+ * Periodic_Instructions / Periodic_Cycles. Do NOT divide them by Cumulative_*. */
+DEF_PARAM(early_evict_stats, EARLY_EVICT_STATS, Flag, Flag, FALSE, )
+DEF_PARAM(early_evict_lat_mult, EARLY_EVICT_LAT_MULT, uns, uns, 2, )
+
 /* L0 data */
 DEF_PARAM(dcache_size, DCACHE_SIZE, uns, uns, (64 * 1024), )
 DEF_PARAM(dcache_assoc, DCACHE_ASSOC, uns, uns, 1, )

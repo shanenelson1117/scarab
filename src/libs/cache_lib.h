@@ -114,6 +114,21 @@ typedef struct Cache_Entry_struct {
      are mutually exclusive -- a line is one or the other or neither. */
   Flag membound_fill;  /* data line, demanding load's membound fraction > TD_LOAD_REPLAY_THRESH */
   Flag fe_bound_fill;  /* instruction line, fetch miss's FE-bound fraction > TD_FE_RRIP_THRESH */
+
+  /* --early_evict_stats: cycle_count at the fill that installed THIS line. Subtracted from
+     cycle_count when the line is replaced to give its residency, which is what the early-
+     eviction counters threshold. Stamped by every insert path, whether or not the stat is
+     enabled -- it is one store on a line that is already being written, and making it
+     conditional would mean a line filled with the knob off could later be measured against a
+     stale stamp.
+
+     Deliberately cycle_count and NOT sim_time: the other timestamps in this struct
+     (last_access_time, insertion_time) are sim_time, which freq.c defines in FEMTOSECONDS, so
+     a sim_time delta is larger than the cycle count by a factor of the domain's cycle time.
+     The thresholds here are expressed in cycles (a multiple of the cache's own access latency
+     in cycles), so the stamp has to be in cycles too. */
+  Counter fill_cycle;
+
   Flag outcome;       /* for replacement policy */
 } Cache_Entry;
 
@@ -206,6 +221,19 @@ typedef struct Cache_struct {
      cannot clobber each other. cache_lib.c keeps no stats of its own; memory.c counts. */
   Flag last_hit_membound;
   Flag last_hit_fe_bound;
+
+  /* --early_evict_stats: residency of the line the most recent INSERT on THIS cache evicted.
+     last_evict_valid is FALSE when that insert took a free way and so evicted nothing; when it
+     is TRUE, last_evict_age is cycle_count - the victim's fill_cycle, in cycles.
+
+     Published rather than counted here for the same reason as last_hit_membound: cache_lib.c
+     keeps no stats and knows no cache's access latency, so the owner (memory.c, dcache_stage.c,
+     icache_stage.c) reads this right after its cache_insert returns and applies its own
+     threshold. Written by every insert path, so a reader always sees the insert it just made
+     and never a stale value from an earlier one. Per-cache, so the LLC and MLC cannot clobber
+     each other. */
+  Flag    last_evict_valid;
+  Counter last_evict_age;
 } Cache;
 
 /**************************************************************************************/
@@ -279,6 +307,16 @@ void cache_set_next_fill_bound(Flag membound, Flag fe_bound);
  * membound (resp. FE-bound) access. Valid only immediately after that access. */
 Flag cache_last_hit_membound(Cache* cache);
 Flag cache_last_hit_fe_bound(Cache* cache);
+
+/* --early_evict_stats: how long the line evicted by the most recent INSERT on `cache` had been
+ * resident, in CYCLES (cycle_count at eviction minus cycle_count at its fill).
+ *
+ * Returns FALSE, leaving *age untouched, when that insert evicted nothing -- it found a free
+ * way, or the policy declined to allocate. Returns TRUE and writes the residency otherwise.
+ * Valid only immediately after the cache_insert / cache_insert_replpos / cache_insert_lru it
+ * describes; call it before any other insert on the same cache. The caller compares *age
+ * against its own threshold, because cache_lib knows no cache's access latency. */
+Flag cache_last_evict_age(Cache* cache, Counter* age);
 
 /* REPL_MARKED_RRIP allocation filter (--marked_rrip_bypass). TRUE when a fill arriving at
  * `insert_rrpv` would be strictly more distant than every resident line in its set -- i.e. it

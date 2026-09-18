@@ -349,12 +349,14 @@ void lsq_tag_inflight_loads(Flag mem_bound_cycle) {
     // The three --td_load_window_* knobs below reshape this window; all default to the behaviour
     // described here.
 
-    // --td_load_window_start 1: the window opens at the first dcache access instead of at
-    // dispatch, so the address-generation / scheduling wait is excluded and only the cache and
-    // memory service time is measured. op_pool_setup_op initializes dcache_cycle to MAX_CTR and
-    // dcache_stage sets it to cycle_count on every access it performs, so "!= MAX_CTR" is a
-    // monotone "this load has been sent to the cache at least once" test: a re-access (port or
-    // MSHR retry) only moves it later, it never returns it to MAX_CTR.
+    // --td_load_window_start 1: the window opens when the load itself goes to the cache -- the
+    // cycle its own address probes the L1D array -- instead of at dispatch. dcache_stage stamps
+    // op->dcache_cycle right after that cache_access, and turns an op away BEFORE it (address
+    // not ready, or no read port), so those waits are excluded and what remains is the cache /
+    // memory service time. op_pool_setup_op initializes dcache_cycle to MAX_CTR, so "!= MAX_CTR"
+    // is a monotone "this load has probed the cache at least once" test: an MSHR-starvation
+    // re-probe only moves the stamp later, it never returns it to MAX_CTR, so that wait lands
+    // inside the window instead of restarting it.
     if (TD_LOAD_WINDOW_START == 1 && op->dcache_cycle == MAX_CTR)
       continue;
 

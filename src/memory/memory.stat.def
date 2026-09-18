@@ -956,6 +956,34 @@ DEF_STAT(  DCACHE_MARKED_LOAD_HIT         ,  COUNT,  NO_RATIO  )
 DEF_STAT(  DCACHE_MARKED_LOAD_MISS        ,  COUNT,  NO_RATIO  )
 DEF_STAT(  DCACHE_MARKED_LOAD_NA          ,  COUNT,  NO_RATIO  )
 
+/* --early_evict_stats: how often a line is replaced shortly after it was filled.
+
+   *_EVICT        every replacement of a VALID line in that cache. A fill that took a free way
+                  evicts nothing and is not counted, so this is strictly less than *_FILL over
+                  a cold cache and converges to it once the cache is warm.
+   *_EARLY_EVICT  the subset whose residency (cycle_count at eviction minus cycle_count at its
+                  own fill) was below --early_evict_lat_mult times that cache's access latency
+                  in cycles -- DCACHE_CYCLES, ICACHE_LATENCY, MLC_CYCLES, L1_CYCLES
+                  respectively. Printed as a RATIO of *_EVICT, so the output column IS the
+                  fraction of evictions that were premature; that is the number to compare
+                  across replacement policies.
+
+   Residency is measured FROM FILL, so a line that was hit many times before being replaced
+   still counts as short-lived. This is line residency, not dead time.
+
+   WINDOW: both counters are gated on early_evict_in_roi(), so under --full_warmup they cover
+   the TARGET ONLY and sit on the same window as Periodic_Instructions / Periodic_Cycles --
+   divide by those for a per-kilo-instruction rate, never by Cumulative_*, which spans warmup.
+   The ratio above is self-consistent because both halves carry the same gate. */
+DEF_STAT(  DCACHE_EVICT                   ,  COUNT,  NO_RATIO       )
+DEF_STAT(  DCACHE_EARLY_EVICT             ,  RATIO,  DCACHE_EVICT   )
+DEF_STAT(  ICACHE_EVICT                   ,  COUNT,  NO_RATIO       )
+DEF_STAT(  ICACHE_EARLY_EVICT             ,  RATIO,  ICACHE_EVICT   )
+DEF_STAT(  MLC_EVICT                      ,  COUNT,  NO_RATIO       )
+DEF_STAT(  MLC_EARLY_EVICT                ,  RATIO,  MLC_EVICT      )
+DEF_STAT(  L1_EVICT                       ,  COUNT,  NO_RATIO       )
+DEF_STAT(  L1_EARLY_EVICT                 ,  RATIO,  L1_EVICT       )
+
 DEF_STAT(  NORESET_L1_FILL               ,  COUNT,  NO_RATIO  )
 DEF_STAT(  NORESET_L1_FILL_NONPREF       ,  COUNT,  NO_RATIO  )
 DEF_STAT(  NORESET_L1_FILL_PREF          ,  COUNT,  NO_RATIO  )

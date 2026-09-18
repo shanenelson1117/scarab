@@ -251,6 +251,10 @@ int mem_get_req_count(uns proc_id);
    region of interest. Shared with topdown.c so the marked-load counters use the SAME window as
    the membound counters; see the definition in memory.c for why the gate is needed at all. */
 Flag membound_in_roi(void);
+/* --early_evict_stats: TRUE once past the --full_warmup boundary, so the *_EVICT /
+   *_EARLY_EVICT counters are target-only. Shared with dcache_stage.c and icache_stage.c so all
+   four caches' counters sit on one window. See the definition in memory.c. */
+Flag early_evict_in_roi(void);
 Flag mem_can_allocate_req_buffer(uns proc_id, Mem_Req_Type type, Flag for_l1_writeback);
 
 void open_mem_stat_interval_file(void);

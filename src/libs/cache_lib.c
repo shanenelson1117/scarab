@@ -125,6 +125,46 @@ Flag cache_last_hit_fe_bound(Cache* cache) {
 }
 
 /**************************************************************************************/
+/* --early_evict_stats: per-eviction line residency (see cache_lib.h).
+ *
+ * Every insert path calls stamp_fill_cycle on the line it allocates and record_evict_age on
+ * the victim BEFORE that line's fields are overwritten -- which is the only window where the
+ * victim is still readable. In cache_insert_replpos / cache_insert_lru that is right after
+ * find_repl_entry names the victim and before `new_line->valid = TRUE`; on the strategy path it
+ * is the top of general_action_repl, which likewise runs before that function sets valid.
+ *
+ * find_repl_entry is NOT the hook, even though every path goes through it: get_next_repl_line
+ * also calls it purely to peek at the next victim, and hooking there would count an eviction
+ * that never happens. */
+
+/* Record the residency of the line about to be replaced. A victim that is not valid is a free
+ * way, i.e. no eviction, and is published as such. */
+static inline void record_evict_age(Cache* cache, Cache_Entry* victim) {
+  if (victim && victim->valid) {
+    cache->last_evict_valid = TRUE;
+    /* cycle_count can only have advanced since the fill, but the subtraction is guarded anyway:
+       a line stamped in a faster clock domain than the one retiring it would otherwise
+       underflow Counter (unsigned) into an enormous residency that reads as "not early". */
+    cache->last_evict_age = (cycle_count > victim->fill_cycle) ? cycle_count - victim->fill_cycle : 0;
+  } else {
+    cache->last_evict_valid = FALSE;
+    cache->last_evict_age = 0;
+  }
+}
+
+/* Stamp a freshly allocated line with its fill time. */
+static inline void stamp_fill_cycle(Cache_Entry* line) {
+  line->fill_cycle = cycle_count;
+}
+
+Flag cache_last_evict_age(Cache* cache, Counter* age) {
+  if (!cache->last_evict_valid)
+    return FALSE;
+  *age = cache->last_evict_age;
+  return TRUE;
+}
+
+/**************************************************************************************/
 /* REPL_MARKED_RRIP one-line stream buffer (--marked_rrip_stream_buf).
  *
  * Holds the single line most recently declined by the bypass filter
@@ -240,6 +280,11 @@ void init_cache(Cache* cache, const char* name, uns cache_size, uns assoc, uns l
   cache->sb_last_hit = FALSE;
   cache->last_hit_membound = FALSE;
   cache->last_hit_fe_bound = FALSE;
+  /* --early_evict_stats: cleared here as well as at every insert, so a caller that reads it
+     before any insert has happened sees "no eviction" rather than garbage. This runs ahead of
+     the init_cache_strategy branch below, so both policy families get it. */
+  cache->last_evict_valid = FALSE;
+  cache->last_evict_age = 0;
   memset(&cache->sb, 0, sizeof(cache->sb));
 
   if (repl_policy >= REPL_VOID) {
@@ -281,6 +326,7 @@ void init_cache(Cache* cache, const char* name, uns cache_size, uns assoc, uns l
       cache->entries[ii][jj].valid = FALSE;
       cache->entries[ii][jj].membound_fill = FALSE;
       cache->entries[ii][jj].fe_bound_fill = FALSE;
+      cache->entries[ii][jj].fill_cycle = 0;  // --early_evict_stats
       if (data_size) {
         cache->entries[ii][jj].data = (void*)malloc(data_size);
         memset(cache->entries[ii][jj].data, 0, data_size);
@@ -484,6 +530,9 @@ void* cache_insert_replpos(Cache* cache, uns8 proc_id, Addr addr, Addr* line_add
           hexstr64s(new_line->tag), hexstr64s(new_line->base), cache->name, hexstr64s(*line_addr));
   }
 
+  /* --early_evict_stats: last look at the victim -- the stores below overwrite it. */
+  record_evict_age(cache, new_line);
+
   new_line->proc_id = proc_id;
   new_line->valid = TRUE;
   new_line->tag = tag;
@@ -494,6 +543,7 @@ void* cache_insert_replpos(Cache* cache, uns8 proc_id, Addr addr, Addr* line_add
   new_line->pw_start_addr = addr;  // only means anything for uop cache
   new_line->marked_promote_rrpv = RRIP_DISTANT_VAL - 1;  // neutral; set at marked-RRIP insert
   consume_fill_bound(new_line);    // --membound_stats: non-strategy path (incl. REPL_TRUE_LRU)
+  stamp_fill_cycle(new_line);      // --early_evict_stats: start this line's residency clock
 
   switch (insert_repl_policy) {
     case INSERT_REPL_DEFAULT:
@@ -1207,10 +1257,14 @@ void* cache_insert_lru(Cache* cache, uns8 proc_id, Addr addr, Addr* line_addr, A
           set, repl_index, hexstr64s(new_line->tag), hexstr64s(new_line->base), cache->name, hexstr64s(*line_addr));
   }
 
+  /* --early_evict_stats: last look at the victim -- the stores below overwrite it. */
+  record_evict_age(cache, new_line);
+
   new_line->proc_id = proc_id;
   new_line->valid = TRUE;
   new_line->tag = tag;
   new_line->base = *line_addr;
+  stamp_fill_cycle(new_line);  // --early_evict_stats: start this line's residency clock
   update_repl_policy(cache, new_line, set, repl_index, TRUE);
   if (cache->repl_policy == REPL_TRUE_LRU)
     new_line->last_access_time = 137;
@@ -1568,6 +1622,7 @@ void general_action_init(Cache* cache, const char* name, uns cache_size, uns ass
       cache->entries[ii][jj].marked_protected = FALSE;
       cache->entries[ii][jj].membound_fill = FALSE;
       cache->entries[ii][jj].fe_bound_fill = FALSE;
+      cache->entries[ii][jj].fill_cycle = 0;  // --early_evict_stats
       if (data_size) {
         cache->entries[ii][jj].data = (void*)malloc(data_size);
         memset(cache->entries[ii][jj].data, 0, data_size);
@@ -1600,11 +1655,16 @@ void general_action_init(Cache* cache, const char* name, uns cache_size, uns ass
 
 void general_action_repl(Cache* cache, Cache_Entry* new_line, uns8 proc_id, Addr tag, Addr* line_addr,
                          Addr* repl_line_addr) {
+  /* --early_evict_stats: new_line still holds the victim here -- the stores below overwrite it,
+     starting with `valid`, which record_evict_age reads. Must stay first. */
+  record_evict_age(cache, new_line);
+
   new_line->proc_id = proc_id;
   new_line->valid = TRUE;
   new_line->tag = tag;
   new_line->base = *line_addr;
   consume_fill_bound(new_line);  // --membound_stats: strategy path (>= REPL_VOID)
+  stamp_fill_cycle(new_line);    // --early_evict_stats: start this line's residency clock
 }
 
 /**************************************************************************************/

@@ -137,8 +137,15 @@ DEF_PARAM(td_load_dir, TD_LOAD_DIR, char*, string, ".", )
      0 (default)  at LSQ dispatch. Includes the address-generation and scheduling wait before the
                   access is even attempted, so a load blocked behind an unready base register
                   accrues window cycles it never spent at the cache.
-     1            at its first dcache access (op->dcache_cycle set in dcache_stage). Isolates the
-                  cache/memory service time.
+     1            when the load itself goes to the cache, i.e. the cycle its own address probes
+                  the L1D array (the cache_access in dcache_stage that stamps op->dcache_cycle).
+                  Cycles spent waiting for address generation (dcache_stage_addr_unready) or for
+                  a read port (OS_WAIT_DCACHE, which turns the op away BEFORE the access) are
+                  therefore excluded, leaving the cache/memory service time.
+                  "First" probe, not last: a load that misses with no miss buffer free goes to
+                  OS_WAIT_MEM and re-probes later, re-stamping dcache_cycle. The gate tests only
+                  whether the stamp exists, so that MSHR-starvation wait falls INSIDE the window
+                  rather than restarting it.
 
    td_load_window_end -- when a load STOPS accumulating:
      0 (default)  at completion (done_cycle), i.e. when the load's data comes back. This is a
