@@ -341,12 +341,30 @@ void lsq_tag_inflight_loads(Flag mem_bound_cycle) {
   const auto& load_entries = lsq_unit->get_queue(MEM_LD)->get_entries();
   for (const auto& entry : load_entries) {
     Op* op = entry.op;
-    // window = dispatch -> completion (done_cycle == 0 means not yet complete). The window
-    // closes when the load's data becomes available to the pipeline, which is a path-agnostic
-    // event: both on-path and off-path loads get done_cycle set when their data returns. This
-    // deliberately does NOT key off retire (an on-path-only event), so the membound fraction
-    // is well-defined for any load that returns, on-path or off-path.
-    Flag in_window = (op->done_cycle == 0) || (cycle_count < op->done_cycle);
+    // DEFAULT window = dispatch -> completion (done_cycle == 0 means not yet complete). The
+    // window closes when the load's data becomes available to the pipeline, which is a
+    // path-agnostic event: both on-path and off-path loads get done_cycle set when their data
+    // returns. By default this deliberately does NOT key off retire (an on-path-only event), so
+    // the membound fraction is well-defined for any load that returns, on-path or off-path.
+    // The three --td_load_window_* knobs below reshape this window; all default to the behaviour
+    // described here.
+
+    // --td_load_window_start 1: the window opens at the first dcache access instead of at
+    // dispatch, so the address-generation / scheduling wait is excluded and only the cache and
+    // memory service time is measured. op_pool_setup_op initializes dcache_cycle to MAX_CTR and
+    // dcache_stage sets it to cycle_count on every access it performs, so "!= MAX_CTR" is a
+    // monotone "this load has been sent to the cache at least once" test: a re-access (port or
+    // MSHR retry) only moves it later, it never returns it to MAX_CTR.
+    if (TD_LOAD_WINDOW_START == 1 && op->dcache_cycle == MAX_CTR)
+      continue;
+
+    // --td_load_window_end 1: hold the window open until the entry leaves the LQ, which
+    // lsq_commit does at retirement -- so a load whose data has returned keeps accruing while it
+    // waits in the ROB behind older ops. No done_cycle test is needed for that: this walk only
+    // ever sees entries still in the queue. (Off-path loads never retire; LSQ::recover pops them
+    // at the flush, which is where their window ends under this mode.)
+    Flag in_window = (TD_LOAD_WINDOW_END == 1) || (op->done_cycle == 0) ||
+                     (cycle_count < op->done_cycle);
     if (!in_window) {
       // Load has completed; its window is closed and td_mem_cycles/td_window_cycles are final.
       // The record is NOT emitted here. It is emitted at RETIREMENT (topdown_load_retire), which
@@ -361,5 +379,13 @@ void lsq_tag_inflight_loads(Flag mem_bound_cycle) {
     op->td_window_cycles++;
     if (mem_bound_cycle)
       op->td_mem_cycles++;
+
+    // --td_load_window_scope 1: credit only the LQ head, i.e. the oldest load still in its
+    // window. entries is a deque in dispatch order (allocate pushes back, free pops front and
+    // asserts FIFO), so the first entry that reaches this point IS that load, and stopping here
+    // caps the accounting at one load per cycle. This mirrors the front-end arm, where
+    // icache_tag_inflight_miss credits only the demand miss fetch is blocked on.
+    if (TD_LOAD_WINDOW_SCOPE == 1)
+      break;
   }
 }

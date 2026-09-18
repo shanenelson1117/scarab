@@ -122,6 +122,46 @@ DEF_PARAM(core_63_cycle_time, CORE_63_CYCLE_TIME, uns, uns, 312500, )
 DEF_PARAM(topdown_fu_exec_few, TOPDOWN_FU_EXEC_FEW, uns, uns, 0, )
 DEF_PARAM(td_load_track_enable, TD_LOAD_TRACK_ENABLE, Flag, Flag, FALSE, )
 DEF_PARAM(td_load_dir, TD_LOAD_DIR, char*, string, ".", )
+/* Per-load membound window shape. Both knobs act ONLY inside lsq_tag_inflight_loads, i.e. they
+   change which loads get td_window_cycles/td_mem_cycles credited on a given cycle. They do NOT
+   change how a cycle is classified memory-bound (that stays the global backend-stall AND
+   in-flight-load test in topdown_idq_update), and they are behaviour-neutral on their own: every
+   consumer of the fraction is separately gated.
+
+   WARNING: every consumer divides td_mem_cycles by td_window_cycles, so these knobs change the
+   recorded fraction itself. A --marked_load_replay run must use the SAME values as the
+   --marked_load_record run that wrote its bitmap, and a --td_load_replay threshold sweep must not
+   mix CSVs produced under different values.
+
+   td_load_window_start -- when a load STARTS accumulating:
+     0 (default)  at LSQ dispatch. Includes the address-generation and scheduling wait before the
+                  access is even attempted, so a load blocked behind an unready base register
+                  accrues window cycles it never spent at the cache.
+     1            at its first dcache access (op->dcache_cycle set in dcache_stage). Isolates the
+                  cache/memory service time.
+
+   td_load_window_end -- when a load STOPS accumulating:
+     0 (default)  at completion (done_cycle), i.e. when the load's data comes back. This is a
+                  path-agnostic event, so the fraction is well-defined for off-path loads too.
+     1            at retirement, i.e. when the entry leaves the LQ in lsq_commit. A load that has
+                  its data but sits in the ROB behind older ops keeps accruing window cycles.
+                  CAVEAT: retirement is an ON-PATH-ONLY event. An off-path load never retires --
+                  its entry is popped by LSQ::recover at the flush -- so under this mode an
+                  off-path load's window ends at the branch recovery instead, and how long that
+                  is depends on prediction, which varies between configs.
+
+   td_load_window_scope -- WHICH in-flight loads accumulate on a cycle:
+     0 (default)  every load in its window. N outstanding loads each get credited the same stalled
+                  cycle, so the per-load windows sum to far more than elapsed cycles.
+     1            only the oldest load still in its window (the LQ head, which is what blocks
+                  retirement). At most one load is credited per cycle -- the load-side analogue of
+                  the front-end arm, where icache_tag_inflight_miss credits only the single demand
+                  miss fetch is currently blocked on. A load that has completed but not yet retired
+                  is already out of its window and is skipped, so credit passes to the oldest
+                  INCOMPLETE load rather than stalling on a done-but-unretired head. */
+DEF_PARAM(td_load_window_start, TD_LOAD_WINDOW_START, uns, uns, 0, )
+DEF_PARAM(td_load_window_end, TD_LOAD_WINDOW_END, uns, uns, 0, )
+DEF_PARAM(td_load_window_scope, TD_LOAD_WINDOW_SCOPE, uns, uns, 0, )
 DEF_PARAM(td_load_replay, TD_LOAD_REPLAY, Flag, Flag, FALSE, )
 DEF_PARAM(td_load_replay_key, TD_LOAD_REPLAY_KEY, char*, string, "pc", )
 DEF_PARAM(td_load_replay_thresh, TD_LOAD_REPLAY_THRESH, float, float, 0.0, )
