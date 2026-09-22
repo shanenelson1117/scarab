@@ -311,87 +311,6 @@ Flag membound_in_roi(void) {
   return warmup_dump_done && warmup_dump_done[0];
 }
 
-/* --td_load_rrip_fixup: the load's membound window has closed, so td_mem_cycles/td_window_cycles
-   are FINAL. Rewrite the RRPV of every line this load's fill installed, at each level where the
-   line is still resident and still the same fill.
-
-   Called from lsq.cc at whichever event closes the window: completion (the default
-   --td_load_window_end 0) or retirement / branch recovery (mode 1). One-shot via
-   td_rrip_fixup_done, because the completion path re-tests every cycle the entry lingers in the
-   LQ and must not re-apply.
-
-   A level whose line is gone is counted, not repaired: nothing is re-inserted. Eviction already
-   happened and undoing it would be a different (and much larger) mechanism. */
-void td_load_rrip_window_closed(Op* op) {
-  if (!TD_LOAD_RRIP_FIXUP || !op || op->td_rrip_fixup_done)
-    return;
-  op->td_rrip_fixup_done = TRUE;
-  if (op->td_window_cycles == 0)
-    return;
-
-  const double frac = (double)op->td_mem_cycles / (double)op->td_window_cycles;
-  const Flag   count = early_evict_in_roi();
-
-  for (int lvl = 0; lvl < TD_RRIP_FIXUP_LEVELS; lvl++) {
-    Td_Rrip_Fixup* f = &op->td_rrip_fixup[lvl];
-    Cache*         cache = NULL;
-    int            try_stat, hit_stat, miss_stat;
-
-    if (!f->valid)
-      continue;
-
-    switch (lvl) {
-      case TD_RRIP_FIXUP_DCACHE:
-        cache = dcache_get_cache();
-        try_stat = DCACHE_RRIP_FIXUP_TRY;
-        hit_stat = DCACHE_RRIP_FIXUP_HIT;
-        miss_stat = DCACHE_RRIP_FIXUP_MISS;
-        break;
-      case TD_RRIP_FIXUP_MLC:
-        cache = &MLC(op->proc_id)->cache;
-        try_stat = MLC_RRIP_FIXUP_TRY;
-        hit_stat = MLC_RRIP_FIXUP_HIT;
-        miss_stat = MLC_RRIP_FIXUP_MISS;
-        break;
-      default:
-        cache = &L1(op->proc_id)->cache;
-        try_stat = L1_RRIP_FIXUP_TRY;
-        hit_stat = L1_RRIP_FIXUP_HIT;
-        miss_stat = L1_RRIP_FIXUP_MISS;
-        break;
-    }
-
-    /* The value the fill WOULD have chosen given the final fraction, using the configuration
-       that fill actually resolved -- so this differs from the provisional value only because
-       the fraction changed, never because the policy's selection moved underneath it. */
-    const int corrected = marked_rrip_rrpv_from_frac_basic(frac, f->depth, TD_LOAD_RRIP_EXTRAPOLATE,
-                                                           (double)TD_LOAD_RRIP_EXTRAP_ANCHOR, f->thresh, f->basic);
-    const int provisional = (TD_LOAD_RRIP_PROVISIONAL == 0) ? f->basic : f->depth;
-
-    if (count)
-      STAT_EVENT(op->proc_id, try_stat);
-
-    if (cache_rrpv_fixup(cache, f->line_addr, f->fill_cycle, corrected, f->basic)) {
-      if (count) {
-        STAT_EVENT(op->proc_id, hit_stat);
-        /* More negative == more protected, so a corrected value BELOW the provisional one is a
-           promotion. Counted across all levels: the question is how often the partial fraction
-           was wrong at all. */
-        if (corrected < provisional)
-          STAT_EVENT(op->proc_id, RRIP_FIXUP_PROMOTE);
-        else if (corrected > provisional)
-          STAT_EVENT(op->proc_id, RRIP_FIXUP_DEMOTE);
-        else
-          STAT_EVENT(op->proc_id, RRIP_FIXUP_SAME);
-      }
-    } else if (count) {
-      STAT_EVENT(op->proc_id, miss_stat);  // evicted, or refilled under a new generation
-    }
-
-    f->valid = FALSE;  // consumed
-  }
-}
-
 /* --early_evict_stats: same target-only window as membound_in_roi, on its own gate.
 
    See that function for why an ROI-scoped counter has to gate itself under --full_warmup: the
@@ -726,6 +645,89 @@ static void duel_cfg_for_addr(uns8 proc_id, Addr addr, int* depth_idx, int* basi
   }
   *depth_idx = g_duel_depth_sel[proc_id];
   *basic_val = duel_basic_now(proc_id);
+}
+
+/* --td_load_rrip_fixup: the load's membound window has closed, so td_mem_cycles/td_window_cycles
+   are FINAL. Rewrite the RRPV of every line this load's fill installed, at each level where the
+   line is still resident and still the same fill.
+
+   Called from lsq.cc at whichever event closes the window: completion (the default
+   --td_load_window_end 0) or retirement / branch recovery (mode 1). One-shot via
+   td_rrip_fixup_done, because the completion path re-tests every cycle the entry lingers in the
+   LQ and must not re-apply.
+
+   A level whose line is gone is counted, not repaired: nothing is re-inserted. Eviction already
+   happened and undoing it would be a different (and much larger) mechanism. */
+void td_load_rrip_window_closed(Op* op) {
+  if (!TD_LOAD_RRIP_FIXUP || !op || op->td_rrip_fixup_done)
+    return;
+  op->td_rrip_fixup_done = TRUE;
+  if (op->td_window_cycles == 0)
+    return;
+
+  const double frac = (double)op->td_mem_cycles / (double)op->td_window_cycles;
+  const Flag   count = early_evict_in_roi();
+
+  for (int lvl = 0; lvl < TD_RRIP_FIXUP_LEVELS; lvl++) {
+    Td_Rrip_Fixup* f = &op->td_rrip_fixup[lvl];
+    Cache*         cache = NULL;
+    /* Initialized although the switch below has a default that assigns all three: -Werror
+       builds enable -Wmaybe-uninitialized, which does not always see through a switch. */
+    int            try_stat = 0, hit_stat = 0, miss_stat = 0;
+
+    if (!f->valid)
+      continue;
+
+    switch (lvl) {
+      case TD_RRIP_FIXUP_DCACHE:
+        cache = dcache_get_cache();
+        try_stat = DCACHE_RRIP_FIXUP_TRY;
+        hit_stat = DCACHE_RRIP_FIXUP_HIT;
+        miss_stat = DCACHE_RRIP_FIXUP_MISS;
+        break;
+      case TD_RRIP_FIXUP_MLC:
+        cache = &MLC(op->proc_id)->cache;
+        try_stat = MLC_RRIP_FIXUP_TRY;
+        hit_stat = MLC_RRIP_FIXUP_HIT;
+        miss_stat = MLC_RRIP_FIXUP_MISS;
+        break;
+      default:
+        cache = &L1(op->proc_id)->cache;
+        try_stat = L1_RRIP_FIXUP_TRY;
+        hit_stat = L1_RRIP_FIXUP_HIT;
+        miss_stat = L1_RRIP_FIXUP_MISS;
+        break;
+    }
+
+    /* The value the fill WOULD have chosen given the final fraction, using the configuration
+       that fill actually resolved -- so this differs from the provisional value only because
+       the fraction changed, never because the policy's selection moved underneath it. */
+    const int corrected = marked_rrip_rrpv_from_frac_basic(frac, f->depth, TD_LOAD_RRIP_EXTRAPOLATE,
+                                                           (double)TD_LOAD_RRIP_EXTRAP_ANCHOR, f->thresh, f->basic);
+    const int provisional = (TD_LOAD_RRIP_PROVISIONAL == 0) ? f->basic : f->depth;
+
+    if (count)
+      STAT_EVENT(op->proc_id, try_stat);
+
+    if (cache_rrpv_fixup(cache, f->line_addr, f->fill_cycle, corrected, f->basic)) {
+      if (count) {
+        STAT_EVENT(op->proc_id, hit_stat);
+        /* More negative == more protected, so a corrected value BELOW the provisional one is a
+           promotion. Counted across all levels: the question is how often the partial fraction
+           was wrong at all. */
+        if (corrected < provisional)
+          STAT_EVENT(op->proc_id, RRIP_FIXUP_PROMOTE);
+        else if (corrected > provisional)
+          STAT_EVENT(op->proc_id, RRIP_FIXUP_DEMOTE);
+        else
+          STAT_EVENT(op->proc_id, RRIP_FIXUP_SAME);
+      }
+    } else if (count) {
+      STAT_EVENT(op->proc_id, miss_stat);  // evicted, or refilled under a new generation
+    }
+
+    f->valid = FALSE;  // consumed
+  }
 }
 
 /* Resolve the per-class depths / thresholds / basic RRPV a COMBINED-policy (--td_combined_on_mlc)
