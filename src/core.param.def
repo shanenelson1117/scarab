@@ -341,6 +341,46 @@ DEF_PARAM(td_load_rrip_extrapolate, TD_LOAD_RRIP_EXTRAPOLATE, Flag, Flag, FALSE,
    replay threshold is NOT consulted in extrapolate mode. Negative => fall back to
    TD_LOAD_REPLAY_THRESH. */
 DEF_PARAM(td_load_rrip_extrap_anchor, TD_LOAD_RRIP_EXTRAP_ANCHOR, float, float, -1.0, )
+/* --td_load_rrip_fixup: TWO-PHASE MARKING.
+
+   The problem: a fill has to name an RRPV at the instant the data returns, but the signal it
+   wants -- the demanding load's membound fraction td_mem_cycles/td_window_cycles -- is not
+   final then. The load's window is still open (it closes at done_cycle, or at RETIREMENT under
+   --td_load_window_end 1), so the fill reads a PARTIAL fraction, and nothing ever revisits the
+   line: reference_val is written only by update_insert, update_hit and aging.
+
+   With this on, the fill instead installs a PROVISIONAL RRPV (--td_load_rrip_provisional), the
+   load remembers which line it installed at each level (Op.td_rrip_fixup), and when its window
+   closes the RRPV is rewritten from the FINAL fraction -- if the line is still resident and is
+   still the same fill. See td_load_rrip_window_closed in memory.c.
+
+   Scope note: under the DEFAULT window (--td_load_window_end 0) the window closes at
+   done_cycle, a handful of cycles after the fill, so the correction is nearly a no-op. This
+   knob earns its keep under --td_load_window_end 1, where the window stays open through the
+   ROB wait and the final fraction can differ substantially from the fill-time one.
+
+   The correction is an ABSOLUTE overwrite: it writes the RRPV the fill would have chosen,
+   discarding whatever aging the line accumulated in between. That deliberately grants a
+   corrected line a fresh lease at its depth rather than placing it where a correctly-inserted
+   line would be by now, so a promoted line is somewhat MORE protected than one marked right
+   the first time. Watch *_RRIP_FIXUP_MISS to see how often the line was already gone. */
+DEF_PARAM(td_load_rrip_fixup, TD_LOAD_RRIP_FIXUP, Flag, Flag, FALSE, )
+/* Provisional RRPV a fill installs while its load's window is still open (requires
+   --td_load_rrip_fixup):
+     0  basic -- unprotected. Never over-protects, but a basic line is a single aging round from
+        eviction, so many lines are evicted before their correction can land and the mechanism
+        degrades toward plain basic insertion. Read *_RRIP_FIXUP_MISS to quantify that.
+     1  depth (default) -- insert at this class's protected RRPV and DEMOTE at fixup if the final
+        fraction does not clear the gate. Keeps the line alive long enough to be corrected, at
+        the cost of protecting some lines that turn out not to deserve it.
+
+   INTERACTION WITH --marked_rrip_bypass: the bypass filter treats a fill whose RRPV equals
+   basic as unmarked and may decline to allocate it at all. Under provisional 0 that is every
+   fill, so a line that the final fraction would have protected can be bypassed before there is
+   anything to correct -- the two knobs fight. Provisional 1 does not have this problem (the
+   fill arrives at depth, so the filter sees it as marked). Prefer provisional 1 when the
+   bypass is on, or turn the bypass off when sweeping provisional 0. */
+DEF_PARAM(td_load_rrip_provisional, TD_LOAD_RRIP_PROVISIONAL, uns, uns, 1, )
 /* Apply the marked-RRIP policy (and all td_load_rrip_* knobs) to the L2 / MLC instead of the
    L1 D-cache. When TRUE (with td_load_rrip_mark), the MLC uses REPL_MARKED_RRIP -- its fills
    derive the initial RRPV from the demanding load's on-demand membound fraction and its hits

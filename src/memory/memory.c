@@ -58,6 +58,7 @@
 #include "addr_trans.h"
 #include "cache_part.h"
 #include "cmp_model.h"
+#include "dcache_stage.h"  /* --td_load_rrip_fixup: dcache_get_cache() for the L1D correction */
 #include "icache_stage.h"
 #include "mem_req.h"
 #include "op.h"
@@ -76,11 +77,13 @@
  * waiting on `req` -> its on-demand memory-bound fraction (td_mem_cycles/td_window_cycles)
  * and PC. Mirrors the L1D fill logic in dcache_stage.c. Path-agnostic: any returning load
  * sets the RRPV, since the fill happens because its data returned. */
-static inline Flag td_mlc_req_load_frac(Mem_Req* req, double* out_frac, Addr* out_pc) {
+static inline Flag td_mlc_req_load_frac(Mem_Req* req, double* out_frac, Addr* out_pc, Op** out_op) {
   if (out_frac)
     *out_frac = 0.0;
   if (out_pc)
     *out_pc = 0;
+  if (out_op)
+    *out_op = NULL;
   Op** op_p = (Op**)list_start_head_traversal(&req->op_ptrs);
   Counter* op_u = (Counter*)list_start_head_traversal(&req->op_uniques);
   for (; op_p; op_p = (Op**)list_next_element(&req->op_ptrs),
@@ -94,6 +97,10 @@ static inline Flag td_mlc_req_load_frac(Mem_Req* req, double* out_frac, Addr* ou
       *out_frac = (double)op->td_mem_cycles / (double)op->td_window_cycles;
     if (out_pc)
       *out_pc = op->inst_info->addr;
+    /* --td_load_rrip_fixup: the load whose (still partial) fraction decides this fill is also
+       the load whose window closing must correct it, so hand it back to the caller. */
+    if (out_op)
+      *out_op = op;
     return TRUE;
   }
   return FALSE;
@@ -162,9 +169,12 @@ static inline Flag mockingjay_bypass_fill(Cache* cache, Mem_Req* req) {
    disagree about what this fill's RRPV would be. Pure: both fraction lookups only read state,
    so calling this twice per fill changes nothing. */
 static inline void td_combined_calc_fill(Mem_Req* req, int instr_depth, int data_depth, double instr_thr,
-                                         double data_thr, int basic_rrpv, Flag* have_rrpv, int* rrpv) {
+                                         double data_thr, int basic_rrpv, Flag* have_rrpv, int* rrpv,
+                                         Op** out_fixup_op) {
   *have_rrpv = FALSE;
   *rrpv = 0;
+  if (out_fixup_op)
+    *out_fixup_op = NULL;
   if (req->type == MRT_IFETCH) {
     double fe_frac = 0.0;
     if (icache_fe_frac_for_line(req->proc_id, req->addr, &fe_frac)) {
@@ -172,26 +182,56 @@ static inline void td_combined_calc_fill(Mem_Req* req, int instr_depth, int data
                                                (double)TD_FE_RRIP_EXTRAP_ANCHOR, instr_thr, basic_rrpv);
       *have_rrpv = TRUE;
     }
+    /* No fixup arm for instruction lines: the FE-bound fraction is a property of the fetch
+       miss, not of a load with a window that later closes, so there is nothing to correct. */
   } else {
     double frac = 0.0;
     Addr   frac_pc = 0;
-    if (td_mlc_req_load_frac(req, &frac, &frac_pc)) {
+    Op*    fop = NULL;
+    if (td_mlc_req_load_frac(req, &frac, &frac_pc, &fop)) {
       *rrpv = marked_rrip_rrpv_from_frac_basic(frac, data_depth, TD_LOAD_RRIP_EXTRAPOLATE,
                                                (double)TD_LOAD_RRIP_EXTRAP_ANCHOR, data_thr, basic_rrpv);
       *have_rrpv = TRUE;
+      /* --td_load_rrip_fixup: `frac` above is a PARTIAL measurement -- the load's window is
+         still open, and under --td_load_window_end 1 it stays open until retirement. Install a
+         provisional value instead and let td_load_rrip_window_closed rewrite it from the final
+         fraction. The caller records the site after its cache_insert. */
+      if (TD_LOAD_RRIP_FIXUP) {
+        *rrpv = (TD_LOAD_RRIP_PROVISIONAL == 0) ? basic_rrpv : data_depth;
+        if (out_fixup_op)
+          *out_fixup_op = fop;
+      }
     }
   }
 }
 
 static inline void td_combined_stage_fill(Mem_Req* req, int instr_depth, int data_depth, double instr_thr,
-                                          double data_thr, int basic_rrpv) {
+                                          double data_thr, int basic_rrpv, Op** out_fixup_op) {
   Flag have_rrpv = FALSE;
   int  rrpv = 0;
-  td_combined_calc_fill(req, instr_depth, data_depth, instr_thr, data_thr, basic_rrpv, &have_rrpv, &rrpv);
+  td_combined_calc_fill(req, instr_depth, data_depth, instr_thr, data_thr, basic_rrpv, &have_rrpv, &rrpv,
+                        out_fixup_op);
   // Stage the basic too, so an UNMARKED fill (prefetch / off-path / no demanding op) lands at
   // this set's basic rather than the global param's.
   cache_set_marked_next_basic(TRUE, basic_rrpv);
   cache_set_marked_next_insert(have_rrpv, rrpv);
+}
+
+/* --td_load_rrip_fixup: remember that `op`'s fill installed `line_addr` at `level`, together
+   with the configuration this fill resolved, so the correction can reproduce the same decision
+   from the final fraction. Call immediately after the cache_insert: the line's fill_cycle is
+   cycle_count at that instant, which is what the generation check will compare against.
+   Silently does nothing without an op (prefetch / no demanding load) -- there is no window to
+   wait for in that case, and the provisional value simply stands. */
+void td_rrip_fixup_record(Op* op, int level, Addr line_addr, int depth, double thresh, int basic) {
+  if (!TD_LOAD_RRIP_FIXUP || !op || !op->op_pool_valid)
+    return;
+  op->td_rrip_fixup[level].valid = TRUE;
+  op->td_rrip_fixup[level].line_addr = line_addr;
+  op->td_rrip_fixup[level].fill_cycle = cycle_count;
+  op->td_rrip_fixup[level].depth = depth;
+  op->td_rrip_fixup[level].thresh = thresh;
+  op->td_rrip_fixup[level].basic = basic;
 }
 
 /* --marked_load_record / --marked_load_replay: stamp one cache level's outcome onto every load
@@ -271,6 +311,87 @@ Flag membound_in_roi(void) {
   return warmup_dump_done && warmup_dump_done[0];
 }
 
+/* --td_load_rrip_fixup: the load's membound window has closed, so td_mem_cycles/td_window_cycles
+   are FINAL. Rewrite the RRPV of every line this load's fill installed, at each level where the
+   line is still resident and still the same fill.
+
+   Called from lsq.cc at whichever event closes the window: completion (the default
+   --td_load_window_end 0) or retirement / branch recovery (mode 1). One-shot via
+   td_rrip_fixup_done, because the completion path re-tests every cycle the entry lingers in the
+   LQ and must not re-apply.
+
+   A level whose line is gone is counted, not repaired: nothing is re-inserted. Eviction already
+   happened and undoing it would be a different (and much larger) mechanism. */
+void td_load_rrip_window_closed(Op* op) {
+  if (!TD_LOAD_RRIP_FIXUP || !op || op->td_rrip_fixup_done)
+    return;
+  op->td_rrip_fixup_done = TRUE;
+  if (op->td_window_cycles == 0)
+    return;
+
+  const double frac = (double)op->td_mem_cycles / (double)op->td_window_cycles;
+  const Flag   count = early_evict_in_roi();
+
+  for (int lvl = 0; lvl < TD_RRIP_FIXUP_LEVELS; lvl++) {
+    Td_Rrip_Fixup* f = &op->td_rrip_fixup[lvl];
+    Cache*         cache = NULL;
+    int            try_stat, hit_stat, miss_stat;
+
+    if (!f->valid)
+      continue;
+
+    switch (lvl) {
+      case TD_RRIP_FIXUP_DCACHE:
+        cache = dcache_get_cache();
+        try_stat = DCACHE_RRIP_FIXUP_TRY;
+        hit_stat = DCACHE_RRIP_FIXUP_HIT;
+        miss_stat = DCACHE_RRIP_FIXUP_MISS;
+        break;
+      case TD_RRIP_FIXUP_MLC:
+        cache = &MLC(op->proc_id)->cache;
+        try_stat = MLC_RRIP_FIXUP_TRY;
+        hit_stat = MLC_RRIP_FIXUP_HIT;
+        miss_stat = MLC_RRIP_FIXUP_MISS;
+        break;
+      default:
+        cache = &L1(op->proc_id)->cache;
+        try_stat = L1_RRIP_FIXUP_TRY;
+        hit_stat = L1_RRIP_FIXUP_HIT;
+        miss_stat = L1_RRIP_FIXUP_MISS;
+        break;
+    }
+
+    /* The value the fill WOULD have chosen given the final fraction, using the configuration
+       that fill actually resolved -- so this differs from the provisional value only because
+       the fraction changed, never because the policy's selection moved underneath it. */
+    const int corrected = marked_rrip_rrpv_from_frac_basic(frac, f->depth, TD_LOAD_RRIP_EXTRAPOLATE,
+                                                           (double)TD_LOAD_RRIP_EXTRAP_ANCHOR, f->thresh, f->basic);
+    const int provisional = (TD_LOAD_RRIP_PROVISIONAL == 0) ? f->basic : f->depth;
+
+    if (count)
+      STAT_EVENT(op->proc_id, try_stat);
+
+    if (cache_rrpv_fixup(cache, f->line_addr, f->fill_cycle, corrected, f->basic)) {
+      if (count) {
+        STAT_EVENT(op->proc_id, hit_stat);
+        /* More negative == more protected, so a corrected value BELOW the provisional one is a
+           promotion. Counted across all levels: the question is how often the partial fraction
+           was wrong at all. */
+        if (corrected < provisional)
+          STAT_EVENT(op->proc_id, RRIP_FIXUP_PROMOTE);
+        else if (corrected > provisional)
+          STAT_EVENT(op->proc_id, RRIP_FIXUP_DEMOTE);
+        else
+          STAT_EVENT(op->proc_id, RRIP_FIXUP_SAME);
+      }
+    } else if (count) {
+      STAT_EVENT(op->proc_id, miss_stat);  // evicted, or refilled under a new generation
+    }
+
+    f->valid = FALSE;  // consumed
+  }
+}
+
 /* --early_evict_stats: same target-only window as membound_in_roi, on its own gate.
 
    See that function for why an ROI-scoped counter has to gate itself under --full_warmup: the
@@ -321,7 +442,7 @@ static inline void membound_classify_fill(Mem_Req* req, Flag* is_membound, Flag*
        load. Merges append with sl_list_add_tail, so that is normally the load whose miss
        created this request -- i.e. "the first miss". Note the walk skips stale/freed op slots,
        so if the original op is gone this falls through to a merged one. */
-    if (td_mlc_req_load_frac(req, &frac, &frac_pc) && frac > (double)TD_LOAD_REPLAY_THRESH)
+    if (td_mlc_req_load_frac(req, &frac, &frac_pc, NULL) && frac > (double)TD_LOAD_REPLAY_THRESH)
       *is_membound = TRUE;
   }
 }
@@ -354,7 +475,7 @@ static inline Flag marked_bypass_fill(Cache* cache, Mem_Req* req, int instr_dept
   if (!MARKED_RRIP_BYPASS_PREF && mem_req_type_is_prefetch(req->type))
     return FALSE;
 
-  td_combined_calc_fill(req, instr_depth, data_depth, instr_thr, data_thr, basic_rrpv, &have_rrpv, &rrpv);
+  td_combined_calc_fill(req, instr_depth, data_depth, instr_thr, data_thr, basic_rrpv, &have_rrpv, &rrpv, NULL);
   if (have_rrpv && rrpv != basic_rrpv)
     return FALSE;  // marked (protected) fill
   /* The fill's RRPV is basic_rrpv here, whether or not a fraction was staged. */
@@ -2552,7 +2673,7 @@ static Flag mem_complete_mlc_access(Mem_Req* req, Mem_Queue_Entry* mlc_queue_ent
   if (TD_LOAD_RRIP_MARK && TD_LOAD_RRIP_ON_MLC && TD_LOAD_RRIP_HIT_PREDICT && update_mlc_lru) {
     double meas = 0.0, pf = 0.0;
     Addr   pc = 0;
-    if (td_mlc_req_load_frac(req, &meas, &pc) && td_load_pc_pred_lookup(pc, &pf)) {
+    if (td_mlc_req_load_frac(req, &meas, &pc, NULL) && td_load_pc_pred_lookup(pc, &pf)) {
       cache_set_hit_promote_frac(TRUE, pf);
       td_mlc_pred_staged = TRUE;
     }
@@ -5156,6 +5277,11 @@ Flag l1_fill_line(Mem_Req* req) {
   // L1I fetch miss's front-end-bound fraction, data lines from the demanding load's membound
   // fraction, each with its own depth and threshold. Static depths only -- the set-duel and
   // dynamic selectors are MLC-bound, so the fixed td_*_min_rrpv values apply here.
+  /* --td_load_rrip_fixup: see the MLC counterpart. Captured per fill, not re-resolved later. */
+  Op*    l1_fixup_op = NULL;
+  int    l1_fix_depth = 0, l1_fix_basic = 0;
+  double l1_fix_thresh = 0.0;
+
   if (TD_COMBINED_ON_L1) {
     // With --td_combined_l1_set_duel a leader set uses its own group's (depth, threshold,
     // basic) and a follower uses the incumbent; without it these are the static params.
@@ -5163,7 +5289,10 @@ Flag l1_fill_line(Mem_Req* req) {
     double l1_instr_thr, l1_data_thr;
     l1duel_cfg_for_addr(req->proc_id, req->addr, &l1_instr_depth, &l1_data_depth, &l1_instr_thr, &l1_data_thr,
                         &l1_basic);
-    td_combined_stage_fill(req, l1_instr_depth, l1_data_depth, l1_instr_thr, l1_data_thr, l1_basic);
+    td_combined_stage_fill(req, l1_instr_depth, l1_data_depth, l1_instr_thr, l1_data_thr, l1_basic, &l1_fixup_op);
+    l1_fix_depth = l1_data_depth;  // data class; instruction lines have no window to wait on
+    l1_fix_thresh = l1_data_thr;
+    l1_fix_basic = l1_basic;
   }
 
 
@@ -5261,6 +5390,9 @@ Flag l1_fill_line(Mem_Req* req) {
         STAT_EVENT(req->proc_id, L1_EARLY_EVICT);
     }
   }
+
+  /* --td_load_rrip_fixup: record where this fill landed, for the correction at window close. */
+  td_rrip_fixup_record(l1_fixup_op, TD_RRIP_FIXUP_L1, line_addr, l1_fix_depth, l1_fix_thresh, l1_fix_basic);
 
   STAT_EVENT(req->proc_id, NORESET_L1_FILL);
   if (mem_req_type_is_prefetch(req->type) || req->demand_match_prefetch)
@@ -5568,6 +5700,14 @@ Flag mlc_fill_line(Mem_Req* req) {
     }
   }
 
+  /* --td_load_rrip_fixup: the load whose window must later correct this fill's RRPV, plus the
+     data-class configuration THIS fill resolved. Captured here rather than re-resolved at
+     correction time so a set-duel selection that moves in between cannot change the answer.
+     Consumed by the td_rrip_fixup_record after the cache_insert below. */
+  Op*    mlc_fixup_op = NULL;
+  int    mlc_fix_depth = 0, mlc_fix_basic = 0;
+  double mlc_fix_thresh = 0.0;
+
   // COMBINED L2 policy: instruction demand fetches get an RRPV from the L1I fetch miss's
   // front-end-bound fraction (td_fe_rrip_* knobs); everything else uses the demanding load's
   // membound fraction (td_load_rrip_* knobs). No demanding op (prefetch/store) -> basic. Each
@@ -5579,17 +5719,31 @@ Flag mlc_fill_line(Mem_Req* req) {
     int    instr_depth, data_depth, basic_rrpv;
     double instr_thr, data_thr;
     mlc_combined_cfg_for_addr(req->proc_id, req->addr, &instr_depth, &data_depth, &instr_thr, &data_thr, &basic_rrpv);
-    td_combined_stage_fill(req, instr_depth, data_depth, instr_thr, data_thr, basic_rrpv);
+    td_combined_stage_fill(req, instr_depth, data_depth, instr_thr, data_thr, basic_rrpv, &mlc_fixup_op);
+    mlc_fix_depth = data_depth;   // --td_load_rrip_fixup: data class, the only one with a window
+    mlc_fix_thresh = data_thr;
+    mlc_fix_basic = basic_rrpv;
   }
   // marked-RRIP on MLC: derive the fill's initial RRPV from the demanding load's on-demand
   // membound fraction (no CSV), and teach the hit predictor how membound this PC is on a miss.
   else if (TD_LOAD_RRIP_MARK && TD_LOAD_RRIP_ON_MLC) {
     double frac = 0.0;
     Addr   frac_pc = 0;
-    Flag   have_frac = td_mlc_req_load_frac(req, &frac, &frac_pc);
+    Flag   have_frac = td_mlc_req_load_frac(req, &frac, &frac_pc, &mlc_fixup_op);
     int    rrpv = have_frac ? marked_rrip_rrpv_from_frac(frac, TD_LOAD_RRIP_MIN_RRPV, TD_LOAD_RRIP_EXTRAPOLATE,
                                                          (double)TD_LOAD_RRIP_EXTRAP_ANCHOR, (double)TD_LOAD_REPLAY_THRESH)
                             : 0;
+    /* --td_load_rrip_fixup: `frac` is partial here for the same reason as on the combined path;
+       install the provisional value and let the window close decide the real one. This branch
+       stages no per-set basic, so the insert uses the global one. */
+    if (TD_LOAD_RRIP_FIXUP && have_frac) {
+      mlc_fix_depth = TD_LOAD_RRIP_MIN_RRPV;
+      mlc_fix_thresh = (double)TD_LOAD_REPLAY_THRESH;
+      mlc_fix_basic = marked_rrip_basic_rrpv();
+      rrpv = (TD_LOAD_RRIP_PROVISIONAL == 0) ? mlc_fix_basic : mlc_fix_depth;
+    } else {
+      mlc_fixup_op = NULL;  // nothing staged -> nothing to correct
+    }
     cache_set_marked_next_insert(have_frac, rrpv);
     if (have_frac && TD_LOAD_RRIP_HIT_PREDICT)
       td_load_pc_pred_update(frac_pc, frac);
@@ -5687,6 +5841,11 @@ Flag mlc_fill_line(Mem_Req* req) {
         STAT_EVENT(req->proc_id, MLC_EARLY_EVICT);
     }
   }
+
+  /* --td_load_rrip_fixup: the line is in now, so its fill_cycle is this cycle. `line_addr` is
+     the one the insert above reported for THIS cache, which is what the correction must look
+     up (line sizes can differ per level). */
+  td_rrip_fixup_record(mlc_fixup_op, TD_RRIP_FIXUP_MLC, line_addr, mlc_fix_depth, mlc_fix_thresh, mlc_fix_basic);
 
   /* this will make it bring the line into the mlc and then modify it */
   data->proc_id = req->proc_id;

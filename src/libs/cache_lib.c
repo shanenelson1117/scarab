@@ -165,6 +165,36 @@ Flag cache_last_evict_age(Cache* cache, Counter* age) {
 }
 
 /**************************************************************************************/
+/* --td_load_rrip_fixup: late correction of a line's RRPV (see cache_lib.h).
+ *
+ * Deliberately a plain tag walk rather than cache_access: an access would run update_hit,
+ * which for marked_rrip PROMOTES the line and consumes the staged hit-predictor fraction. The
+ * correction is not a reference and must not look like one. */
+Flag cache_rrpv_fixup(Cache* cache, Addr addr, Counter fill_cycle, int new_rrpv, int basic_rrpv) {
+  Addr tag, line_addr;
+  uns  set = cache_index(cache, addr, &tag, &line_addr);
+  uns  ii;
+
+  for (ii = 0; ii < cache->assoc; ii++) {
+    Cache_Entry* line = &cache->entries[set][ii];
+
+    if (!line->valid || line->tag != tag)
+      continue;
+    /* Same address, but is it the same LINE? A refill after an eviction restamps fill_cycle,
+       and correcting that line with the previous occupant's fraction would be wrong. */
+    if (line->fill_cycle != fill_cycle)
+      return FALSE;
+
+    line->reference_val = new_rrpv;
+    line->marked_promote_rrpv = new_rrpv;  // a later hit promotes to the CORRECTED home level
+    line->marked_protected = (new_rrpv < basic_rrpv) ? TRUE : FALSE;
+    return TRUE;
+  }
+
+  return FALSE;  // evicted before the window closed
+}
+
+/**************************************************************************************/
 /* REPL_MARKED_RRIP one-line stream buffer (--marked_rrip_stream_buf).
  *
  * Holds the single line most recently declined by the bypass filter

@@ -132,6 +132,29 @@ typedef struct Dp_Info_struct {
 #define TD_CACHE_HIT  1
 #define TD_CACHE_MISS 2
 
+/* --td_load_rrip_fixup: one cache level's record of the line a load's fill installed, kept on
+   the load so its RRPV can be CORRECTED once the load's membound window actually closes.
+   See Op.td_rrip_fixup and td_load_rrip_window_closed (memory.c). */
+#define TD_RRIP_FIXUP_DCACHE 0
+#define TD_RRIP_FIXUP_MLC    1
+#define TD_RRIP_FIXUP_L1     2
+#define TD_RRIP_FIXUP_LEVELS 3
+
+typedef struct Td_Rrip_Fixup_struct {
+  Flag    valid;      /* this load installed a line at this level and it is worth revisiting */
+  Addr    line_addr;  /* line address, as the level's own cache_insert reported it (line sizes
+                         may differ per level, so this is stored per level and never derived) */
+  Counter fill_cycle; /* Cache_Entry.fill_cycle of the installed line: the FILL GENERATION token.
+                         The fixup requires it to match, so a line that was evicted and refilled
+                         at the same address is left alone -- it is a different line now. */
+  /* The configuration the FILL resolved, captured so the correction reproduces exactly the
+     decision the fill would have made given the final fraction. Re-resolving at fixup time
+     would read the CURRENT set-duel selection, which may have moved windows since. */
+  int    depth;  /* this class's protected (minimum) RRPV */
+  double thresh; /* this class's marking gate */
+  int    basic;  /* this set's unprotected RRPV */
+} Td_Rrip_Fixup;
+
 struct Op_struct {
   // {{{ op_pool stuff --- don't use outside of op pool management
   Flag op_pool_valid;  // is op allocated from the op_pool?
@@ -193,6 +216,12 @@ struct Op_struct {
   uns8 td_dcache_outcome;
   uns8 td_mlc_outcome;
   uns8 td_llc_outcome;
+  /* --td_load_rrip_fixup: where this load's fill landed at each level, and a one-shot guard so
+     the correction is applied exactly once however many times the window-close hook fires
+     (the completion path re-tests every cycle the entry lingers in the LQ). Zeroed by
+     op_pool_setup_op's memset, so an op that never fills simply has every entry invalid. */
+  Td_Rrip_Fixup td_rrip_fixup[TD_RRIP_FIXUP_LEVELS];
+  Flag          td_rrip_fixup_done;
   // }}}
 
   // {{{ path and fetch info

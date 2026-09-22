@@ -318,6 +318,23 @@ Flag cache_last_hit_fe_bound(Cache* cache);
  * against its own threshold, because cache_lib knows no cache's access latency. */
 Flag cache_last_evict_age(Cache* cache, Counter* age);
 
+/* --td_load_rrip_fixup: rewrite a resident line's RRPV after the fact.
+ *
+ * Finds the line for `addr` in its set and, ONLY IF it is still the same fill -- its
+ * Cache_Entry.fill_cycle equals `fill_cycle` -- overwrites reference_val with `new_rrpv`.
+ * The generation check is what makes this safe to call late: a line evicted and refilled at
+ * the same address carries a different fill_cycle and is left untouched, so a stale correction
+ * can never land on an unrelated line that happens to share the address.
+ *
+ * Touches ONLY the replacement value (plus marked_promote_rrpv, so a later hit promotes to the
+ * corrected home level rather than the provisional one, and marked_protected, recomputed as
+ * new_rrpv < basic_rrpv for the protected-hits metric). It does NOT count as an access: no
+ * update_hit, no LRU timestamp, no aging, no stream-buffer probe. The line's position in the
+ * set changes only because its RRPV did.
+ *
+ * Returns TRUE if a line was corrected, FALSE if it was already evicted or had been refilled. */
+Flag cache_rrpv_fixup(Cache* cache, Addr addr, Counter fill_cycle, int new_rrpv, int basic_rrpv);
+
 /* REPL_MARKED_RRIP allocation filter (--marked_rrip_bypass). TRUE when a fill arriving at
  * `insert_rrpv` would be strictly more distant than every resident line in its set -- i.e. it
  * would be the very next victim, so caching it can only evict something more useful. Only

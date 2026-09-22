@@ -984,6 +984,38 @@ DEF_STAT(  MLC_EARLY_EVICT                ,  RATIO,  MLC_EVICT      )
 DEF_STAT(  L1_EVICT                       ,  COUNT,  NO_RATIO       )
 DEF_STAT(  L1_EARLY_EVICT                 ,  RATIO,  L1_EVICT       )
 
+/* --td_load_rrip_fixup: did the late RRPV correction actually land?
+
+   *_RRIP_FIXUP_TRY   loads whose window closed having installed a line at that level.
+   *_RRIP_FIXUP_MISS  the subset where the line was already gone, or had been evicted and
+                      refilled at the same address (the fill_cycle generation check). This is
+                      the headline diagnostic: a high MISS fraction means the provisional RRPV
+                      is not keeping lines alive long enough to be corrected, which is the
+                      expected failure mode of --td_load_rrip_provisional 0 (basic).
+   *_RRIP_FIXUP_HIT   the subset actually rewritten. HIT + MISS == TRY.
+
+   The direction counters are summed over every level, since what matters is how often the
+   partial fill-time fraction disagreed with the final one at all:
+   RRIP_FIXUP_PROMOTE   corrected to a MORE protected RRPV than the provisional one
+   RRIP_FIXUP_DEMOTE    corrected to a LESS protected RRPV
+   RRIP_FIXUP_SAME      the correction agreed with the provisional value -- nothing changed.
+                        A run where SAME dominates is one where two-phase marking buys nothing,
+                        which is the expected result under --td_load_window_end 0.
+
+   Target-only, on the same early_evict_in_roi() gate as the *_EVICT counters. */
+DEF_STAT(  DCACHE_RRIP_FIXUP_TRY           ,  COUNT,  NO_RATIO                 )
+DEF_STAT(  DCACHE_RRIP_FIXUP_HIT           ,  RATIO,  DCACHE_RRIP_FIXUP_TRY    )
+DEF_STAT(  DCACHE_RRIP_FIXUP_MISS          ,  RATIO,  DCACHE_RRIP_FIXUP_TRY    )
+DEF_STAT(  MLC_RRIP_FIXUP_TRY              ,  COUNT,  NO_RATIO                 )
+DEF_STAT(  MLC_RRIP_FIXUP_HIT              ,  RATIO,  MLC_RRIP_FIXUP_TRY       )
+DEF_STAT(  MLC_RRIP_FIXUP_MISS             ,  RATIO,  MLC_RRIP_FIXUP_TRY       )
+DEF_STAT(  L1_RRIP_FIXUP_TRY               ,  COUNT,  NO_RATIO                 )
+DEF_STAT(  L1_RRIP_FIXUP_HIT               ,  RATIO,  L1_RRIP_FIXUP_TRY        )
+DEF_STAT(  L1_RRIP_FIXUP_MISS              ,  RATIO,  L1_RRIP_FIXUP_TRY        )
+DEF_STAT(  RRIP_FIXUP_PROMOTE              ,  COUNT,  NO_RATIO                 )
+DEF_STAT(  RRIP_FIXUP_DEMOTE               ,  COUNT,  NO_RATIO                 )
+DEF_STAT(  RRIP_FIXUP_SAME                 ,  COUNT,  NO_RATIO                 )
+
 DEF_STAT(  NORESET_L1_FILL               ,  COUNT,  NO_RATIO  )
 DEF_STAT(  NORESET_L1_FILL_NONPREF       ,  COUNT,  NO_RATIO  )
 DEF_STAT(  NORESET_L1_FILL_PREF          ,  COUNT,  NO_RATIO  )

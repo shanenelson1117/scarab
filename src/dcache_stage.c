@@ -71,6 +71,11 @@
 Dcache_Stage* dc = NULL;
 
 /* L1D geometry accessors for td_load_evict_track (set-conflict eviction tracking). */
+/* --td_load_rrip_fixup: the L1D itself, so the late RRPV correction in memory.c can reach this
+   level without memory.c having to know how the dcache stage stores it. */
+Cache* dcache_get_cache(void) {
+  return &dc->dcache;
+}
 uns dcache_get_assoc(void) {
   return dc->dcache.assoc;
 }
@@ -854,6 +859,12 @@ static inline Dcache_Data* dcache_fill_get_cacheline(Mem_Req* req) {
   // sets the RRPV exactly as real hardware would, agnostic to path. The insert path derives
   // the initial RRPV from the fraction (gated by the anchor in extrapolate mode, or the replay
   // threshold in fixed-min mode).
+  /* --td_load_rrip_fixup: the load whose window must later correct this fill's RRPV, and the
+     configuration this fill used. Consumed by the td_rrip_fixup_record after the insert. */
+  Op*    dc_fixup_op = NULL;
+  int    dc_fix_depth = 0, dc_fix_basic = 0;
+  double dc_fix_thresh = 0.0;
+
   if (TD_LOAD_RRIP_MARK && !TD_LOAD_RRIP_ON_MLC) {
     double frac = 0.0;
     Flag   have_frac = FALSE;
@@ -872,11 +883,23 @@ static inline Dcache_Data* dcache_fill_get_cacheline(Mem_Req* req) {
       frac = (double)op->td_mem_cycles / (double)op->td_window_cycles;
       frac_pc = op->inst_info->addr;
       have_frac = TRUE;
+      dc_fixup_op = op;  // --td_load_rrip_fixup: the load whose window will correct this fill
       break;  // oldest valid demanding load (any path)
     }
     int rrpv = have_frac ? marked_rrip_rrpv_from_frac(frac, TD_LOAD_RRIP_MIN_RRPV, TD_LOAD_RRIP_EXTRAPOLATE,
                                                       (double)TD_LOAD_RRIP_EXTRAP_ANCHOR, (double)TD_LOAD_REPLAY_THRESH)
                          : 0;
+    /* --td_load_rrip_fixup: `frac` is measured over a window that is still OPEN (the load
+       completes because of this very fill), so install the provisional value and let
+       td_load_rrip_window_closed rewrite it from the final fraction. */
+    if (TD_LOAD_RRIP_FIXUP && have_frac) {
+      dc_fix_depth = TD_LOAD_RRIP_MIN_RRPV;
+      dc_fix_thresh = (double)TD_LOAD_REPLAY_THRESH;
+      dc_fix_basic = marked_rrip_basic_rrpv();
+      rrpv = (TD_LOAD_RRIP_PROVISIONAL == 0) ? dc_fix_basic : dc_fix_depth;
+    } else {
+      dc_fixup_op = NULL;  // nothing staged -> nothing to correct
+    }
     cache_set_marked_next_insert(have_frac, rrpv);
     // hit predictor: teach this load PC how membound it is when it actually misses
     if (have_frac && TD_LOAD_RRIP_HIT_PREDICT)
@@ -932,6 +955,9 @@ static inline Dcache_Data* dcache_fill_get_cacheline(Mem_Req* req) {
         STAT_EVENT(dc->proc_id, DCACHE_EARLY_EVICT);
     }
   }
+
+  /* --td_load_rrip_fixup: the line is resident now, so its fill generation is this cycle. */
+  td_rrip_fixup_record(dc_fixup_op, TD_RRIP_FIXUP_DCACHE, line_addr, dc_fix_depth, dc_fix_thresh, dc_fix_basic);
 
   ASSERT(dc->proc_id, req->emitted_cycle);
   ASSERT(dc->proc_id, cycle_count >= req->emitted_cycle);

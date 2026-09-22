@@ -44,6 +44,10 @@ extern "C" {
 
 #include "bp/bp.h"
 
+/* --td_load_rrip_fixup: td_load_rrip_window_closed, called at whichever event closes a load's
+   membound window (completion, retirement, or branch recovery). */
+#include "memory/memory.h"
+
 #include "exec_ports.h"
 #include "node_stage.h"
 }
@@ -108,6 +112,12 @@ void LSQ::free(Op* mem_op) {
   ASSERT(proc_id, mem_op->inst_info->table_info.mem_type == this->mem_type);
   ASSERT(proc_id, !mem_op->off_path);
 
+  /* --td_load_rrip_fixup: under --td_load_window_end 1 the window is held open until the entry
+     leaves the LQ, which is exactly here (retirement). Apply the correction before the entry
+     goes. Harmless under window_end 0: the completion path already fired and this is a no-op. */
+  if (mem_op->inst_info->table_info.mem_type == MEM_LD)
+    td_load_rrip_window_closed(mem_op);
+
   ASSERT(proc_id, entries.front().op_num == mem_op->op_num);
   entries.pop_front();
 }
@@ -135,6 +145,12 @@ void LSQ::recover(Counter flush_op_num) {
     ASSERT(proc_id, back_entry.op->off_path);
     ASSERT(proc_id, entries.back().op_num == back_entry.op->op_num);
     ASSERT(proc_id, back_entry.op->inst_info->table_info.mem_type == this->mem_type);
+    /* --td_load_rrip_fixup: an off-path load never retires, so under --td_load_window_end 1
+       the flush is where its window ends. Correct here or its fills keep the provisional RRPV
+       forever. (The param doc notes this window is prediction-dependent and so config-varying;
+       that is a property of window_end 1, not of the correction.) */
+    if (back_entry.op->inst_info->table_info.mem_type == MEM_LD)
+      td_load_rrip_window_closed(back_entry.op);
     entries.pop_back();
   }
 }
@@ -368,6 +384,11 @@ void lsq_tag_inflight_loads(Flag mem_bound_cycle) {
     Flag in_window = (TD_LOAD_WINDOW_END == 1) || (op->done_cycle == 0) ||
                      (cycle_count < op->done_cycle);
     if (!in_window) {
+      /* --td_load_rrip_fixup: this is the window-closing event under the DEFAULT
+         --td_load_window_end 0, so the fraction is final HERE and the provisional RRPV this
+         load's fills installed can be corrected. Re-tested every cycle the entry lingers in
+         the LQ; td_load_rrip_window_closed is one-shot, so only the first pass applies. */
+      td_load_rrip_window_closed(op);
       // Load has completed; its window is closed and td_mem_cycles/td_window_cycles are final.
       // The record is NOT emitted here. It is emitted at RETIREMENT (topdown_load_retire), which
       // makes the recorded sequence ON-PATH ONLY and therefore reproducible across runs: retired

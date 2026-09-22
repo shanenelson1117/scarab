@@ -255,6 +255,16 @@ Flag membound_in_roi(void);
    *_EARLY_EVICT counters are target-only. Shared with dcache_stage.c and icache_stage.c so all
    four caches' counters sit on one window. See the definition in memory.c. */
 Flag early_evict_in_roi(void);
+/* --td_load_rrip_fixup: this load's membound window has closed and its fraction is final --
+   rewrite the RRPV of the lines its fill installed, wherever they are still resident. Called
+   from lsq.cc at the window-closing event (completion, retirement, or branch recovery, per
+   --td_load_window_end). Idempotent: applies at most once per op. */
+void td_load_rrip_window_closed(Op* op);
+/* --td_load_rrip_fixup: remember that `op`'s fill installed `line_addr` at `level` (a
+   TD_RRIP_FIXUP_* index), with the depth / threshold / basic that fill resolved. Call
+   IMMEDIATELY after the cache_insert -- the line's fill generation is cycle_count at that
+   instant. A NULL op is ignored, so unmarked fills need no guard at the call site. */
+void td_rrip_fixup_record(Op* op, int level, Addr line_addr, int depth, double thresh, int basic);
 Flag mem_can_allocate_req_buffer(uns proc_id, Mem_Req_Type type, Flag for_l1_writeback);
 
 void open_mem_stat_interval_file(void);
