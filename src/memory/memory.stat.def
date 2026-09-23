@@ -2541,6 +2541,13 @@ DEF_STAT(  MLC_MLP_COST_NUM                           , COUNT  , NO_RATIO  )
    Counted for EVERY fill that has a fraction to report, above or below the gate -- that is the
    whole point. The _NONE counters below hold fills with no fraction at all.
 
+   MLC ONLY. Incremented in mlc_fill_line, NOT in membound_classify_fill, even though that
+   helper is where the fraction is computed: l1_fill_line calls the same helper, so counting
+   there made these MLC_-named chains cover both cache levels. The symptom was 86% of eligible
+   fills reading above the 0.5 gate while MLC_MEMBOUND_FILL was 45% of the same population.
+   There is deliberately no L1_*_FRAC_* counterpart -- add one at the l1_fill_line site if the
+   LLC ever needs calibrating, do not widen these.
+
    WINDOW: these sit on the same ROI gate as the rest of --membound_stats (target-only under
    --membound_stats_roi, the default), so they pair with Periodic_*, NOT Cumulative_*. */
 DEF_STAT(  MLC_MEMBOUND_FRAC_0                , DIST   , NO_RATIO  )

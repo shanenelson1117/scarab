@@ -346,24 +346,20 @@ Flag early_evict_in_roi(void) {
    is off, so this costs nothing in an unrelated run. Returns the classification so the caller
    can also count the miss and its merges. */
 static inline void membound_classify_fill(Mem_Req* req, Flag* is_membound, Flag* is_fe_bound,
-                                          double* bound_frac) {
+                                          double* bound_frac, Flag* have_frac) {
   *is_membound = FALSE;
   *is_fe_bound = FALSE;
   *bound_frac = 0.0;
+  *have_frac = FALSE;
   if (!MEMBOUND_STATS)
     return;
   if (req->type == MRT_IFETCH) {
     double fe_frac = 0.0;
     if (icache_fe_frac_for_line(req->proc_id, req->addr, &fe_frac)) {
-      /* Histogram the RAW fraction, gate or no gate -- see the MLC_FEBOUND_FRAC_* comment in
-         memory.stat.def. Clamped because the bucket index is a cast, and a fraction of exactly
-         1.0 would otherwise land one past the end of the chain. */
-      STAT_EVENT(req->proc_id, MLC_FEBOUND_FRAC_0 + (uns)MIN2((uns64)(fe_frac * 20.0), (uns64)19));
       *bound_frac = fe_frac;
+      *have_frac = TRUE;
       if (fe_frac > (double)TD_FE_RRIP_THRESH)
         *is_fe_bound = TRUE;
-    } else {
-      STAT_EVENT(req->proc_id, MLC_FEBOUND_FRAC_NONE);
     }
   } else {
     double frac = 0.0;
@@ -373,16 +369,10 @@ static inline void membound_classify_fill(Mem_Req* req, Flag* is_membound, Flag*
        created this request -- i.e. "the first miss". Note the walk skips stale/freed op slots,
        so if the original op is gone this falls through to a merged one. */
     if (td_mlc_req_load_frac(req, &frac, &frac_pc, NULL)) {
-      STAT_EVENT(req->proc_id, MLC_MEMBOUND_FRAC_0 + (uns)MIN2((uns64)(frac * 20.0), (uns64)19));
       *bound_frac = frac;
+      *have_frac = TRUE;
       if (frac > (double)TD_LOAD_REPLAY_THRESH)
         *is_membound = TRUE;
-    } else {
-      /* No demanding load: a store fill, a prefetch, a writeback, or a load whose op slot was
-         already freed. These can never be marked, so they are the eligibility denominator --
-         counting them here is what makes a per-set "fraction of bound lines" normalisable
-         against the lines that could actually carry a value. */
-      STAT_EVENT(req->proc_id, MLC_MEMBOUND_FRAC_NONE);
     }
   }
 }
@@ -5453,7 +5443,8 @@ Flag l1_fill_line(Mem_Req* req) {
   {
     Flag   mb_fill = FALSE, fe_fill = FALSE;
     double bound_frac = 0.0;
-    membound_classify_fill(req, &mb_fill, &fe_fill, &bound_frac);
+    Flag   mb_have_frac = FALSE;
+    membound_classify_fill(req, &mb_fill, &fe_fill, &bound_frac, &mb_have_frac);
     /* Stage the bit even during warmup: a line filled before the ROI that is REUSED inside it
        must still be recognisable as membound, or the hit counter would miss it. Only the
        counting below is scoped to the ROI. */
@@ -5931,7 +5922,8 @@ Flag mlc_fill_line(Mem_Req* req) {
   {
     Flag   mb_fill = FALSE, fe_fill = FALSE;
     double bound_frac = 0.0;
-    membound_classify_fill(req, &mb_fill, &fe_fill, &bound_frac);
+    Flag   mb_have_frac = FALSE;
+    membound_classify_fill(req, &mb_fill, &fe_fill, &bound_frac, &mb_have_frac);
     /* Stage the bit even during warmup: a line filled before the ROI that is REUSED inside it
        must still be recognisable as membound, or the hit counter would miss it. Only the
        counting below is scoped to the ROI. */
@@ -5942,6 +5934,23 @@ Flag mlc_fill_line(Mem_Req* req) {
        LLC-miss cost, which nothing measures. */
     cache_set_next_fill_cost(bound_frac, req->mlp_cost);
     if (MEMBOUND_STATS && membound_in_roi()) {
+      /* Raw-fraction histogram, MLC ONLY. It lives here and not in membound_classify_fill
+         because that helper is shared with l1_fill_line, so histogramming inside it made these
+         MLC_-named chains count BOTH cache levels -- which showed up as 86% of eligible fills
+         reading above the 0.5 gate while MLC_MEMBOUND_FILL was only 45% of them. Being here
+         also puts them on the same ROI gate as every other counter in this block, instead of
+         spanning warmup like an ungated DEF_STAT.
+         Counted above AND below the gate: the point is the shape of the distribution the gate
+         is cutting, which the FILL counters above cannot show. */
+      if (mb_have_frac) {
+        STAT_EVENT(req->proc_id,
+                   (req->type == MRT_IFETCH ? MLC_FEBOUND_FRAC_0 : MLC_MEMBOUND_FRAC_0) +
+                       (uns)MIN2((uns64)(bound_frac * 20.0), (uns64)19));
+      } else {
+        STAT_EVENT(req->proc_id,
+                   req->type == MRT_IFETCH ? MLC_FEBOUND_FRAC_NONE : MLC_MEMBOUND_FRAC_NONE);
+      }
+
       if (mb_fill) {
         STAT_EVENT(req->proc_id, MLC_MEMBOUND_FILL);
         if (req->demand_merge_count) {
