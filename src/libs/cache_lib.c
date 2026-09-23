@@ -145,9 +145,26 @@ static inline void consume_fill_bound(Cache_Entry* line) {
  * this policy: on a prefetch-heavy workload it evicts prefetched lines preferentially, which
  * can swamp the effect being measured. Watch prefetch accuracy when reading results. */
 static inline uns mlp_lin_costq(double cost_cycles) {
-  static const double edges[7] = {15.0, 20.0, 25.0, 30.0, 45.0, 60.0, 90.0};
-  const double        scale = (double)MLP_LIN_COST_SCALE;
-  uns                 q = 0;
+  /* Equal-population cut points, MEASURED from MLC_MLP_COST_* at 5-cycle resolution on the
+     google traces, target-only. Two tables because --mlp_cost_exclude_stores removes ~29% of
+     the population and reshapes what is left enough to move five of the seven edges; running
+     the with-stores table on a without-stores distribution leaves the buckets no longer
+     equal-population, which is the whole thing these edges exist to avoid.
+
+     WITH stores (cost_calib_google, 34.8M misses, mean cost 62.1)
+     WITHOUT    (mlp_lin_stores_google/excl_stores, 26.7M misses, mean cost 64.0)
+
+     Note the without-stores edges are LOWER at the bottom and top-heavy, even though the MEAN
+     cost is HIGHER. Excluding stores does not simply shift the distribution up: it removes a
+     band of mid-cost misses and leaves a more skewed one -- more mass low, heavier tail. That
+     is why these are measured per configuration rather than derived by scaling the other
+     table, and why --mlp_lin_cost_scale cannot substitute for re-cutting them. */
+  static const double edges_with_stores[7] = {15.0, 20.0, 25.0, 30.0, 45.0, 60.0, 90.0};
+  static const double edges_without_stores[7] = {10.0, 20.0, 25.0, 30.0, 40.0, 55.0, 90.0};
+
+  const double* edges = MLP_COST_EXCLUDE_STORES ? edges_without_stores : edges_with_stores;
+  const double  scale = (double)MLP_LIN_COST_SCALE;
+  uns           q = 0;
   for (q = 0; q < 7; q++) {
     if (cost_cycles < edges[q] * scale)
       return q;
@@ -171,12 +188,35 @@ static inline uns mlp_lin_costq(double cost_cycles) {
  * A line with neither flag -- prefetch, writeback, or store fill, none of which have a
  * demanding load -- scores 0 and gets no protection here. On these traces that is 57% of MLC
  * fills, so this term partitions the cache rather than grading it. */
-static inline double mlp_lin_bound_term(const Cache_Entry* entry) {
+/* REPL_MLP lambdas in force for `cache`: its own when SBAR owns it, the global params
+ * otherwise. Threaded through every use so the ATDs and the real MLC run identical code. */
+static inline double lin_lam_mlp(const Cache* c) {
+  return c->lin_lambda_override ? c->lin_lambda_mlp : (double)MLP_LIN_LAMBDA;
+}
+static inline double lin_lam_data(const Cache* c) {
+  return c->lin_lambda_override ? c->lin_lambda_data : (double)MLP_LIN_DATA_LAMBDA;
+}
+static inline double lin_lam_instr(const Cache* c) {
+  return c->lin_lambda_override ? c->lin_lambda_instr : (double)MLP_LIN_INSTR_LAMBDA;
+}
+
+static inline double mlp_lin_bound_term(const Cache* cache, const Cache_Entry* entry) {
   if (entry->membound_fill)
-    return entry->bound_frac > (double)MLP_LIN_DATA_THRESH ? (double)MLP_LIN_DATA_LAMBDA : 0.0;
+    return entry->bound_frac > (double)MLP_LIN_DATA_THRESH ? lin_lam_data(cache) : 0.0;
   if (entry->fe_bound_fill)
-    return entry->bound_frac > (double)MLP_LIN_INSTR_THRESH ? (double)MLP_LIN_INSTR_LAMBDA : 0.0;
+    return entry->bound_frac > (double)MLP_LIN_INSTR_THRESH ? lin_lam_instr(cache) : 0.0;
   return 0.0;
+}
+
+double cache_last_hit_mlp_cost(Cache* cache) {
+  return cache->last_hit_mlp_cost;
+}
+
+void cache_set_lin_lambdas(Cache* cache, double lam_mlp, double lam_data, double lam_instr) {
+  cache->lin_lambda_override = TRUE;
+  cache->lin_lambda_mlp = lam_mlp;
+  cache->lin_lambda_data = lam_data;
+  cache->lin_lambda_instr = lam_instr;
 }
 
 Flag cache_last_hit_membound(Cache* cache) {
@@ -372,6 +412,7 @@ void init_cache(Cache* cache, const char* name, uns cache_size, uns assoc, uns l
   cache->sb_enabled = FALSE;
   cache->sb_last_hit = FALSE;
   cache->last_hit_membound = FALSE;
+  cache->last_hit_mlp_cost = 0.0;
   cache->last_hit_fe_bound = FALSE;
   /* --early_evict_stats: cleared here as well as at every insert, so a caller that reads it
      before any insert has happened sees "no eviction" rather than garbage. This runs ahead of
@@ -500,6 +541,7 @@ void* cache_access(Cache* cache, Addr addr, Addr* line_addr, Flag update_repl) {
 
   cache->sb_last_hit = FALSE;
   cache->last_hit_membound = FALSE;
+  cache->last_hit_mlp_cost = 0.0;
   cache->last_hit_fe_bound = FALSE;
 
   if (cache->repl_policy >= REPL_VOID) {
@@ -534,6 +576,7 @@ void* cache_access(Cache* cache, Addr addr, Addr* line_addr, Flag update_repl) {
          Independent of update_repl -- a warmup/oracle probe that hits a membound line has
          still hit one. */
       cache->last_hit_membound = line->membound_fill;
+      cache->last_hit_mlp_cost = line->mlp_cost;
       cache->last_hit_fe_bound = line->fe_bound_fill;
 
       if (update_repl) {
@@ -846,8 +889,8 @@ Cache_Entry* find_repl_entry(Cache* cache, uns8 proc_id, uns set, uns* way) {
           if (jj != ii && other->valid && other->last_access_time < entry->last_access_time)
             rank++;
         }
-        double val = (double)rank + (double)MLP_LIN_LAMBDA * (double)mlp_lin_costq(entry->mlp_cost) +
-                     mlp_lin_bound_term(entry);
+        double val = (double)rank + lin_lam_mlp(cache) * (double)mlp_lin_costq(entry->mlp_cost) +
+                     mlp_lin_bound_term(cache, entry);
         if (!have_best || val < best_val) {
           best_val = val;
           best_ind = ii;
@@ -1685,6 +1728,7 @@ void* cache_access_strategy(Cache* cache, Addr addr, Addr* line_addr, Flag updat
     if (line->valid && line->tag == tag) {
       /* --membound_stats: see the matching publish in cache_access. */
       cache->last_hit_membound = line->membound_fill;
+      cache->last_hit_mlp_cost = line->mlp_cost;
       cache->last_hit_fe_bound = line->fe_bound_fill;
 
       if (update_repl)

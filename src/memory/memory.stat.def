@@ -2524,6 +2524,17 @@ DEF_STAT(  MLC_MLP_COST_TOTAL                         , COUNT  , NO_RATIO  )
 DEF_STAT(  MLC_MLP_COST_LATENCY_TOTAL                 , COUNT  , NO_RATIO  )
 DEF_STAT(  MLC_MLP_COST_NUM                           , COUNT  , NO_RATIO  )
 
+/* --mlp_sbar_on: SBAR arm selection on the MLC. MLC_SBAR_SEL_* is incremented once per window
+   for whichever arm is selected, so the three counts are that arm's share of windows -- the
+   policy's own record of what it chose over the run. Indexed as MLC_SBAR_SEL_LRU + arm, so the
+   three must stay contiguous and in the g_sbar_lam order (lru, lin2, full).
+   MLC_SBAR_SWITCH counts windows where the selection CHANGED; a value near the window count
+   means the contest is thrashing and the window is too short to resolve it. */
+DEF_STAT(  MLC_SBAR_SEL_LRU                           , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_SBAR_SEL_LIN2                          , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_SBAR_SEL_FULL                          , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_SBAR_SWITCH                            , COUNT  , NO_RATIO  )
+
 
 /* --membound_stats: distributions of the RAW boundness FRACTIONS, before any threshold.
 

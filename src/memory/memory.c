@@ -1831,6 +1831,188 @@ static inline Flag mlp_cost_tracked(const Mem_Req* req) {
   return req->type == MRT_IFETCH || req->type == MRT_DFETCH || req->type == MRT_DSTORE;
 }
 
+/**************************************************************************************/
+/* --mlp_sbar_on: SBAR for REPL_MLP on the MLC. See memory.param.def for the model; this is the
+ * mechanism. Three tag-only ATDs over the same sampled MLC sets, each running REPL_MLP with a
+ * fixed lambda triple through the ordinary find_repl_entry path. Every demand MLC access to a
+ * sampled set is applied to all three, so they see one identical stream and their accumulated
+ * cost totals are directly comparable. Each window the lowest total wins and the real MLC
+ * adopts its triple. */
+
+#define MLP_SBAR_MAXARMS 3
+/* Arm sets, selected by --mlp_sbar_arms. Arm 0 is always LRU, so every set can back all the way
+ * out to "cost term off" -- which is the choice the paper's SBAR exists to make. */
+static const double g_sbar_lam[2][MLP_SBAR_MAXARMS][3] = {
+    /* 0: three-way. Adjacent pairs differ in ONE thing, so each comparison is attributable:
+          lru vs lin2 isolates the MLP cost term, lin2 vs full isolates the boundness terms. */
+    {{0.0, 0.0, 0.0}, {2.0, 0.0, 0.0}, {2.0, 10.0, 14.0}},
+    /* 1: two-way, the paper's SBAR -- LIN against LRU and nothing else. No boundness terms;
+          those are not in the paper. */
+    {{0.0, 0.0, 0.0}, {4.0, 0.0, 0.0}, {0.0, 0.0, 0.0}},
+};
+static const char* g_sbar_name[2][MLP_SBAR_MAXARMS] = {{"lru", "lin2", "full"}, {"lru", "lin4", "-"}};
+static const int   g_sbar_narms_tbl[2] = {3, 2};
+
+static inline int sbar_armset(void) {
+  return MLP_SBAR_ARMS == 1 ? 1 : 0;
+}
+static inline int sbar_narms(void) {
+  return g_sbar_narms_tbl[sbar_armset()];
+}
+
+static Cache   g_sbar_atd[MAX_NUM_PROCS][MLP_SBAR_MAXARMS];
+static Flag    g_sbar_init[MAX_NUM_PROCS];
+static double  g_sbar_cost[MAX_NUM_PROCS][MLP_SBAR_MAXARMS]; /* accumulated cost this window */
+static int     g_sbar_sel[MAX_NUM_PROCS];                  /* arm the MTD is currently running */
+static Counter g_sbar_win_start[MAX_NUM_PROCS];
+static uns     g_sbar_stride[MAX_NUM_PROCS]; /* sample every Nth MLC set */
+
+/* Deferred charge: an ATD miss whose REAL counterpart also missed has no cost yet -- the MSHR
+ * entry is still accumulating. Record which arms missed, keyed by the request's line address,
+ * and settle when mlp_cost_finalize produces the number. One slot per request buffer entry,
+ * which is the most outstanding MLC misses there can be. */
+typedef struct {
+  Flag  pending;
+  Addr  line_addr;
+  uns8  proc_id;
+  Flag  arm_missed[MLP_SBAR_MAXARMS];
+} Sbar_Pending;
+static Sbar_Pending g_sbar_pend[MAX_NUM_PROCS][64];
+
+static inline Flag sbar_enabled(void) {
+  return MLP_SBAR_ON && MLC_CACHE_REPL_POLICY == REPL_MLP;
+}
+
+/* Is `set` one of the sampled sets? Uniform stride, so the sample is spread across the index
+ * space rather than clustered -- the same reasoning as the RRIP duel's role map. */
+static inline Flag sbar_sampled(uns8 proc_id, uns set) {
+  return g_sbar_stride[proc_id] ? (set % g_sbar_stride[proc_id]) == 0 : FALSE;
+}
+
+static void sbar_init(uns8 proc_id) {
+  if (g_sbar_init[proc_id] || !sbar_enabled())
+    return;
+  Cache* mlc = &MLC(proc_id)->cache;
+  uns    nsets = mlc->num_sets;
+  uns    want = MIN2(MLP_SBAR_SETS, nsets);
+  g_sbar_stride[proc_id] = want ? MAX2(1, nsets / want) : 0;
+  /* The ATD is tag-only: sized to the SAMPLED sets, not the whole cache, and given a zero-byte
+     data payload. Everything the policy reads -- mlp_cost, the bound flags, last_access_time --
+     lives in Cache_Entry, so no per-line data is needed. */
+  uns atd_sets = want ? want : 1;
+  for (int a = 0; a < sbar_narms(); a++) {
+    char nm[MAX_STR_LENGTH + 1];
+    snprintf(nm, sizeof(nm), "SBAR_ATD_%u_%s", proc_id, g_sbar_name[sbar_armset()][a]);
+    init_cache(&g_sbar_atd[proc_id][a], nm, atd_sets * mlc->assoc * mlc->line_size, mlc->assoc, mlc->line_size, 0,
+               REPL_MLP);
+    cache_set_lin_lambdas(&g_sbar_atd[proc_id][a], g_sbar_lam[sbar_armset()][a][0], g_sbar_lam[sbar_armset()][a][1], g_sbar_lam[sbar_armset()][a][2]);
+  }
+  g_sbar_sel[proc_id] = sbar_narms() - 1; /* seed on the richest arm, not on LRU */
+  cache_set_lin_lambdas(&MLC(proc_id)->cache, g_sbar_lam[sbar_armset()][g_sbar_sel[proc_id]][0], g_sbar_lam[sbar_armset()][g_sbar_sel[proc_id]][1],
+                        g_sbar_lam[sbar_armset()][g_sbar_sel[proc_id]][2]);
+  for (int a = 0; a < sbar_narms(); a++)
+    g_sbar_cost[proc_id][a] = 0.0;
+  memset(g_sbar_pend[proc_id], 0, sizeof(g_sbar_pend[proc_id]));
+  g_sbar_win_start[proc_id] = inst_count[proc_id];
+  g_sbar_init[proc_id] = TRUE;
+}
+
+/* Apply one demand MLC access to every ATD. `real_hit` and `real_cost` describe what the REAL
+ * cache did with this same access, and are what let a hypothetical ATD miss be charged a
+ * measured number instead of a modelled one. */
+static void sbar_probe(Mem_Req* req, Flag real_hit, double real_hit_cost) {
+  if (!sbar_enabled())
+    return;
+  uns8 proc_id = req->proc_id;
+  sbar_init(proc_id);
+  Addr tag = 0, line_addr = 0;
+  uns  set = ext_cache_index(&MLC(proc_id)->cache, req->addr, &tag, &line_addr);
+  if (!sbar_sampled(proc_id, set))
+    return;
+  if (!mem_req_type_is_demand(req->type))
+    return;
+
+  Flag any_deferred = FALSE;
+  Flag missed[MLP_SBAR_MAXARMS];
+  for (int a = 0; a < sbar_narms(); a++) {
+    Addr atd_line = 0;
+    missed[a] = cache_access(&g_sbar_atd[proc_id][a], req->addr, &atd_line, TRUE) ? FALSE : TRUE;
+    if (!missed[a])
+      continue;
+    if (real_hit) {
+      /* Real cache still holds it, so nothing new is measured: charge what this address cost
+         the last time it really was fetched. */
+      g_sbar_cost[proc_id][a] += real_hit_cost;
+    } else {
+      any_deferred = TRUE; /* settle in sbar_settle when the real fill produces a cost */
+    }
+    /* Install so the ATD tracks the real stream. The staged bound/cost values from the real
+       fill are consumed by the real insert, so an ATD line carries what the last stage set --
+       correct for the real-miss case, and harmless for the real-hit case where this line is
+       only a tag placeholder. */
+    Addr dummy = 0;
+    cache_insert(&g_sbar_atd[proc_id][a], proc_id, req->addr, &atd_line, &dummy);
+  }
+
+  if (any_deferred) {
+    for (uns i = 0; i < 64; i++) {
+      if (g_sbar_pend[proc_id][i].pending)
+        continue;
+      g_sbar_pend[proc_id][i].pending = TRUE;
+      g_sbar_pend[proc_id][i].line_addr = line_addr;
+      g_sbar_pend[proc_id][i].proc_id = proc_id;
+      for (int a = 0; a < sbar_narms(); a++)
+        g_sbar_pend[proc_id][i].arm_missed[a] = missed[a] && !real_hit;
+      break;
+    }
+  }
+}
+
+/* Settle any deferred charges for this line now that its real cost is final. */
+static void sbar_settle(uns8 proc_id, Addr line_addr, double cost) {
+  if (!sbar_enabled() || !g_sbar_init[proc_id])
+    return;
+  for (uns i = 0; i < 64; i++) {
+    Sbar_Pending* p = &g_sbar_pend[proc_id][i];
+    if (!p->pending || p->line_addr != line_addr)
+      continue;
+    for (int a = 0; a < sbar_narms(); a++)
+      if (p->arm_missed[a])
+        g_sbar_cost[proc_id][a] += cost;
+    p->pending = FALSE;
+    break;
+  }
+}
+
+/* End of window: lowest accumulated cost wins and the real MLC adopts its lambdas. Ties keep
+ * the incumbent, so a flat contest does not make the policy oscillate. */
+static void sbar_maybe_advance(uns8 proc_id) {
+  if (!sbar_enabled())
+    return;
+  sbar_init(proc_id);
+  if (inst_count[proc_id] - g_sbar_win_start[proc_id] < (Counter)MLP_SBAR_WINDOW)
+    return;
+
+  int    best = g_sbar_sel[proc_id];
+  double best_cost = g_sbar_cost[proc_id][best];
+  for (int a = 0; a < sbar_narms(); a++) {
+    if (g_sbar_cost[proc_id][a] < best_cost) {
+      best_cost = g_sbar_cost[proc_id][a];
+      best = a;
+    }
+  }
+  if (best != g_sbar_sel[proc_id])
+    STAT_EVENT(proc_id, MLC_SBAR_SWITCH);
+  g_sbar_sel[proc_id] = best;
+  STAT_EVENT(proc_id, MLC_SBAR_SEL_LRU + best);
+  cache_set_lin_lambdas(&MLC(proc_id)->cache, g_sbar_lam[sbar_armset()][best][0],
+                        g_sbar_lam[sbar_armset()][best][1], g_sbar_lam[sbar_armset()][best][2]);
+
+  for (int a = 0; a < sbar_narms(); a++)
+    g_sbar_cost[proc_id][a] = 0.0;
+  g_sbar_win_start[proc_id] = inst_count[proc_id];
+}
+
 /* --mlp_cost_stats: charge this cycle's stall across the demand MLC misses sharing it.
 
    This is Algorithm 1 from the paper directly: each cycle, every outstanding demand miss accrues
@@ -1918,6 +2100,13 @@ void mlp_cost_finalize(Mem_Req* req) {
      places of a per-miss mean that is often well under one cycle. Divide MLC_MLP_COST_TOTAL by
      1000 to read it as cycles; MLC_MLP_COST_LATENCY_TOTAL is scaled the same way so their
      ratio -- the average 1/MLP -- needs no correction. */
+  /* --mlp_sbar_on: any ATD that missed this line while the real cache missed too has been
+     waiting for exactly this number. */
+  {
+    Addr sb_tag = 0, sb_line = 0;
+    (void)ext_cache_index(&MLC(req->proc_id)->cache, req->addr, &sb_tag, &sb_line);
+    sbar_settle(req->proc_id, sb_line, cost);
+  }
   INC_STAT_EVENT(req->proc_id, MLC_MLP_COST_TOTAL, (Counter)(cost * 1000.0));
   INC_STAT_EVENT(req->proc_id, MLC_MLP_COST_LATENCY_TOTAL, latency * 1000);
   STAT_EVENT(req->proc_id, MLC_MLP_COST_NUM);
@@ -2838,6 +3027,10 @@ static Flag mem_complete_mlc_access(Mem_Req* req, Mem_Queue_Entry* mlc_queue_ent
   if (td_mlc_pred_staged)
     cache_set_hit_promote_frac(FALSE, 0.0);  // clear one-shot (consumed on hit; drop on miss)
   req->mlc_hit = data ? TRUE : FALSE;
+  /* --mlp_sbar_on: apply this access to the ATDs. Placed here, immediately after the real
+     lookup, so real_hit and the hit line's stored cost describe THIS access -- cache_lib
+     publishes last_hit_mlp_cost as a one-shot and a later access would clobber it. */
+  sbar_probe(req, req->mlc_hit, cache_last_hit_mlp_cost(&MLC(req->proc_id)->cache));
   td_stamp_op_outcome(req, TRUE, req->mlc_hit);   /* carry L2 outcome to retire */
   /* A hit the data array missed and the one-line stream buffer caught -- see the L1 site. */
   if (data && cache_stream_buf_last_hit(&MLC(req->proc_id)->cache))
@@ -2847,6 +3040,7 @@ static Flag mem_complete_mlc_access(Mem_Req* req, Mem_Queue_Entry* mlc_queue_ent
   // Set dueling: advance the selection window (instruction-clocked) once per MLC access.
   if (TD_COMBINED_ON_MLC && TD_COMBINED_SET_DUEL)
     duel_maybe_advance(req->proc_id);
+  sbar_maybe_advance(req->proc_id);
 
   if (data || PERFECT_MLC) { /* mlc hit */
     /* if exclusive cache, invalidate the line in L2 if there is a done function

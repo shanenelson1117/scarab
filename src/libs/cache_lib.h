@@ -256,6 +256,31 @@ typedef struct Cache_struct {
      each other. */
   Flag    last_evict_valid;
   Counter last_evict_age;
+
+  /* REPL_MLP: the MLP-based cost carried by the line the most recent cache_access on THIS cache
+     HIT, in cycles; 0 on a miss or on a line that never had one. Same publish-one-shot idea as
+     last_hit_membound above, and it exists for the same reason: cache_access returns
+     entry->data, not the Cache_Entry, so a caller with only the data pointer cannot reach
+     mlp_cost.
+
+     Read by the SBAR selector. When an ATD misses on an address the REAL cache still holds,
+     no new cost is measured for that access, so the charge is this line's stored cost -- what
+     that exact address cost the last time it was actually fetched. */
+  double last_hit_mlp_cost;
+
+  /* REPL_MLP lambdas for THIS cache. When lin_lambda_override is FALSE the value function uses
+     the global --mlp_lin_* params, which is the plain static-LIN configuration. The SBAR
+     selector sets it TRUE on every cache it owns: each ATD gets its candidate triple and holds
+     it for the run, while the real MLC gets whichever triple is currently selected and has it
+     rewritten at each window boundary.
+
+     Per-cache rather than global so the ATDs and the MTD can run DIFFERENT lambdas through the
+     SAME find_repl_entry code -- that is what makes the ATDs a faithful shadow of the policy
+     rather than a reimplementation of it. */
+  Flag   lin_lambda_override;
+  double lin_lambda_mlp;
+  double lin_lambda_data;
+  double lin_lambda_instr;
 } Cache;
 
 /**************************************************************************************/
@@ -332,6 +357,10 @@ void cache_set_next_fill_cost(double bound_frac, double mlp_cost);
 /* TRUE if the most recent cache_access on `cache` hit a line that had been brought in by a
  * membound (resp. FE-bound) access. Valid only immediately after that access. */
 Flag cache_last_hit_membound(Cache* cache);
+/* REPL_MLP / SBAR: cost carried by the line the last cache_access on `cache` hit. */
+double cache_last_hit_mlp_cost(Cache* cache);
+/* REPL_MLP / SBAR: pin this cache's LIN lambdas (ATD candidate, or the MTD's selection). */
+void cache_set_lin_lambdas(Cache* cache, double lam_mlp, double lam_data, double lam_instr);
 Flag cache_last_hit_fe_bound(Cache* cache);
 
 /* --early_evict_stats: how long the line evicted by the most recent INSERT on `cache` had been
