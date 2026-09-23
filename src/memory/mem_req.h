@@ -153,6 +153,10 @@ struct Mem_Req_struct {
   Flag mlc_miss_satisfied;                   /* did this request miss in MLC and it is already
                                                 satisfied? */
   Counter mlc_miss_cycle;                    /* cycle when this req missed in MLC */
+  double mlp_cost;                           /* --mlp_cost_stats: MLP-based cost in cycles
+                                                accrued by this req while its MLC miss was
+                                                outstanding, 1/N per cycle. Zeroed wherever
+                                                mlc_miss_cycle is armed, read at the fill. */
   Flag l1_hit;                               /* did this request hit in L1? */
   Flag l1_miss;                              /* did this request miss in L1? */
   Flag l1_miss_satisfied;                    /* did this request miss in L1 and it is already

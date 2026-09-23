@@ -72,6 +72,16 @@ typedef struct L1_Data_struct {
                                experienced */
   Counter fetch_cycle;
   Counter onpath_use_cycle;
+
+  /* --mlp_cost_stats: MLP-based cost in cycles of the miss that brought this line in, written
+     at fill. Stored per line because an MLP-aware replacement policy reads it at victim
+     selection; the paper keeps a 3-bit quantization of it in the tag store rather than the raw
+     value, so this is the pre-quantization input, not the hardware field. Zero for lines filled
+     by a writeback, which pay no memory latency, and for every line when the knob is off.
+
+     NOTE this lands on every LLC line too, since MLC_Data is a typedef of L1_Data below. Only
+     the MLC path writes it; the LLC copies are dead weight until an LLC policy wants them. */
+  double mlp_cost;
 } L1_Data;
 
 typedef L1_Data MLC_Data; /* Use the same data structure for simplicity */
@@ -224,6 +234,9 @@ void reset_memory(void);
 void recover_memory(void);
 void debug_memory(void);
 void update_memory(void);
+
+void mlp_cost_update_cycle(void);
+void mlp_cost_finalize(Mem_Req* req);
 
 Flag scan_stores(Addr, uns);
 void op_nuke_mem_req(Op*);

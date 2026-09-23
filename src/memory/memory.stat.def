@@ -2448,6 +2448,56 @@ DEF_STAT(  CORE_PREF_MLC_DEMAND_LATENCY1000           , COUNT  , NO_RATIO  )
 DEF_STAT(  CORE_PREF_MLC_DEMAND_LATENCY1000MORE       , DIST  , NO_RATIO  )
 
 
+/* --mlp_cost_stats: distribution of the MLP-based cost of demand MLC misses, per
+   "A Case for MLP-Aware Cache Replacement" (Qureshi et al., ISCA'06).
+
+   Cost, not latency: a miss outstanding alongside N-1 others accrues only 1/N of each cycle it
+   waits, so an isolated miss ends at its full latency and a highly parallel one ends far below
+   it. See --mlp_cost_stats in memory.param.def for the model and mlp_cost_finalize() in
+   memory.c for the accumulation.
+
+   Buckets are 25 cycles wide and NAMED BY LOWER EDGE: MLC_MLP_COST_25 counts costs in [25,50).
+   The chain must stay contiguous and in order -- mlp_cost_finalize indexes it as
+   MLC_MLP_COST_0 + MIN2(cost/25, 16) -- and must stay bracketed by the two DIST entries, which
+   are what delimit the group for the distribution percentages in statistics.c.
+
+   WINDOW: full run, warmup included -- these are ungated. Divide by Cumulative_*, not
+   Periodic_*. */
+DEF_STAT(  MLC_MLP_COST_0                             , DIST   , NO_RATIO  )
+DEF_STAT(  MLC_MLP_COST_25                            , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_MLP_COST_50                            , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_MLP_COST_75                            , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_MLP_COST_100                           , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_MLP_COST_125                           , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_MLP_COST_150                           , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_MLP_COST_175                           , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_MLP_COST_200                           , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_MLP_COST_225                           , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_MLP_COST_250                           , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_MLP_COST_275                           , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_MLP_COST_300                           , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_MLP_COST_325                           , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_MLP_COST_350                           , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_MLP_COST_375                           , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_MLP_COST_400MORE                       , DIST   , NO_RATIO  )
+
+/* Outside the DIST group above on purpose: these are sums, not buckets, and would corrupt the
+   distribution percentages if they fell between the bracketing DIST entries.
+
+   Both sums are in MILLI-cycles: cost per miss is routinely well under one cycle, and these
+   are integer counters, so the raw sums would truncate to noise. Divide by 1000 to read either
+   as cycles.
+
+   MLC_MLP_COST_TOTAL / MLC_MLP_COST_NUM / 1000 is mean cost per demand MLC miss.
+   MLC_MLP_COST_LATENCY_TOTAL is the latency of that SAME set of misses, scaled identically, so
+   COST/LATENCY needs no correction: it is the average 1/MLP those misses saw, and must land in
+   (0,1]. That ratio is the sanity check that the accumulator is working -- exactly 1.0
+   everywhere means N==1 always, i.e. the buffer walk is not seeing concurrent misses. */
+DEF_STAT(  MLC_MLP_COST_TOTAL                         , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_MLP_COST_LATENCY_TOTAL                 , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_MLP_COST_NUM                           , COUNT  , NO_RATIO  )
+
+
 // BATCH SCHEDULING
 DEF_STAT(  TOTAL_BATCH_FORMED                                , COUNT  , NO_RATIO  )
 DEF_STAT(  TOTAL_BATCH_MEM_REQ_MARKED                        , RATIO  , TOTAL_BATCH_FORMED)

@@ -1784,6 +1784,117 @@ void update_memory_queues() {
   }
 }
 
+/* --mlp_cost_stats: is this req one of the outstanding demand MLC misses that share this
+   cycle's stall? See the param comment in memory.param.def for the cost model.
+
+   mlc_miss && !mlc_miss_satisfied is the MLC-level "occupies an MSHR entry" predicate: mlc_miss
+   is armed where mlc_miss_cycle is set, and every path that retires an MLC miss sets
+   mlc_miss_satisfied before clearing mlc_miss_cycle. The state check is what keeps freed
+   req_buffer slots -- which keep their stale field values after release -- out of the count.
+
+   Defined here rather than beside the other stats helpers near the top of the file because it
+   dereferences the file-scope `mem`, which is not declared until above. */
+static inline Flag mlp_cost_tracked(const Mem_Req* req) {
+  if (req->state == MRS_INV)
+    return FALSE;
+  if (!req->mlc_miss || req->mlc_miss_satisfied)
+    return FALSE;
+  if (req->off_path)
+    return FALSE;
+  return req->type == MRT_IFETCH || req->type == MRT_DFETCH || req->type == MRT_DSTORE;
+}
+
+/* --mlp_cost_stats: charge this cycle's stall across the demand MLC misses sharing it.
+
+   This is Algorithm 1 from the paper directly: each cycle, every outstanding demand miss accrues
+   1/N of it. Kept in that per-miss form deliberately, so the code reads as the algorithm does.
+
+   Two passes, and they cannot be fused: every outstanding miss must be charged against the SAME
+   N. Charging as we count would give the first miss in the buffer a larger share than the last
+   purely because of its slot index.
+
+   On the clock: the MLC has no frequency domain of its own -- freq.h declares only
+   FREQ_DOMAIN_CORES[], FREQ_DOMAIN_L1 and FREQ_DOMAIN_MEMORY, and there is no MLC_CYCLE_TIME
+   param. FREQ_DOMAIN_L1 is the uncore domain, not the LLC's private clock: mem_process_mlc_reqs
+   and mem_process_mlc_fill_reqs both run under it, so it is what clocks the MLC. MLC_CYCLES is
+   an access latency measured in that clock, not a frequency. It is therefore also the clock
+   mlc_miss_cycle is stamped in, which is what makes cost and latency directly comparable.
+
+   MUST be called exactly once per uncore cycle, and from nowhere else. That is what bounds a
+   miss's cost by its own latency -- one share of at most 1 per cycle outstanding -- which the
+   rest of the code relies on without checking. update_memory() has TWO freq_is_ready
+   (FREQ_DOMAIN_L1) blocks; the single call site is at the end of the second one, and cmp_cycle()
+   runs once per freq_advance_time(). A second call site anywhere, or this one moved into the
+   earlier block, would silently corrupt every cost. */
+void mlp_cost_update_cycle(void) {
+  if (!MLP_COST_STATS)
+    return;
+
+  uns n_outstanding = 0;
+  for (uns ii = 0; ii < mem->total_mem_req_buffers; ii++) {
+    if (mlp_cost_tracked(&mem->req_buffer[ii]))
+      n_outstanding++;
+  }
+  if (n_outstanding == 0)
+    return;
+
+  const double share = 1.0 / (double)n_outstanding;
+  for (uns ii = 0; ii < mem->total_mem_req_buffers; ii++) {
+    if (mlp_cost_tracked(&mem->req_buffer[ii]))
+      mem->req_buffer[ii].mlp_cost += share;
+  }
+}
+
+/* --mlp_cost_stats: start charging this req, at every site that arms mlc_miss_cycle.
+
+   Cost accrues over one MLC miss, not over the buffer entry's whole life, so re-arming the miss
+   must re-zero the cost with it. */
+static inline void mlp_cost_arm(Mem_Req* req) {
+  req->mlp_cost = 0.0;
+}
+
+/* --mlp_cost_stats: the MLC miss is retiring, so its cost is final -- histogram it.
+
+   Must be called BEFORE mlc_miss_satisfied is set, because that flag is what mlp_cost_tracked
+   reads to decide the miss is still outstanding; after it is set this req is no longer one of
+   the tracked misses and the cost would be attributed to a miss the accumulator has stopped
+   charging. Every early-return bypass path in mlc_fill_line retires a miss too, so each calls
+   this -- a bypassed line is never inserted, but the miss it caused was still paid for.
+
+   Buckets are 25 cycles wide to 400. That range is deliberate: an MLC miss that hits the LLC
+   costs on the order of tens of cycles while one that goes to DRAM costs a few hundred, and the
+   point of this histogram is to show where the modes actually sit so the 3-bit quantization
+   from the paper (which assumed a 400-cycle memory and used 60-cycle buckets) can be
+   re-cut for this hierarchy instead of inherited. */
+void mlp_cost_finalize(Mem_Req* req) {
+  if (!MLP_COST_STATS)
+    return;
+  if (!mlp_cost_tracked(req))
+    return;
+
+  const double cost = req->mlp_cost;
+  const Counter latency = cycle_count - req->mlc_miss_cycle;
+
+  ASSERT(req->proc_id, req->mlc_miss_cycle != MAX_CTR);
+
+  /* 0 <= cost <= latency holds by construction and is not asserted: cost is a sum of shares
+     that are positive and at most 1 (N >= 1 whenever the accumulator runs), zeroed at arm, and
+     added at most once per cycle -- see mlp_cost_update_cycle on why that last part is the
+     load-bearing half. */
+
+  /* Truncating toward zero, so bucket k holds [25k, 25(k+1)) -- the lower-edge naming the
+     stat.def comment documents. */
+  STAT_EVENT(req->proc_id, MLC_MLP_COST_0 + (uns)MIN2((uns64)(cost / 25.0), (uns64)16));
+
+  /* Stats are integer counters, so the sum is kept in milli-cycles to keep three decimal
+     places of a per-miss mean that is often well under one cycle. Divide MLC_MLP_COST_TOTAL by
+     1000 to read it as cycles; MLC_MLP_COST_LATENCY_TOTAL is scaled the same way so their
+     ratio -- the average 1/MLP -- needs no correction. */
+  INC_STAT_EVENT(req->proc_id, MLC_MLP_COST_TOTAL, (Counter)(cost * 1000.0));
+  INC_STAT_EVENT(req->proc_id, MLC_MLP_COST_LATENCY_TOTAL, latency * 1000);
+  STAT_EVENT(req->proc_id, MLC_MLP_COST_NUM);
+}
+
 void update_on_chip_memory_stats() {
   STAT_EVENT_ALL(L1_CYCLE);
   STAT_EVENT(0, MIN2(MEM_REQ_DEMANDS__0 + mem_req_demand_entries / 4, MEM_REQ_DEMANDS_64));
@@ -1833,6 +1944,15 @@ void update_memory() {
     mem_process_bus_out_reqs();
     mem_process_l1_reqs();
     mem_process_mlc_reqs();
+
+    /* Last thing in the uncore cycle, and specifically AFTER mem_process_mlc_reqs, which is
+       where MLC misses are armed (mem_process_mlc_miss_access) and where some of them also
+       retire same-cycle. Arriving here last means the set of outstanding misses is final for
+       this cycle, so a miss armed at T is charged for T, and one that retired at T -- in either
+       this block or mem_process_mlc_fill_reqs up in the earlier FREQ_DOMAIN_L1 block -- is not.
+       A miss armed at T and filled at T+L is charged on T..T+L-1: exactly L shares, so an
+       isolated miss ends with cost == latency rather than a cycle short of it. */
+    mlp_cost_update_cycle();
   }
 
   for (uns proc_id = 0; proc_id < NUM_CORES; proc_id++) {
@@ -2327,6 +2447,7 @@ static Flag mem_process_mlc_miss_access(Mem_Req* req, Mem_Queue_Entry* mlc_queue
   /* Mark the request as MLC_miss */
   req->mlc_miss = TRUE;
   req->mlc_miss_cycle = cycle_count;
+  mlp_cost_arm(req);
 
   if ((req->type == MRT_WB) || (req->type == MRT_WB_NODIRTY)) {
     // if the request is a write back request then the processor just insert the
@@ -4285,6 +4406,7 @@ static void mem_init_new_req(Mem_Req* new_req, Mem_Req_Type type, Mem_Queue_Type
   new_req->mlc_miss = FALSE;
   new_req->mlc_miss_satisfied = FALSE;
   new_req->mlc_miss_cycle = MAX_CTR;
+  mlp_cost_arm(new_req);
   new_req->l1_hit = FALSE;
   new_req->l1_miss = FALSE;
   new_req->l1_miss_satisfied = FALSE;
@@ -4485,6 +4607,7 @@ Flag new_mem_req(Mem_Req_Type type, uns8 proc_id, Addr addr, uns size, uns delay
     }
     matching_req->mlc_miss = TRUE;
     matching_req->mlc_miss_cycle = cycle_count;
+    mlp_cost_arm(matching_req); /* a demand promoting an in-flight L2 prefetch re-arms the miss */
   }
 
   /* Step 2: Found matching request. Adjust it based on the current request */
@@ -5536,6 +5659,7 @@ Flag mlc_fill_line(Mem_Req* req) {
     STAT_EVENT(req->proc_id, MLC_MOCKINGJAY_BYPASS);
     ASSERT(req->proc_id, req->mlc_miss_cycle != MAX_CTR);
     ASSERT(req->proc_id, req->mlc_miss);
+    mlp_cost_finalize(req); /* bypassed, but the miss was still paid for */
     req->mlc_miss_satisfied = TRUE;
     req->mlc_miss_cycle = MAX_CTR;
     return SUCCESS;
@@ -5591,6 +5715,7 @@ Flag mlc_fill_line(Mem_Req* req) {
         sb_data->offpath_op_unique = req->oldest_op_unique_num;
         sb_data->l0_modified_fetched_by_offpath = FALSE;
         sb_data->mlc_miss_latency = cycle_count - req->mlc_miss_cycle;
+        sb_data->mlp_cost = req->mlp_cost;
         sb_data->fetch_cycle = cycle_count;
         sb_data->onpath_use_cycle = req->off_path ? 0 : cycle_count;
       }
@@ -5598,6 +5723,7 @@ Flag mlc_fill_line(Mem_Req* req) {
       STAT_EVENT(req->proc_id, MLC_MARKED_BYPASS);
       ASSERT(req->proc_id, req->mlc_miss_cycle != MAX_CTR);
       ASSERT(req->proc_id, req->mlc_miss);
+      mlp_cost_finalize(req); /* bypassed, but the miss was still paid for */
       req->mlc_miss_satisfied = TRUE;
       req->mlc_miss_cycle = MAX_CTR;
       return SUCCESS;
@@ -5905,6 +6031,12 @@ Flag mlc_fill_line(Mem_Req* req) {
   data->mlc_miss_latency = (req->type == MRT_WB) ? 0 : cycle_count - req->mlc_miss_cycle;
   data->fetch_cycle = cycle_count;
   data->onpath_use_cycle = req->off_path ? 0 : cycle_count;
+
+  /* --mlp_cost_stats: carry the cost onto the line before the req is retired. Zero for a
+     writeback fill, matching mlc_miss_latency above: it paid no memory latency, so it accrued
+     no cost. mlp_cost_finalize must precede mlc_miss_satisfied -- see its comment. */
+  data->mlp_cost = (req->type == MRT_WB) ? 0.0 : req->mlp_cost;
+  mlp_cost_finalize(req);
 
   req->mlc_miss_satisfied = TRUE;
 

@@ -187,6 +187,43 @@ DEF_PARAM(  uop_queue_length               , UOP_QUEUE_LENGTH                , u
 DEF_PARAM(early_evict_stats, EARLY_EVICT_STATS, Flag, Flag, FALSE, )
 DEF_PARAM(early_evict_lat_mult, EARLY_EVICT_LAT_MULT, uns, uns, 2, )
 
+/* --mlp_cost_stats: accumulate the MLP-based cost of every demand MLC miss, per
+ * "A Case for MLP-Aware Cache Replacement" (Qureshi et al., ISCA'06), Algorithm 1.
+ *
+ * The paper's cost model: a miss serviced alone stalls the processor for its full latency,
+ * while N misses serviced concurrently share that stall. So each cycle a miss is outstanding
+ * it accrues 1/N, where N is the number of demand misses outstanding that cycle. A fully
+ * isolated miss therefore ends with mlp_cost == its own latency; a miss that always overlapped
+ * 4 others ends with roughly a quarter of it. Cost is what the replacement policy wants to
+ * protect, NOT latency -- that is the whole point of the paper.
+ *
+ * Scarab has no MLC-level MSHR object, so the "MSHR" here is the subset of mem->req_buffer[]
+ * with mlc_miss set and mlc_miss_satisfied clear. The walk is O(total_mem_req_buffers) per
+ * uncore cycle, which is why this is a knob and defaults off.
+ *
+ * Counted as demand: IFETCH, DFETCH, DSTORE. Prefetches and writebacks are excluded, matching
+ * the paper ("We count instruction accesses, load accesses, and store accesses that miss in
+ * the largest on-chip cache as demand misses"). Off-path requests are excluded via
+ * req->off_path. Note the paper's hardware instead treats a miss as correct-path until the
+ * branch resolves, which would be off_path_confirmed here; off_path is the cleaner signal for
+ * calibrating quantization, since it never credits cost to a miss that was never needed.
+ *
+ * Cost is accumulated as a double, in cycles. The paper's 9.5 fixed-point format is a statement
+ * about what the HARDWARE would store, and modelling it here would only bias the measurement:
+ * an integer 1/N truncates, always downward, every cycle of every miss. Quantization belongs on
+ * top of an exact value -- which is the point of the histogram this feeds -- not inside the
+ * accumulator producing it.
+ *
+ * The 1/N is applied per cycle, as the paper's Algorithm 1 states it, and cannot be deferred:
+ * summing outstanding cycles and dividing once at the end computes latency/mean(N), an
+ * arithmetic mean where the model needs a harmonic one. For a miss outstanding two cycles at
+ * N=1 then N=4, the cost is 1/1 + 1/4 = 1.25, while 2/mean(1,4) = 0.8.
+ *
+ * WINDOW: these counters are NOT gated on an ROI predicate, so under --full_warmup they span
+ * warmup + target, like every ordinary DEF_STAT counter. Divide them by Cumulative_*, never by
+ * Periodic_*. See the comment on membound_in_roi() in memory.c for why that distinction bites. */
+DEF_PARAM(mlp_cost_stats, MLP_COST_STATS, Flag, Flag, FALSE, )
+
 /* L0 data */
 DEF_PARAM(dcache_size, DCACHE_SIZE, uns, uns, (64 * 1024), )
 DEF_PARAM(dcache_assoc, DCACHE_ASSOC, uns, uns, 1, )
