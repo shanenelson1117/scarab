@@ -345,15 +345,26 @@ Flag early_evict_in_roi(void) {
    Both fraction lookups are pure reads, and the whole thing is skipped when --membound_stats
    is off, so this costs nothing in an unrelated run. Returns the classification so the caller
    can also count the miss and its merges. */
-static inline void membound_classify_fill(Mem_Req* req, Flag* is_membound, Flag* is_fe_bound) {
+static inline void membound_classify_fill(Mem_Req* req, Flag* is_membound, Flag* is_fe_bound,
+                                          double* bound_frac) {
   *is_membound = FALSE;
   *is_fe_bound = FALSE;
+  *bound_frac = 0.0;
   if (!MEMBOUND_STATS)
     return;
   if (req->type == MRT_IFETCH) {
     double fe_frac = 0.0;
-    if (icache_fe_frac_for_line(req->proc_id, req->addr, &fe_frac) && fe_frac > (double)TD_FE_RRIP_THRESH)
-      *is_fe_bound = TRUE;
+    if (icache_fe_frac_for_line(req->proc_id, req->addr, &fe_frac)) {
+      /* Histogram the RAW fraction, gate or no gate -- see the MLC_FEBOUND_FRAC_* comment in
+         memory.stat.def. Clamped because the bucket index is a cast, and a fraction of exactly
+         1.0 would otherwise land one past the end of the chain. */
+      STAT_EVENT(req->proc_id, MLC_FEBOUND_FRAC_0 + (uns)MIN2((uns64)(fe_frac * 20.0), (uns64)19));
+      *bound_frac = fe_frac;
+      if (fe_frac > (double)TD_FE_RRIP_THRESH)
+        *is_fe_bound = TRUE;
+    } else {
+      STAT_EVENT(req->proc_id, MLC_FEBOUND_FRAC_NONE);
+    }
   } else {
     double frac = 0.0;
     Addr   frac_pc = 0;
@@ -361,8 +372,18 @@ static inline void membound_classify_fill(Mem_Req* req, Flag* is_membound, Flag*
        load. Merges append with sl_list_add_tail, so that is normally the load whose miss
        created this request -- i.e. "the first miss". Note the walk skips stale/freed op slots,
        so if the original op is gone this falls through to a merged one. */
-    if (td_mlc_req_load_frac(req, &frac, &frac_pc, NULL) && frac > (double)TD_LOAD_REPLAY_THRESH)
-      *is_membound = TRUE;
+    if (td_mlc_req_load_frac(req, &frac, &frac_pc, NULL)) {
+      STAT_EVENT(req->proc_id, MLC_MEMBOUND_FRAC_0 + (uns)MIN2((uns64)(frac * 20.0), (uns64)19));
+      *bound_frac = frac;
+      if (frac > (double)TD_LOAD_REPLAY_THRESH)
+        *is_membound = TRUE;
+    } else {
+      /* No demanding load: a store fill, a prefetch, a writeback, or a load whose op slot was
+         already freed. These can never be marked, so they are the eligibility denominator --
+         counting them here is what makes a per-set "fraction of bound lines" normalisable
+         against the lines that could actually carry a value. */
+      STAT_EVENT(req->proc_id, MLC_MEMBOUND_FRAC_NONE);
+    }
   }
 }
 
@@ -1882,9 +1903,10 @@ void mlp_cost_finalize(Mem_Req* req) {
      added at most once per cycle -- see mlp_cost_update_cycle on why that last part is the
      load-bearing half. */
 
-  /* Truncating toward zero, so bucket k holds [25k, 25(k+1)) -- the lower-edge naming the
-     stat.def comment documents. */
-  STAT_EVENT(req->proc_id, MLC_MLP_COST_0 + (uns)MIN2((uns64)(cost / 25.0), (uns64)16));
+  /* Truncating toward zero, so bucket k holds [5k, 5(k+1)) -- the lower-edge naming the
+     stat.def comment documents. 5-cycle buckets to 200 because the distribution is heavily
+     low-skewed; see the stat.def comment for why 25 was too coarse to calibrate against. */
+  STAT_EVENT(req->proc_id, MLC_MLP_COST_0 + (uns)MIN2((uns64)(cost / 5.0), (uns64)40));
 
   /* Stats are integer counters, so the sum is kept in milli-cycles to keep three decimal
      places of a per-miss mean that is often well under one cycle. Divide MLC_MLP_COST_TOTAL by
@@ -5429,12 +5451,18 @@ Flag l1_fill_line(Mem_Req* req) {
      while it was in flight. Classified now, by the first miss's signal, which is exactly the
      definition wanted -- the re-misses themselves need not be membound. */
   {
-    Flag mb_fill = FALSE, fe_fill = FALSE;
-    membound_classify_fill(req, &mb_fill, &fe_fill);
+    Flag   mb_fill = FALSE, fe_fill = FALSE;
+    double bound_frac = 0.0;
+    membound_classify_fill(req, &mb_fill, &fe_fill, &bound_frac);
     /* Stage the bit even during warmup: a line filled before the ROI that is REUSED inside it
        must still be recognisable as membound, or the hit counter would miss it. Only the
        counting below is scoped to the ROI. */
     cache_set_next_fill_bound(mb_fill, fe_fill);
+    /* Graded companion, staged unconditionally for the same reason as the bits above. The
+       cost is the MLP cost of THIS request's MLC miss, so an LLC line carries an MLC-
+       denominated cost -- correct as "what the miss that fetched me cost", but not an
+       LLC-miss cost, which nothing measures. */
+    cache_set_next_fill_cost(bound_frac, req->mlp_cost);
     if (MEMBOUND_STATS && membound_in_roi()) {
       if (mb_fill) {
         STAT_EVENT(req->proc_id, L1_MEMBOUND_FILL);
@@ -5901,12 +5929,18 @@ Flag mlc_fill_line(Mem_Req* req) {
      while it was in flight. Classified now, by the first miss's signal, which is exactly the
      definition wanted -- the re-misses themselves need not be membound. */
   {
-    Flag mb_fill = FALSE, fe_fill = FALSE;
-    membound_classify_fill(req, &mb_fill, &fe_fill);
+    Flag   mb_fill = FALSE, fe_fill = FALSE;
+    double bound_frac = 0.0;
+    membound_classify_fill(req, &mb_fill, &fe_fill, &bound_frac);
     /* Stage the bit even during warmup: a line filled before the ROI that is REUSED inside it
        must still be recognisable as membound, or the hit counter would miss it. Only the
        counting below is scoped to the ROI. */
     cache_set_next_fill_bound(mb_fill, fe_fill);
+    /* Graded companion, staged unconditionally for the same reason as the bits above. The
+       cost is the MLP cost of THIS request's MLC miss, so an LLC line carries an MLC-
+       denominated cost -- correct as "what the miss that fetched me cost", but not an
+       LLC-miss cost, which nothing measures. */
+    cache_set_next_fill_cost(bound_frac, req->mlp_cost);
     if (MEMBOUND_STATS && membound_in_roi()) {
       if (mb_fill) {
         STAT_EVENT(req->proc_id, MLC_MEMBOUND_FILL);

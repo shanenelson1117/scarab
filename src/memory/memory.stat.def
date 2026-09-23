@@ -2456,30 +2456,57 @@ DEF_STAT(  CORE_PREF_MLC_DEMAND_LATENCY1000MORE       , DIST  , NO_RATIO  )
    it. See --mlp_cost_stats in memory.param.def for the model and mlp_cost_finalize() in
    memory.c for the accumulation.
 
-   Buckets are 25 cycles wide and NAMED BY LOWER EDGE: MLC_MLP_COST_25 counts costs in [25,50).
-   The chain must stay contiguous and in order -- mlp_cost_finalize indexes it as
-   MLC_MLP_COST_0 + MIN2(cost/25, 16) -- and must stay bracketed by the two DIST entries, which
-   are what delimit the group for the distribution percentages in statistics.c.
+   Buckets are 5 cycles wide and NAMED BY LOWER EDGE: MLC_MLP_COST_25 counts costs in [25,30).
+   5 and not 25 because the measured distribution is heavily low-skewed -- on the google traces
+   two thirds of demand MLC misses cost under 50 cycles and 96.6% under 200, so 25-cycle buckets
+   put five of the seven cut points an equal-population 3-bit code needs inside the first two
+   buckets, where they cannot be resolved. The chain must stay contiguous and in order --
+   mlp_cost_finalize indexes it as MLC_MLP_COST_0 + MIN2(cost/5, 40) -- and must stay bracketed
+   by the two DIST entries, which delimit the group for statistics.c.
 
    WINDOW: full run, warmup included -- these are ungated. Divide by Cumulative_*, not
    Periodic_*. */
-DEF_STAT(  MLC_MLP_COST_0                             , DIST   , NO_RATIO  )
-DEF_STAT(  MLC_MLP_COST_25                            , COUNT  , NO_RATIO  )
-DEF_STAT(  MLC_MLP_COST_50                            , COUNT  , NO_RATIO  )
-DEF_STAT(  MLC_MLP_COST_75                            , COUNT  , NO_RATIO  )
-DEF_STAT(  MLC_MLP_COST_100                           , COUNT  , NO_RATIO  )
-DEF_STAT(  MLC_MLP_COST_125                           , COUNT  , NO_RATIO  )
-DEF_STAT(  MLC_MLP_COST_150                           , COUNT  , NO_RATIO  )
-DEF_STAT(  MLC_MLP_COST_175                           , COUNT  , NO_RATIO  )
-DEF_STAT(  MLC_MLP_COST_200                           , COUNT  , NO_RATIO  )
-DEF_STAT(  MLC_MLP_COST_225                           , COUNT  , NO_RATIO  )
-DEF_STAT(  MLC_MLP_COST_250                           , COUNT  , NO_RATIO  )
-DEF_STAT(  MLC_MLP_COST_275                           , COUNT  , NO_RATIO  )
-DEF_STAT(  MLC_MLP_COST_300                           , COUNT  , NO_RATIO  )
-DEF_STAT(  MLC_MLP_COST_325                           , COUNT  , NO_RATIO  )
-DEF_STAT(  MLC_MLP_COST_350                           , COUNT  , NO_RATIO  )
-DEF_STAT(  MLC_MLP_COST_375                           , COUNT  , NO_RATIO  )
-DEF_STAT(  MLC_MLP_COST_400MORE                       , DIST   , NO_RATIO  )
+DEF_STAT(  MLC_MLP_COST_0                     , DIST   , NO_RATIO  )
+DEF_STAT(  MLC_MLP_COST_5                     , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_MLP_COST_10                    , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_MLP_COST_15                    , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_MLP_COST_20                    , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_MLP_COST_25                    , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_MLP_COST_30                    , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_MLP_COST_35                    , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_MLP_COST_40                    , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_MLP_COST_45                    , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_MLP_COST_50                    , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_MLP_COST_55                    , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_MLP_COST_60                    , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_MLP_COST_65                    , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_MLP_COST_70                    , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_MLP_COST_75                    , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_MLP_COST_80                    , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_MLP_COST_85                    , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_MLP_COST_90                    , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_MLP_COST_95                    , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_MLP_COST_100                   , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_MLP_COST_105                   , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_MLP_COST_110                   , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_MLP_COST_115                   , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_MLP_COST_120                   , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_MLP_COST_125                   , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_MLP_COST_130                   , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_MLP_COST_135                   , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_MLP_COST_140                   , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_MLP_COST_145                   , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_MLP_COST_150                   , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_MLP_COST_155                   , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_MLP_COST_160                   , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_MLP_COST_165                   , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_MLP_COST_170                   , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_MLP_COST_175                   , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_MLP_COST_180                   , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_MLP_COST_185                   , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_MLP_COST_190                   , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_MLP_COST_195                   , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_MLP_COST_200MORE               , DIST   , NO_RATIO  )
 
 /* Outside the DIST group above on purpose: these are sums, not buckets, and would corrupt the
    distribution percentages if they fell between the bracketing DIST entries.
@@ -2496,6 +2523,76 @@ DEF_STAT(  MLC_MLP_COST_400MORE                       , DIST   , NO_RATIO  )
 DEF_STAT(  MLC_MLP_COST_TOTAL                         , COUNT  , NO_RATIO  )
 DEF_STAT(  MLC_MLP_COST_LATENCY_TOTAL                 , COUNT  , NO_RATIO  )
 DEF_STAT(  MLC_MLP_COST_NUM                           , COUNT  , NO_RATIO  )
+
+
+/* --membound_stats: distributions of the RAW boundness FRACTIONS, before any threshold.
+
+   membound_fill / fe_bound_fill record only whether a fraction cleared its gate, so nothing
+   until now measured the fractions themselves. A policy that weights a line by HOW bound it was
+   -- rather than by a yes/no mark -- needs the shape of that distribution to place its
+   quantization levels, exactly as MLC_MLP_COST_* does for cost. Without it the graded signal
+   could turn out to have almost no dynamic range (nearly every load at 0.9+, say) and a
+   graded policy would be indistinguishable from the thresholded one.
+
+   Buckets are 0.05 wide, NAMED BY LOWER EDGE IN PERCENT: MLC_MEMBOUND_FRAC_50 counts fractions
+   in [0.50,0.55). Indexed as MLC_MEMBOUND_FRAC_0 + MIN2(frac*20, 19); each chain is contiguous
+   and bracketed by its two DIST entries.
+
+   Counted for EVERY fill that has a fraction to report, above or below the gate -- that is the
+   whole point. The _NONE counters below hold fills with no fraction at all.
+
+   WINDOW: these sit on the same ROI gate as the rest of --membound_stats (target-only under
+   --membound_stats_roi, the default), so they pair with Periodic_*, NOT Cumulative_*. */
+DEF_STAT(  MLC_MEMBOUND_FRAC_0                , DIST   , NO_RATIO  )
+DEF_STAT(  MLC_MEMBOUND_FRAC_5                , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_MEMBOUND_FRAC_10               , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_MEMBOUND_FRAC_15               , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_MEMBOUND_FRAC_20               , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_MEMBOUND_FRAC_25               , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_MEMBOUND_FRAC_30               , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_MEMBOUND_FRAC_35               , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_MEMBOUND_FRAC_40               , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_MEMBOUND_FRAC_45               , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_MEMBOUND_FRAC_50               , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_MEMBOUND_FRAC_55               , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_MEMBOUND_FRAC_60               , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_MEMBOUND_FRAC_65               , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_MEMBOUND_FRAC_70               , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_MEMBOUND_FRAC_75               , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_MEMBOUND_FRAC_80               , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_MEMBOUND_FRAC_85               , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_MEMBOUND_FRAC_90               , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_MEMBOUND_FRAC_95               , DIST   , NO_RATIO  )
+
+DEF_STAT(  MLC_FEBOUND_FRAC_0                 , DIST   , NO_RATIO  )
+DEF_STAT(  MLC_FEBOUND_FRAC_5                 , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_FEBOUND_FRAC_10                , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_FEBOUND_FRAC_15                , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_FEBOUND_FRAC_20                , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_FEBOUND_FRAC_25                , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_FEBOUND_FRAC_30                , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_FEBOUND_FRAC_35                , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_FEBOUND_FRAC_40                , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_FEBOUND_FRAC_45                , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_FEBOUND_FRAC_50                , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_FEBOUND_FRAC_55                , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_FEBOUND_FRAC_60                , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_FEBOUND_FRAC_65                , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_FEBOUND_FRAC_70                , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_FEBOUND_FRAC_75                , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_FEBOUND_FRAC_80                , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_FEBOUND_FRAC_85                , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_FEBOUND_FRAC_90                , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_FEBOUND_FRAC_95                , DIST   , NO_RATIO  )
+
+/* Fills with NO fraction to report, so they can never be marked and are not in the chains
+   above. This is the eligibility denominator: a store fill has no demanding load, and a
+   prefetch or writeback has no demanding op at all, so on the google traces only ~42% of MLC
+   fills can carry a membound value and ~1% an FE value. Any per-set normalisation that divides
+   by associativity rather than by the eligible count is really measuring the store/prefetch
+   mix. */
+DEF_STAT(  MLC_MEMBOUND_FRAC_NONE                 , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_FEBOUND_FRAC_NONE                  , COUNT  , NO_RATIO  )
 
 
 // BATCH SCHEDULING

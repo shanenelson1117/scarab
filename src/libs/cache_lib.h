@@ -115,6 +115,25 @@ typedef struct Cache_Entry_struct {
   Flag membound_fill;  /* data line, demanding load's membound fraction > TD_LOAD_REPLAY_THRESH */
   Flag fe_bound_fill;  /* instruction line, fetch miss's FE-bound fraction > TD_FE_RRIP_THRESH */
 
+  /* GRADED versions of the two signals above, for a cost-scaled replacement policy. The Flags
+     say only whether a fraction cleared its gate; these say how far, which is what a policy
+     that WEIGHTS a line by its cost needs rather than one that merely marks it.
+
+     bound_frac is the raw fraction in [0,1] -- membound for a data line, FE-bound for an
+     instruction line. One field because the two are mutually exclusive (see the Flags above);
+     read membound_fill / fe_bound_fill to know which signal it came from. mlp_cost is the
+     MLP-based cost in cycles of the miss that filled this line, mirrored from
+     Mem_Req.mlp_cost.
+
+     Both are stored RAW, not quantized. Real hardware would keep a few bits (the paper uses 3
+     for cost); keeping full precision here lets the quantization be swept as a policy
+     parameter without re-running the simulation to regenerate line state. Both are 0 for
+     lines with no signal -- prefetch and writeback fills, and store fills, which have no
+     demanding load. A cost-scaled policy MUST decide explicitly what a 0 means, or it will
+     evict every prefetched line first. */
+  double bound_frac;
+  double mlp_cost;
+
   /* --early_evict_stats: cycle_count at the fill that installed THIS line. Subtracted from
      cycle_count when the line is replaced to give its residency, which is what the early-
      eviction counters threshold. Stamped by every insert path, whether or not the stat is
@@ -303,6 +322,10 @@ void cache_set_hit_promote_frac(Flag have, double frac);
  * fill that never happens (bypass, or an early FAILURE return) cannot leak its classification
  * onto an unrelated later fill. Both FALSE = the line is neither, which is the default. */
 void cache_set_next_fill_bound(Flag membound, Flag fe_bound);
+/* Graded companion to cache_set_next_fill_bound, staged at the same point and consumed by the
+   same insert paths. Separate entry point rather than more arguments on that one so the
+   marked-RRIP callers that only need the Flags are untouched. */
+void cache_set_next_fill_cost(double bound_frac, double mlp_cost);
 /* TRUE if the most recent cache_access on `cache` hit a line that had been brought in by a
  * membound (resp. FE-bound) access. Valid only immediately after that access. */
 Flag cache_last_hit_membound(Cache* cache);

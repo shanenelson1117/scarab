@@ -100,20 +100,34 @@ uns ext_cache_index(Cache* cache, Addr addr, Addr* tag, Addr* line_addr) {
  * general_action_repl for the strategy policies (>= REPL_VOID), cache_insert_replpos for the
  * rest -- REPL_TRUE_LRU, the DEFAULT for both the LLC and the MLC, is on the latter path, so
  * both have to consume it or the bit would be silently dead in the default configuration. */
-static Flag g_next_fill_membound = FALSE;
-static Flag g_next_fill_fe_bound = FALSE;
+static Flag   g_next_fill_membound = FALSE;
+static Flag   g_next_fill_fe_bound = FALSE;
+static double g_next_fill_bound_frac = 0.0;
+static double g_next_fill_mlp_cost = 0.0;
 
 void cache_set_next_fill_bound(Flag membound, Flag fe_bound) {
   g_next_fill_membound = membound;
   g_next_fill_fe_bound = fe_bound;
 }
 
-/* Stamp the staged classification onto a freshly allocated line and clear the one-shot. */
+void cache_set_next_fill_cost(double bound_frac, double mlp_cost) {
+  g_next_fill_bound_frac = bound_frac;
+  g_next_fill_mlp_cost = mlp_cost;
+}
+
+/* Stamp the staged classification onto a freshly allocated line and clear the one-shot.
+   The graded pair clears here too, and not in cache_set_next_fill_cost, so a fill that stages
+   the Flags but not the costs (any caller that has not been updated) gets 0 rather than the
+   previous fill's values. */
 static inline void consume_fill_bound(Cache_Entry* line) {
   line->membound_fill = g_next_fill_membound;
   line->fe_bound_fill = g_next_fill_fe_bound;
+  line->bound_frac = g_next_fill_bound_frac;
+  line->mlp_cost = g_next_fill_mlp_cost;
   g_next_fill_membound = FALSE;
   g_next_fill_fe_bound = FALSE;
+  g_next_fill_bound_frac = 0.0;
+  g_next_fill_mlp_cost = 0.0;
 }
 
 Flag cache_last_hit_membound(Cache* cache) {
@@ -355,6 +369,8 @@ void init_cache(Cache* cache, const char* name, uns cache_size, uns assoc, uns l
     for (jj = 0; jj < assoc; jj++) {
       cache->entries[ii][jj].valid = FALSE;
       cache->entries[ii][jj].membound_fill = FALSE;
+      cache->entries[ii][jj].bound_frac = 0.0;
+      cache->entries[ii][jj].mlp_cost = 0.0;
       cache->entries[ii][jj].fe_bound_fill = FALSE;
       cache->entries[ii][jj].fill_cycle = 0;  // --early_evict_stats
       if (data_size) {
@@ -681,6 +697,8 @@ void cache_invalidate(Cache* cache, Addr addr, Addr* line_addr) {
       /* --membound_stats: the classification describes a line that is no longer here. Clearing
          it stops a later fill that stages nothing from inheriting the old line's bits. */
       line->membound_fill = FALSE;
+      line->bound_frac = 0.0;
+      line->mlp_cost = 0.0;
       line->fe_bound_fill = FALSE;
     }
   }
@@ -1651,6 +1669,8 @@ void general_action_init(Cache* cache, const char* name, uns cache_size, uns ass
       cache->entries[ii][jj].valid = FALSE;
       cache->entries[ii][jj].marked_protected = FALSE;
       cache->entries[ii][jj].membound_fill = FALSE;
+      cache->entries[ii][jj].bound_frac = 0.0;
+      cache->entries[ii][jj].mlp_cost = 0.0;
       cache->entries[ii][jj].fe_bound_fill = FALSE;
       cache->entries[ii][jj].fill_cycle = 0;  // --early_evict_stats
       if (data_size) {
