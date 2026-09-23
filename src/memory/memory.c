@@ -1815,7 +1815,18 @@ static inline Flag mlp_cost_tracked(const Mem_Req* req) {
     return FALSE;
   if (!req->mlc_miss || req->mlc_miss_satisfied)
     return FALSE;
-  if (req->off_path)
+  /* --mlp_cost_include_offpath: when set, no off-path gating at all -- a wrong-path miss
+     accrues cost and counts toward N exactly like any other MSHR occupant. See
+     memory.param.def; the default keeps the oracle exclusion. */
+  if (!MLP_COST_INCLUDE_OFFPATH && req->off_path)
+    return FALSE;
+  /* --mlp_cost_exclude_stores: drop stores from the tracked set entirely. Because this one
+     predicate gates BOTH the per-cycle concurrency count and the per-request charge, excluding
+     a type here has two effects at once -- a store accrues no cost of its own (so the line it
+     fills carries mlp_cost 0 and quantizes to level 0), and it does not appear in N, so it
+     stops diluting the cost charged to the loads it overlaps. Those are exactly the two halves
+     of the question the knob exists to answer; see memory.param.def. */
+  if (MLP_COST_EXCLUDE_STORES && req->type == MRT_DSTORE)
     return FALSE;
   return req->type == MRT_IFETCH || req->type == MRT_DFETCH || req->type == MRT_DSTORE;
 }

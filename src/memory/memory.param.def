@@ -284,6 +284,73 @@ DEF_PARAM(early_evict_lat_mult, EARLY_EVICT_LAT_MULT, uns, uns, 2, )
  * Periodic_*. See the comment on membound_in_roi() in memory.c for why that distinction bites. */
 DEF_PARAM(mlp_cost_stats, MLP_COST_STATS, Flag, Flag, FALSE, )
 
+/* --mlp_cost_exclude_stores: treat MRT_DSTORE as if it were not a demand miss, for cost
+ * purposes only. Default FALSE, which is the paper's definition ("instruction accesses, load
+ * accesses, and store accesses that miss in the largest on-chip cache").
+ *
+ * ATTRIBUTION EXPERIMENT. Stores are 28.7% of MLC demand misses on the google traces and they
+ * occupy MSHRs exactly like loads (mem_req_type_is_demand covers all three types), so today
+ * they both accrue MLP cost and count toward N. That gives REPL_MLP a capability the
+ * marked-RRIP scheme never had: a store-filled line can be ranked ABOVE an unbound load's,
+ * whereas marked-RRIP inserted both at `basic` and could not tell them apart. So any win LIN
+ * shows over marked-RRIP might come from the cost model -- or merely from stores having become
+ * rankable at all. Turning this on removes that capability while leaving everything else
+ * intact, and the difference is the answer.
+ *
+ * TWO EFFECTS, BOTH INTENDED, and they are not separable through this knob:
+ *   1. Store-filled lines carry mlp_cost 0, quantize to level 0, and are evicted first among
+ *      equals -- i.e. stores go back to being indistinguishable from the cheapest loads.
+ *   2. Stores leave N, so a load overlapping four store misses is charged 1/1 for those cycles
+ *      instead of 1/5. Load costs RISE and the cost distribution should sharpen.
+ * Effect 2 is arguably the more defensible model on its own merits: a store does not block
+ * dispatch the way a load does, so counting it as a concurrent stall-sharer overstates how
+ * much company a load really had. If the sweep shows a win here, it is worth separating which
+ * of the two effects produced it before concluding anything about stores.
+ *
+ * Expect MLC_MLP_COST_NUM to fall by roughly the store share and mean cost to rise; that is
+ * the confirmation the knob took effect, and no separate stat is needed for it. Costs measured
+ * with this on are NOT comparable to costs measured with it off -- the quantization edges in
+ * cache_lib.c were cut from a run with stores included. */
+DEF_PARAM(mlp_cost_exclude_stores, MLP_COST_EXCLUDE_STORES, Flag, Flag, FALSE, )
+
+/* --mlp_cost_include_offpath: stop excluding wrong-path misses from the cost accounting.
+ * Default FALSE, which keeps the oracle exclusion (req->off_path, known at allocation).
+ *
+ * THIS IS THE HARDWARE-REALISABLE END OF THE SPECTRUM, and there are three points on it:
+ *
+ *   FALSE (default)  ORACLE. A wrong-path miss never accrues cost and never enters N, from the
+ *                    instant it is allocated. No hardware can do this -- at allocation the
+ *                    branch has not resolved and the machine does not know. It is the cleanest
+ *                    signal for CALIBRATION, because the cost distribution it produces contains
+ *                    only misses that mattered, which is what the quantization edges should be
+ *                    cut from.
+ *
+ *   the paper        CONFIRM-AND-RETRACT. "All misses are treated on correct path until they
+ *                    are confirmed to be on the wrong path." A miss counts from allocation and
+ *                    is dropped at branch resolution. Reachable here only via Scarab's
+ *                    off_path_confirmed, which needs --set_off_path_confirmed 1 (it is never
+ *                    written otherwise) and is NOT what this knob selects. Note the paper's own
+ *                    scheme carries a dilution it does not discuss: until confirmation, a
+ *                    wrong-path miss is in N and deflates the cost charged to the correct-path
+ *                    misses it overlaps, and that charge is never corrected afterwards.
+ *
+ *   TRUE             NO GATING. Every demand MSHR occupant accrues cost and counts toward N,
+ *                    wrong-path included, for its whole lifetime. This models hardware that
+ *                    simply does not implement the confirm-and-retract logic -- the cheapest
+ *                    real design, and a defensible one.
+ *
+ * WHAT CHANGES WHEN IT IS ON. Scarab never squashes an off-path request: recover_memory() only
+ * stamps a flag (and only when --set_off_path_confirmed is on), so a wrong-path miss keeps its
+ * MSHR entry, consumes bandwidth, completes, and FILLS THE CACHE. Today those fills carry cost
+ * 0, quantize to level 0 and are evicted first under REPL_MLP -- a real effect on the policy
+ * that arrives by accident rather than by design. With this knob on they carry genuine cost and
+ * compete for retention like anything else, so a LIN result can shift for that reason alone.
+ * N also rises, so on-path misses are charged a smaller share and mean cost falls.
+ *
+ * Costs measured with this on are NOT comparable to costs measured with it off, and the
+ * quantization edges in cache_lib.c were cut with it off. */
+DEF_PARAM(mlp_cost_include_offpath, MLP_COST_INCLUDE_OFFPATH, Flag, Flag, FALSE, )
+
 /* L0 data */
 DEF_PARAM(dcache_size, DCACHE_SIZE, uns, uns, (64 * 1024), )
 DEF_PARAM(dcache_assoc, DCACHE_ASSOC, uns, uns, 1, )
