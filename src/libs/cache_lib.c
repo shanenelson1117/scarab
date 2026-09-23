@@ -130,6 +130,50 @@ static inline void consume_fill_bound(Cache_Entry* line) {
   g_next_fill_mlp_cost = 0.0;
 }
 
+/* REPL_MLP: quantize an MLP-based cost in cycles to a 3-bit level, 0..7.
+ *
+ * EQUAL-POPULATION edges measured on the google traces (MLC_MLP_COST_* at 5-cycle resolution,
+ * target-only, 34.8M demand MLC misses), NOT the paper's 60-cycle ladder -- that ladder was
+ * calibrated to a 400-cycle memory behind the LLC and on this hierarchy leaves four of its
+ * eight codes empty while putting 74% of misses in costq=0. These edges are workload-specific
+ * by construction: re-cut them from a fresh histogram for a different suite, or scale the
+ * whole table with --mlp_lin_cost_scale.
+ *
+ * A line with no cost -- a prefetch or writeback fill, or any fill when --mlp_cost_stats is
+ * off -- has mlp_cost 0 and lands in level 0, i.e. it is treated as the cheapest thing in the
+ * set and evicted first among equals. That is deliberate but it is also the sharpest edge on
+ * this policy: on a prefetch-heavy workload it evicts prefetched lines preferentially, which
+ * can swamp the effect being measured. Watch prefetch accuracy when reading results. */
+static inline uns mlp_lin_costq(double cost_cycles) {
+  static const double edges[7] = {15.0, 20.0, 25.0, 30.0, 45.0, 60.0, 90.0};
+  const double        scale = (double)MLP_LIN_COST_SCALE;
+  uns                 q = 0;
+  for (q = 0; q < 7; q++) {
+    if (cost_cycles < edges[q] * scale)
+      return q;
+  }
+  return 7;
+}
+
+/* REPL_MLP second term: did this line's fill clear its class's boundness gate?
+ *
+ * A MARK, not a graded value -- see --mlp_lin_bound_lambda for why the measured fraction
+ * distribution does not support a graded code. The two classes are mutually exclusive and use
+ * different signals, so each is tested against its own threshold: data lines against the
+ * membound fraction, instruction lines against the front-end-bound fraction.
+ *
+ * bound_frac carries whichever fraction applies (membound_classify_fill writes exactly one),
+ * so membound_fill / fe_bound_fill are read only to decide WHICH threshold to apply. A line
+ * with neither flag set -- prefetch, writeback, store fill, or any fill with the measurement
+ * off -- scores 0 and gets no protection from this term. */
+static inline uns mlp_lin_boundq(const Cache_Entry* entry) {
+  if (entry->membound_fill)
+    return entry->bound_frac > (double)MLP_LIN_DATA_THRESH ? 1 : 0;
+  if (entry->fe_bound_fill)
+    return entry->bound_frac > (double)MLP_LIN_INSTR_THRESH ? 1 : 0;
+  return 0;
+}
+
 Flag cache_last_hit_membound(Cache* cache) {
   return cache->last_hit_membound;
 }
@@ -767,6 +811,45 @@ Cache_Entry* find_repl_entry(Cache* cache, uns8 proc_id, uns set, uns* way) {
       *way = lru_ind;
       return &cache->entries[set][lru_ind];
     } break;
+    /* REPL_MLP: MLP-aware LIN (Qureshi et al. ISCA'06). Evict the line minimising
+         Value = Recency + MLP_LIN_LAMBDA * costq + MLP_LIN_BOUND_LAMBDA * boundq
+       with Recency the LRU stack position (0 = LRU). See --mlp_lin_lambda in
+       memory.param.def for the cost model and where the quantization edges come from.
+
+       Recency is computed as a RANK, not from last_access_time directly, because
+       last_access_time is sim_time in FEMTOSECONDS: a raw difference is ~10^5 per cycle and
+       would swamp any lambda a human would type. Ranking is O(assoc^2) -- 256 compares at
+       assoc 16, once per eviction, which is nothing next to the miss it is servicing.
+
+       An invalid way always wins outright: filling a hole evicts nothing, so no cost applies. */
+    case REPL_MLP: {
+      uns    best_ind = 0;
+      double best_val = 0.0;
+      Flag   have_best = FALSE;
+      for (ii = 0; ii < cache->assoc; ii++) {
+        Cache_Entry* entry = &cache->entries[set][ii];
+        if (!entry->valid) {
+          *way = ii;
+          return entry;
+        }
+        /* Stack position: how many resident lines are older than this one. */
+        uns rank = 0;
+        for (int jj = 0; jj < cache->assoc; jj++) {
+          Cache_Entry* other = &cache->entries[set][jj];
+          if (jj != ii && other->valid && other->last_access_time < entry->last_access_time)
+            rank++;
+        }
+        double val = (double)rank + (double)MLP_LIN_LAMBDA * (double)mlp_lin_costq(entry->mlp_cost) +
+                     (double)MLP_LIN_BOUND_LAMBDA * (double)mlp_lin_boundq(entry);
+        if (!have_best || val < best_val) {
+          best_val = val;
+          best_ind = ii;
+          have_best = TRUE;
+        }
+      }
+      *way = best_ind;
+      return &cache->entries[set][best_ind];
+    } break;
     case REPL_RANDOM:
     case REPL_NOT_MRU:
     case REPL_ROUND_ROBIN:
@@ -911,6 +994,10 @@ static inline void update_repl_policy(Cache* cache, Cache_Entry* cur_entry, uns 
     case REPL_SHADOW_IDEAL:
     case REPL_TRUE_LRU:
     case REPL_PARTITION:
+    /* REPL_MLP derives its Recency term from the same LRU stack these maintain -- without this
+       case last_access_time would never advance and LIN would rank every line equal, leaving
+       the cost term to decide alone. */
+    case REPL_MLP:
       cur_entry->last_access_time = sim_time;
       break;
     case REPL_RANDOM: {

@@ -135,6 +135,56 @@ DEF_PARAM(num_priority_pws, NUM_PRIORITY_PWS, uns, uns, 10,)
 DEF_PARAM(prioritize_pws_after_first_sticky_until_backend_stall, PRIORITIZE_PWS_AFTER_FIRST_STICKY_UNTIL_BACKEND_STALL, Flag, Flag, FALSE,)
 DEF_PARAM(no_repl_after_queue_size, NO_REPL_AFTER_QUEUE_SIZE, uns, uns, 0,)
 
+/* MLP-aware LIN replacement -- REPL_MLP (enum ordinal 9). Select it with
+   --mlc_cache_repl_policy 9 (L2) or --l1_cache_repl_policy 9 (LLC).
+   "A Case for MLP-Aware Cache Replacement", Qureshi/Lynch/Mutlu/Patt, ISCA'06, section 4.
+
+   LIN evicts the line minimising  Value = Recency + lambda * Cost, where Recency is the LRU
+   STACK POSITION (0 = LRU) and Cost is the quantized MLP-based cost of the miss that filled
+   the line. A costly line therefore has to sink further down the stack before it is chosen,
+   and lambda sets how many stack positions one cost level is worth. lambda = 0 is exactly
+   true LRU, which is the control this policy must be measured against.
+   REQUIRES --mlp_cost_stats 1: with the accumulator off every line carries cost 0 and the
+   policy silently degenerates to LRU.
+
+   NOT the paper's SBAR/set-dueling selector. This is static LIN only -- one fixed lambda, no
+   leader sets, no PSEL. Sweep the lambda by hand first; adding dueling on top of an untested
+   value function would confound two mechanisms.
+
+   COST QUANTIZATION. The paper quantizes cost to 3 bits with 60-cycle buckets saturating at
+   420, calibrated to a 400-cycle memory behind the LLC. Measured on the google traces this
+   hierarchy puts 74% of demand MLC misses in costq=0 and leaves four of the eight codes
+   completely unused, so the edges below are EQUAL-POPULATION cut points measured on those
+   traces instead (mean MLC miss latency 215 cycles, mean cost 62). They are workload-specific:
+   re-cut them from MLC_MLP_COST_* before trusting this policy on a different machine or suite,
+   or scale them wholesale with --mlp_lin_cost_scale. */
+DEF_PARAM(mlp_lin_lambda, MLP_LIN_LAMBDA, float, float, 1.0, )
+/* Multiplies every cost quantization edge. 1.0 uses the google-derived edges verbatim; raise
+   it on a machine with longer misses rather than editing the table. */
+DEF_PARAM(mlp_lin_cost_scale, MLP_LIN_COST_SCALE, float, float, 1.0, )
+
+/* SECOND COST TERM, static (no dueling): Value = Recency + lambda*Cost + bound_lambda*Bound.
+   Bound is 1 when the line's boundness fraction cleared its class threshold and 0 otherwise --
+   a MARK, not a graded value, because the measured fraction distribution does not support a
+   graded code: on the google traces 86% of eligible MLC fills sit above 0.65 and an 8-level
+   equal-population quantization yields only 6 distinct cut points.
+
+   Two thresholds, one lambda. The classes use different signals and are mutually exclusive
+   (Cache_Entry.membound_fill vs fe_bound_fill), so each gets its own gate the way
+   TD_LOAD_REPLAY_THRESH / TD_FE_RRIP_THRESH do, but they share one weight because nothing
+   measured so far justifies weighting them differently.
+
+   bound_lambda = 0 (the default) disables the term entirely, so the policy is plain LIN until
+   asked otherwise -- which is the intended first experiment.
+
+   NOTE the instruction side is inert unless something opens the front-end window:
+   icache_fe_frac_for_line returns nothing without TD_FE_RRIP_MARK / TD_FE_RRIP_ON_MLC /
+   TD_COMBINED_ON_*, so fe_bound_fill stays FALSE and instruction lines all score Bound = 0.
+   Data lines need --membound_stats 1 for the same reason. */
+DEF_PARAM(mlp_lin_bound_lambda, MLP_LIN_BOUND_LAMBDA, float, float, 0.0, )
+DEF_PARAM(mlp_lin_data_thresh, MLP_LIN_DATA_THRESH, float, float, 0.5, )
+DEF_PARAM(mlp_lin_instr_thresh, MLP_LIN_INSTR_THRESH, float, float, 0.7, )
+
 /* Mockingjay (HPCA'22) replacement -- REPL_MOCKINGJAY. Select it with
    --mlc_cache_repl_policy 22 (L2) or --l1_cache_repl_policy 22 (LLC); the policy itself is
    level-agnostic and these knobs apply to whichever level is running it.

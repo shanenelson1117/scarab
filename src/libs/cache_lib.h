@@ -55,7 +55,10 @@ typedef enum Repl_Policy_enum {
   REPL_SHADOW_IDEAL,          /* ideal replacement with shadow cache */
   REPL_IDEAL_STORAGE,         /* if the data doesn't have a temporal locality then it
                                  isn't stored at the cache */
-  REPL_MLP,                   /* mlp based replacement  -- uses MLP_REPL_POLICY */
+  REPL_MLP,                   /* MLP-aware LIN (Qureshi et al. ISCA'06): evict min of
+                                 Recency + lambda*cost. Knobs are --mlp_lin_* in
+                                 memory.param.def; needs --mlp_cost_stats 1 or every line
+                                 carries cost 0 and it degenerates to true LRU. */
   REPL_PARTITION,             /* Based on the partition*/
   REPL_RESTEER,               /* Prioritize the instr following a resteered branch or fetch barrier */
   REPL_STICKY_PRIORITY_LINES, /* Prioritize lines tagged with priority bit. */
