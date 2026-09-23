@@ -155,23 +155,28 @@ static inline uns mlp_lin_costq(double cost_cycles) {
   return 7;
 }
 
-/* REPL_MLP second term: did this line's fill clear its class's boundness gate?
+/* REPL_MLP second term: this line's boundness bonus, already weighted, in LRU stack positions.
  *
- * A MARK, not a graded value -- see --mlp_lin_bound_lambda for why the measured fraction
- * distribution does not support a graded code. The two classes are mutually exclusive and use
- * different signals, so each is tested against its own threshold: data lines against the
- * membound fraction, instruction lines against the front-end-bound fraction.
+ * Returns the WEIGHTED contribution rather than a 0/1 mark because the weight depends on which
+ * class the line belongs to -- data lines carry --mlp_lin_data_lambda, instruction lines
+ * --mlp_lin_instr_lambda. There is deliberately no "boundq" any more: the value is binary, so
+ * a separate quantize-then-scale step only invited the reader to assume a graded range like
+ * costq's 0..7 that the measured fraction distribution does not support.
  *
- * bound_frac carries whichever fraction applies (membound_classify_fill writes exactly one),
- * so membound_fill / fe_bound_fill are read only to decide WHICH threshold to apply. A line
- * with neither flag set -- prefetch, writeback, store fill, or any fill with the measurement
- * off -- scores 0 and gets no protection from this term. */
-static inline uns mlp_lin_boundq(const Cache_Entry* entry) {
+ * The two classes are mutually exclusive and use different signals, so each is tested against
+ * its own threshold: data lines against the membound fraction, instruction lines against the
+ * front-end-bound fraction. bound_frac carries whichever applies (membound_classify_fill
+ * writes exactly one), so the flags are read only to pick the threshold and the weight.
+ *
+ * A line with neither flag -- prefetch, writeback, or store fill, none of which have a
+ * demanding load -- scores 0 and gets no protection here. On these traces that is 57% of MLC
+ * fills, so this term partitions the cache rather than grading it. */
+static inline double mlp_lin_bound_term(const Cache_Entry* entry) {
   if (entry->membound_fill)
-    return entry->bound_frac > (double)MLP_LIN_DATA_THRESH ? 1 : 0;
+    return entry->bound_frac > (double)MLP_LIN_DATA_THRESH ? (double)MLP_LIN_DATA_LAMBDA : 0.0;
   if (entry->fe_bound_fill)
-    return entry->bound_frac > (double)MLP_LIN_INSTR_THRESH ? 1 : 0;
-  return 0;
+    return entry->bound_frac > (double)MLP_LIN_INSTR_THRESH ? (double)MLP_LIN_INSTR_LAMBDA : 0.0;
+  return 0.0;
 }
 
 Flag cache_last_hit_membound(Cache* cache) {
@@ -812,7 +817,9 @@ Cache_Entry* find_repl_entry(Cache* cache, uns8 proc_id, uns set, uns* way) {
       return &cache->entries[set][lru_ind];
     } break;
     /* REPL_MLP: MLP-aware LIN (Qureshi et al. ISCA'06). Evict the line minimising
-         Value = Recency + MLP_LIN_LAMBDA * costq + MLP_LIN_BOUND_LAMBDA * boundq
+         Value = Recency + MLP_LIN_LAMBDA * costq + mlp_lin_bound_term(line)
+       where the bound term is already weighted by the line's own class lambda --
+       MLP_LIN_DATA_LAMBDA for a data line, MLP_LIN_INSTR_LAMBDA for an instruction line
        with Recency the LRU stack position (0 = LRU). See --mlp_lin_lambda in
        memory.param.def for the cost model and where the quantization edges come from.
 
@@ -840,7 +847,7 @@ Cache_Entry* find_repl_entry(Cache* cache, uns8 proc_id, uns set, uns* way) {
             rank++;
         }
         double val = (double)rank + (double)MLP_LIN_LAMBDA * (double)mlp_lin_costq(entry->mlp_cost) +
-                     (double)MLP_LIN_BOUND_LAMBDA * (double)mlp_lin_boundq(entry);
+                     mlp_lin_bound_term(entry);
         if (!have_best || val < best_val) {
           best_val = val;
           best_ind = ii;

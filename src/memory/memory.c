@@ -351,7 +351,12 @@ static inline void membound_classify_fill(Mem_Req* req, Flag* is_membound, Flag*
   *is_fe_bound = FALSE;
   *bound_frac = 0.0;
   *have_frac = FALSE;
-  if (!MEMBOUND_STATS)
+  /* REPL_MLP's boundness term reads membound_fill / fe_bound_fill / bound_frac, all of which
+     are written from here. Gating this on --membound_stats alone would mean forgetting that
+     knob turns the policy's second term off SILENTLY -- no error, just a sweep where every
+     lambda arm lands on its control. So a nonzero LIN boundness lambda opens the
+     classification too. The stats below stay gated on MEMBOUND_STATS. */
+  if (!MEMBOUND_STATS && MLP_LIN_DATA_LAMBDA == 0.0 && MLP_LIN_INSTR_LAMBDA == 0.0)
     return;
   if (req->type == MRT_IFETCH) {
     double fe_frac = 0.0;

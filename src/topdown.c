@@ -50,6 +50,8 @@
 #include "op.h"
 #include "td_load_replay.h"
 #include "memory/memory.h"
+/* MLP_LIN_*_LAMBDA: REPL_MLP opens its own measurement windows below. */
+#include "memory/memory.param.h"
 
 const static uns64 TOPDOWN_SCALE_FACTOR = 10000;
 const static int TOPDOWN_RECOVERY_DEPTH = 2;
@@ -137,8 +139,11 @@ void topdown_idq_update(uns proc_id, int count_available, int count_issued, int 
   //
   // MARKED_LOAD_REPLAY is deliberately NOT listed: replay counts outcomes by ordinal and never
   // reads a window, so it does not pay for the per-cycle walk of the load queue.
+  /* MLP_LIN_DATA_LAMBDA joins this list for the same reason MLP_LIN_INSTR_LAMBDA joins the
+     front-end gate below: REPL_MLP's data-side boundness term needs the per-load window, and
+     should not depend on --membound_stats being remembered separately. */
   if (TD_LOAD_TRACK_ENABLE || TD_LOAD_EVICT_TRACK || TD_LOAD_RRIP_MARK || TD_COMBINED_ON_MLC ||
-      TD_COMBINED_ON_L1 || MEMBOUND_STATS || MARKED_LOAD_RECORD) {
+      TD_COMBINED_ON_L1 || MEMBOUND_STATS || MARKED_LOAD_RECORD || MLP_LIN_DATA_LAMBDA != 0.0) {
     Flag backend_stall = (count_issued == 0 && idq_stage_get_stage_data()->op_count > 0);
     Flag mem_bound_cycle = backend_stall && (lsq_get_in_flight_load_num() > 0);
     lsq_tag_inflight_loads(mem_bound_cycle);
@@ -147,7 +152,14 @@ void topdown_idq_update(uns proc_id, int count_available, int count_issued, int 
   // td_fe_rrip_*: credit the demand icache miss the front end is blocked on. A front-end-
   // bound cycle = the machine took no ops and it is NOT a backend stall (miss on crit path).
   // Needed for the L1I (td_fe_rrip_mark), the L2 (td_fe_rrip_on_mlc), or the combined L2 policy.
-  if (TD_FE_RRIP_MARK || TD_FE_RRIP_ON_MLC || TD_COMBINED_ON_MLC || TD_COMBINED_ON_L1) {
+  /* MLP_LIN_INSTR_LAMBDA is in this list so REPL_MLP's instruction-side boundness term opens
+     its OWN measurement window. Every other flag here also applies a replacement policy
+     somewhere -- td_fe_rrip_mark puts REPL_MARKED_RRIP on the L1I -- so borrowing one of them
+     to get the fraction would confound a LIN experiment with an unrelated L1I policy change.
+     Opening the window is behaviour-neutral by itself: it only accumulates fe_bound cycles
+     against in-flight icache misses. */
+  if (TD_FE_RRIP_MARK || TD_FE_RRIP_ON_MLC || TD_COMBINED_ON_MLC || TD_COMBINED_ON_L1 ||
+      MLP_LIN_INSTR_LAMBDA != 0.0) {
     Flag backend_stall = (count_issued == 0 && idq_stage_get_stage_data()->op_count > 0);
     Flag fe_bound_cycle = !backend_stall && (count_available == 0);
     icache_tag_inflight_miss(proc_id, fe_bound_cycle);

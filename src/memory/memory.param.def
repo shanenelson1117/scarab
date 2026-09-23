@@ -163,25 +163,35 @@ DEF_PARAM(mlp_lin_lambda, MLP_LIN_LAMBDA, float, float, 1.0, )
    it on a machine with longer misses rather than editing the table. */
 DEF_PARAM(mlp_lin_cost_scale, MLP_LIN_COST_SCALE, float, float, 1.0, )
 
-/* SECOND COST TERM, static (no dueling): Value = Recency + lambda*Cost + bound_lambda*Bound.
+/* SECOND COST TERM, static (no dueling), with an INDEPENDENT WEIGHT PER CLASS:
+     Value = Recency + lambda*Cost + (data line ? data_lambda : instr_lambda) * Bound
+
    Bound is 1 when the line's boundness fraction cleared its class threshold and 0 otherwise --
    a MARK, not a graded value, because the measured fraction distribution does not support a
    graded code: on the google traces 86% of eligible MLC fills sit above 0.65 and an 8-level
-   equal-population quantization yields only 6 distinct cut points.
+   equal-population quantization yields only 6 distinct cut points. Since Bound is binary, each
+   lambda is a FLAT BONUS IN LRU STACK POSITIONS, not a multiplier on a range -- unlike
+   --mlp_lin_lambda, which scales a 0..7 cost level. The two scales are NOT comparable: at
+   16-way, data_lambda 8 is half the stack while mlp_lin_lambda 8 would be eight times it.
 
-   Two thresholds, one lambda. The classes use different signals and are mutually exclusive
-   (Cache_Entry.membound_fill vs fe_bound_fill), so each gets its own gate the way
-   TD_LOAD_REPLAY_THRESH / TD_FE_RRIP_THRESH do, but they share one weight because nothing
-   measured so far justifies weighting them differently.
+   Separate weights per class because the classes carry DIFFERENT SIGNALS measured on different
+   populations -- a data line's membound fraction comes from its demanding load's dispatch->done
+   window, an instruction line's front-end-bound fraction from the fetch stall its miss caused --
+   and nothing says one stack position of protection is worth the same to both. They are
+   mutually exclusive per line (Cache_Entry.membound_fill vs fe_bound_fill), so exactly one
+   weight ever applies to a given line. Each keeps its own threshold, mirroring
+   TD_LOAD_REPLAY_THRESH / TD_FE_RRIP_THRESH.
 
-   bound_lambda = 0 (the default) disables the term entirely, so the policy is plain LIN until
-   asked otherwise -- which is the intended first experiment.
+   Both default to 0, i.e. the term is off and the policy is plain LIN until asked otherwise.
 
-   NOTE the instruction side is inert unless something opens the front-end window:
-   icache_fe_frac_for_line returns nothing without TD_FE_RRIP_MARK / TD_FE_RRIP_ON_MLC /
-   TD_COMBINED_ON_*, so fe_bound_fill stays FALSE and instruction lines all score Bound = 0.
-   Data lines need --membound_stats 1 for the same reason. */
-DEF_PARAM(mlp_lin_bound_lambda, MLP_LIN_BOUND_LAMBDA, float, float, 0.0, )
+   MEASUREMENT IS SELF-OPENING. A nonzero instr_lambda adds MLP_LIN_INSTR_LAMBDA to the
+   front-end window gate in topdown.c, so the policy turns on its own signal instead of
+   borrowing --td_fe_rrip_mark, which would apply REPL_MARKED_RRIP to the L1I and confound a
+   policy experiment with an unrelated L1I policy change. Likewise a nonzero lambda of either
+   kind makes membound_classify_fill run even with --membound_stats 0, so the term cannot
+   silently no-op because a stats knob was left off. */
+DEF_PARAM(mlp_lin_data_lambda, MLP_LIN_DATA_LAMBDA, float, float, 0.0, )
+DEF_PARAM(mlp_lin_instr_lambda, MLP_LIN_INSTR_LAMBDA, float, float, 0.0, )
 DEF_PARAM(mlp_lin_data_thresh, MLP_LIN_DATA_THRESH, float, float, 0.5, )
 DEF_PARAM(mlp_lin_instr_thresh, MLP_LIN_INSTR_THRESH, float, float, 0.7, )
 
