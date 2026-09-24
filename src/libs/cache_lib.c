@@ -236,10 +236,6 @@ double cache_last_hit_bound_frac(Cache* cache) {
   return cache->last_hit_bound_frac;
 }
 
-Flag cache_last_hit_fe_bound(Cache* cache) {
-  return cache->last_hit_fe_bound;
-}
-
 void cache_set_lin_lambdas(Cache* cache, double lam_mlp, double lam_data, double lam_instr) {
   cache->lin_lambda_override = TRUE;
   cache->lin_lambda_mlp = lam_mlp;

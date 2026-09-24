@@ -361,7 +361,6 @@ Flag cache_last_hit_membound(Cache* cache);
 /* REPL_MLP / SBAR: cost carried by the line the last cache_access on `cache` hit. */
 double cache_last_hit_mlp_cost(Cache* cache);
 double cache_last_hit_bound_frac(Cache* cache);
-Flag cache_last_hit_fe_bound(Cache* cache);
 /* Save / restore the one-shot fill staging. Used by the SBAR ATDs so their inserts cannot
    steal the classification a pending real fill staged -- see cache_get_fill_stage. */
 void cache_get_fill_stage(Flag* membound, Flag* fe_bound, double* bound_frac, double* mlp_cost);
