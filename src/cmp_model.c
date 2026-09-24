@@ -311,6 +311,9 @@ void cmp_done() {
   finalize_memory();
   for (uns proc_id = 0; proc_id < NUM_CORES; proc_id++) {
     cmp_set_all_stages(proc_id);
+    /* --mlp_sbar_on: publish the per-arm charged cost totals. Running values, so they are
+       emitted once at the end rather than per window. */
+    mlp_sbar_dump_stats(proc_id);
   }
 
   // FIXME prefetchers What should I do for this

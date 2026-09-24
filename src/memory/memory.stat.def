@@ -2534,6 +2534,16 @@ DEF_STAT(  MLC_SBAR_SEL_LRU                           , COUNT  , NO_RATIO  )
 DEF_STAT(  MLC_SBAR_SEL_LIN2                          , COUNT  , NO_RATIO  )
 DEF_STAT(  MLC_SBAR_SEL_FULL                          , COUNT  , NO_RATIO  )
 DEF_STAT(  MLC_SBAR_SWITCH                            , COUNT  , NO_RATIO  )
+/* Total MLP cost charged to each arm over the run, in MILLI-cycles, indexed MLC_SBAR_COST_LRU+arm
+   so the three must stay contiguous and in g_sbar_lam order. THE FIRST THING TO CHECK: if these
+   are all zero the contest never happened and the SEL counters are just reporting the seed --
+   which is exactly what a pending-table leak produced before it was caught, with no other
+   symptom. MLC_SBAR_PEND_FULL counts deferred charges dropped because the pending table was
+   full; it must be 0. */
+DEF_STAT(  MLC_SBAR_COST_LRU                          , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_SBAR_COST_LIN2                         , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_SBAR_COST_FULL                         , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_SBAR_PEND_FULL                         , COUNT  , NO_RATIO  )
 
 
 /* --membound_stats: distributions of the RAW boundness FRACTIONS, before any threshold.

@@ -267,6 +267,7 @@ typedef struct Cache_struct {
      no new cost is measured for that access, so the charge is this line's stored cost -- what
      that exact address cost the last time it was actually fetched. */
   double last_hit_mlp_cost;
+  double last_hit_bound_frac;
 
   /* REPL_MLP lambdas for THIS cache. When lin_lambda_override is FALSE the value function uses
      the global --mlp_lin_* params, which is the plain static-LIN configuration. The SBAR
@@ -359,6 +360,12 @@ void cache_set_next_fill_cost(double bound_frac, double mlp_cost);
 Flag cache_last_hit_membound(Cache* cache);
 /* REPL_MLP / SBAR: cost carried by the line the last cache_access on `cache` hit. */
 double cache_last_hit_mlp_cost(Cache* cache);
+double cache_last_hit_bound_frac(Cache* cache);
+Flag cache_last_hit_fe_bound(Cache* cache);
+/* Save / restore the one-shot fill staging. Used by the SBAR ATDs so their inserts cannot
+   steal the classification a pending real fill staged -- see cache_get_fill_stage. */
+void cache_get_fill_stage(Flag* membound, Flag* fe_bound, double* bound_frac, double* mlp_cost);
+void cache_put_fill_stage(Flag membound, Flag fe_bound, double bound_frac, double mlp_cost);
 /* REPL_MLP / SBAR: pin this cache's LIN lambdas (ATD candidate, or the MTD's selection). */
 void cache_set_lin_lambdas(Cache* cache, double lam_mlp, double lam_data, double lam_instr);
 Flag cache_last_hit_fe_bound(Cache* cache);

@@ -1871,13 +1871,18 @@ static uns     g_sbar_stride[MAX_NUM_PROCS]; /* sample every Nth MLC set */
  * entry is still accumulating. Record which arms missed, keyed by the request's line address,
  * and settle when mlp_cost_finalize produces the number. One slot per request buffer entry,
  * which is the most outstanding MLC misses there can be. */
+#define SBAR_PEND_SLOTS 64
 typedef struct {
   Flag  pending;
-  Addr  line_addr;
-  uns8  proc_id;
+  Addr  line_addr; /* matched against the fill */
+  Addr  addr;      /* full address, needed for the deferred ATD install */
   Flag  arm_missed[MLP_SBAR_MAXARMS];
 } Sbar_Pending;
-static Sbar_Pending g_sbar_pend[MAX_NUM_PROCS][64];
+static Sbar_Pending g_sbar_pend[MAX_NUM_PROCS][SBAR_PEND_SLOTS];
+/* Running total of cost charged to each arm, never reset. The per-window g_sbar_cost is what
+   selects; this is the diagnostic that distinguishes "the arms tied" from "no cost was ever
+   charged" -- an ambiguity that hid the pending-table leak for a whole run. */
+static double g_sbar_charged[MAX_NUM_PROCS][MLP_SBAR_MAXARMS];
 
 static inline Flag sbar_enabled(void) {
   return MLP_SBAR_ON && MLC_CACHE_REPL_POLICY == REPL_MLP;
@@ -1913,14 +1918,40 @@ static void sbar_init(uns8 proc_id) {
   for (int a = 0; a < sbar_narms(); a++)
     g_sbar_cost[proc_id][a] = 0.0;
   memset(g_sbar_pend[proc_id], 0, sizeof(g_sbar_pend[proc_id]));
+  for (int a = 0; a < MLP_SBAR_MAXARMS; a++)
+    g_sbar_charged[proc_id][a] = 0.0;
   g_sbar_win_start[proc_id] = inst_count[proc_id];
   g_sbar_init[proc_id] = TRUE;
 }
 
-/* Apply one demand MLC access to every ATD. `real_hit` and `real_cost` describe what the REAL
- * cache did with this same access, and are what let a hypothetical ATD miss be charged a
- * measured number instead of a modelled one. */
-static void sbar_probe(Mem_Req* req, Flag real_hit, double real_hit_cost) {
+/* Install into one ATD without disturbing the pending real fill's staging.
+ *
+ * cache_insert consumes the shared one-shot (consume_fill_bound), so an ATD insert landing
+ * between a real fill's stage and its own insert would steal the classification and the real
+ * line would be installed blank. That bug cost -1.4% IPC and -2.7% membound marks with the
+ * selector idle, so this saves the staging, stages the values THIS line should carry, inserts,
+ * and puts the original back. */
+static void sbar_atd_insert(uns8 proc_id, int arm, Addr addr, Flag membound, Flag fe_bound, double frac,
+                            double cost) {
+  Flag   s_mb, s_fe;
+  double s_frac, s_cost;
+  cache_get_fill_stage(&s_mb, &s_fe, &s_frac, &s_cost);
+  cache_put_fill_stage(membound, fe_bound, frac, cost);
+  Addr atd_line = 0, dummy = 0;
+  cache_insert(&g_sbar_atd[proc_id][arm], proc_id, addr, &atd_line, &dummy);
+  cache_put_fill_stage(s_mb, s_fe, s_frac, s_cost);
+}
+
+/* Apply one demand MLC access to every ATD. `real_hit` and the published last_hit_* values
+ * describe what the REAL cache did with this same access, which is what lets a hypothetical
+ * ATD miss be charged, and an ATD line be filled, with measured numbers rather than modelled
+ * ones.
+ *
+ * On a real HIT everything is known now: charge the resident line's cost and install with its
+ * metadata. On a real MISS nothing is known yet -- the MSHR is still accumulating -- so the
+ * charge AND the ATD install are both deferred to sbar_settle, which mirrors the real cache:
+ * it does not install at access time either. */
+static void sbar_probe(Mem_Req* req, Flag real_hit) {
   if (!sbar_enabled())
     return;
   uns8 proc_id = req->proc_id;
@@ -1932,55 +1963,73 @@ static void sbar_probe(Mem_Req* req, Flag real_hit, double real_hit_cost) {
   if (!mem_req_type_is_demand(req->type))
     return;
 
-  Flag any_deferred = FALSE;
+  Cache* mlc = &MLC(proc_id)->cache;
+  const double hit_cost = cache_last_hit_mlp_cost(mlc);
+  const double hit_frac = cache_last_hit_bound_frac(mlc);
+  const Flag   hit_mb = cache_last_hit_membound(mlc);
+  const Flag   hit_fe = cache_last_hit_fe_bound(mlc);
+
   Flag missed[MLP_SBAR_MAXARMS];
+  Flag any_deferred = FALSE;
   for (int a = 0; a < sbar_narms(); a++) {
     Addr atd_line = 0;
     missed[a] = cache_access(&g_sbar_atd[proc_id][a], req->addr, &atd_line, TRUE) ? FALSE : TRUE;
     if (!missed[a])
       continue;
     if (real_hit) {
-      /* Real cache still holds it, so nothing new is measured: charge what this address cost
-         the last time it really was fetched. */
-      g_sbar_cost[proc_id][a] += real_hit_cost;
+      g_sbar_cost[proc_id][a] += hit_cost;
+      g_sbar_charged[proc_id][a] += hit_cost;
+      sbar_atd_insert(proc_id, a, req->addr, hit_mb, hit_fe, hit_frac, hit_cost);
     } else {
-      any_deferred = TRUE; /* settle in sbar_settle when the real fill produces a cost */
+      any_deferred = TRUE;
     }
-    /* Install so the ATD tracks the real stream. The staged bound/cost values from the real
-       fill are consumed by the real insert, so an ATD line carries what the last stage set --
-       correct for the real-miss case, and harmless for the real-hit case where this line is
-       only a tag placeholder. */
-    Addr dummy = 0;
-    cache_insert(&g_sbar_atd[proc_id][a], proc_id, req->addr, &atd_line, &dummy);
   }
+  if (!any_deferred)
+    return;
 
-  if (any_deferred) {
-    for (uns i = 0; i < 64; i++) {
-      if (g_sbar_pend[proc_id][i].pending)
-        continue;
-      g_sbar_pend[proc_id][i].pending = TRUE;
-      g_sbar_pend[proc_id][i].line_addr = line_addr;
-      g_sbar_pend[proc_id][i].proc_id = proc_id;
-      for (int a = 0; a < sbar_narms(); a++)
-        g_sbar_pend[proc_id][i].arm_missed[a] = missed[a] && !real_hit;
-      break;
-    }
+  for (uns i = 0; i < SBAR_PEND_SLOTS; i++) {
+    if (g_sbar_pend[proc_id][i].pending)
+      continue;
+    g_sbar_pend[proc_id][i].pending = TRUE;
+    g_sbar_pend[proc_id][i].line_addr = line_addr;
+    g_sbar_pend[proc_id][i].addr = req->addr;
+    for (int a = 0; a < sbar_narms(); a++)
+      g_sbar_pend[proc_id][i].arm_missed[a] = missed[a];
+    return;
   }
+  /* Table full. Previously this fell through silently, which is how a leak turned into "every
+     arm scores zero and the selector never moves" with no symptom. Counted so it cannot hide. */
+  STAT_EVENT(proc_id, MLC_SBAR_PEND_FULL);
 }
 
-/* Settle any deferred charges for this line now that its real cost is final. */
-static void sbar_settle(uns8 proc_id, Addr line_addr, double cost) {
-  if (!sbar_enabled() || !g_sbar_init[proc_id])
+/* The real fill for this line has produced its cost, so settle every deferred charge and do the
+ * deferred ATD installs.
+ *
+ * Called for EVERY MLC fill, including ones whose request was not cost-tracked (prefetch,
+ * writeback, off-path when excluded) -- those settle with cost 0. That is what guarantees the
+ * pending table drains: gating the release on "was tracked" is what leaked it before. */
+static void sbar_settle(Mem_Req* req, double cost) {
+  if (!sbar_enabled() || !g_sbar_init[req->proc_id])
     return;
-  for (uns i = 0; i < 64; i++) {
+  uns8 proc_id = req->proc_id;
+  Addr tag = 0, line_addr = 0;
+  (void)ext_cache_index(&MLC(proc_id)->cache, req->addr, &tag, &line_addr);
+  for (uns i = 0; i < SBAR_PEND_SLOTS; i++) {
     Sbar_Pending* p = &g_sbar_pend[proc_id][i];
     if (!p->pending || p->line_addr != line_addr)
       continue;
-    for (int a = 0; a < sbar_narms(); a++)
-      if (p->arm_missed[a])
-        g_sbar_cost[proc_id][a] += cost;
+    Flag   mb = FALSE, fe = FALSE;
+    double frac = 0.0, stg_cost = 0.0;
+    cache_get_fill_stage(&mb, &fe, &frac, &stg_cost); /* what the real insert is about to use */
+    for (int a = 0; a < sbar_narms(); a++) {
+      if (!p->arm_missed[a])
+        continue;
+      g_sbar_cost[proc_id][a] += cost;
+      g_sbar_charged[proc_id][a] += cost;
+      sbar_atd_insert(proc_id, a, p->addr, mb, fe, frac, cost);
+    }
     p->pending = FALSE;
-    break;
+    return;
   }
 }
 
@@ -2011,6 +2060,16 @@ static void sbar_maybe_advance(uns8 proc_id) {
   for (int a = 0; a < sbar_narms(); a++)
     g_sbar_cost[proc_id][a] = 0.0;
   g_sbar_win_start[proc_id] = inst_count[proc_id];
+}
+
+/* Publish the running per-arm charged cost once, at end of simulation. Emitted as a total in
+ * MILLI-cycles to match MLC_MLP_COST_TOTAL. If these are all zero the contest never happened,
+ * whatever the SEL counters say -- that is the ambiguity this exists to remove. */
+void mlp_sbar_dump_stats(uns8 proc_id) {
+  if (!sbar_enabled() || !g_sbar_init[proc_id])
+    return;
+  for (int a = 0; a < sbar_narms(); a++)
+    INC_STAT_EVENT(proc_id, MLC_SBAR_COST_LRU + a, (Counter)(g_sbar_charged[proc_id][a] * 1000.0));
 }
 
 /* --mlp_cost_stats: charge this cycle's stall across the demand MLC misses sharing it.
@@ -2100,13 +2159,6 @@ void mlp_cost_finalize(Mem_Req* req) {
      places of a per-miss mean that is often well under one cycle. Divide MLC_MLP_COST_TOTAL by
      1000 to read it as cycles; MLC_MLP_COST_LATENCY_TOTAL is scaled the same way so their
      ratio -- the average 1/MLP -- needs no correction. */
-  /* --mlp_sbar_on: any ATD that missed this line while the real cache missed too has been
-     waiting for exactly this number. */
-  {
-    Addr sb_tag = 0, sb_line = 0;
-    (void)ext_cache_index(&MLC(req->proc_id)->cache, req->addr, &sb_tag, &sb_line);
-    sbar_settle(req->proc_id, sb_line, cost);
-  }
   INC_STAT_EVENT(req->proc_id, MLC_MLP_COST_TOTAL, (Counter)(cost * 1000.0));
   INC_STAT_EVENT(req->proc_id, MLC_MLP_COST_LATENCY_TOTAL, latency * 1000);
   STAT_EVENT(req->proc_id, MLC_MLP_COST_NUM);
@@ -3030,7 +3082,7 @@ static Flag mem_complete_mlc_access(Mem_Req* req, Mem_Queue_Entry* mlc_queue_ent
   /* --mlp_sbar_on: apply this access to the ATDs. Placed here, immediately after the real
      lookup, so real_hit and the hit line's stored cost describe THIS access -- cache_lib
      publishes last_hit_mlp_cost as a one-shot and a later access would clobber it. */
-  sbar_probe(req, req->mlc_hit, cache_last_hit_mlp_cost(&MLC(req->proc_id)->cache));
+  sbar_probe(req, req->mlc_hit);
   td_stamp_op_outcome(req, TRUE, req->mlc_hit);   /* carry L2 outcome to retire */
   /* A hit the data array missed and the one-line stream buffer caught -- see the L1 site. */
   if (data && cache_stream_buf_last_hit(&MLC(req->proc_id)->cache))
@@ -6290,6 +6342,11 @@ Flag mlc_fill_line(Mem_Req* req) {
      no cost. mlp_cost_finalize must precede mlc_miss_satisfied -- see its comment. */
   data->mlp_cost = (req->type == MRT_WB) ? 0.0 : req->mlp_cost;
   mlp_cost_finalize(req);
+  /* --mlp_sbar_on: settle deferred ATD charges and do the deferred ATD installs. Called for
+     EVERY MLC fill, tracked or not -- an untracked fill settles with cost 0 but still RELEASES
+     its pending slot, which is what stops the table leaking. Placed before the cache_insert
+     below so the staging sbar_settle copies is the one the real line is about to receive. */
+  sbar_settle(req, (req->type == MRT_WB) ? 0.0 : req->mlp_cost);
 
   req->mlc_miss_satisfied = TRUE;
 

@@ -110,6 +110,26 @@ void cache_set_next_fill_bound(Flag membound, Flag fe_bound) {
   g_next_fill_fe_bound = fe_bound;
 }
 
+/* Read the pending fill staging WITHOUT consuming it, and write it back. The SBAR ATDs insert
+ * through the ordinary cache_insert, which calls consume_fill_bound and therefore ZEROES this
+ * one-shot -- so an ATD insert landing between a real fill's stage and its own insert would
+ * steal the classification and the real line would be installed blank. Measured cost of that
+ * bug before it was found: -1.4% IPC and -2.7% membound marks, with the selector idle. The ATD
+ * path saves the staging, stages its own values per insert, and restores. */
+void cache_get_fill_stage(Flag* membound, Flag* fe_bound, double* bound_frac, double* mlp_cost) {
+  *membound = g_next_fill_membound;
+  *fe_bound = g_next_fill_fe_bound;
+  *bound_frac = g_next_fill_bound_frac;
+  *mlp_cost = g_next_fill_mlp_cost;
+}
+
+void cache_put_fill_stage(Flag membound, Flag fe_bound, double bound_frac, double mlp_cost) {
+  g_next_fill_membound = membound;
+  g_next_fill_fe_bound = fe_bound;
+  g_next_fill_bound_frac = bound_frac;
+  g_next_fill_mlp_cost = mlp_cost;
+}
+
 void cache_set_next_fill_cost(double bound_frac, double mlp_cost) {
   g_next_fill_bound_frac = bound_frac;
   g_next_fill_mlp_cost = mlp_cost;
@@ -210,6 +230,14 @@ static inline double mlp_lin_bound_term(const Cache* cache, const Cache_Entry* e
 
 double cache_last_hit_mlp_cost(Cache* cache) {
   return cache->last_hit_mlp_cost;
+}
+
+double cache_last_hit_bound_frac(Cache* cache) {
+  return cache->last_hit_bound_frac;
+}
+
+Flag cache_last_hit_fe_bound(Cache* cache) {
+  return cache->last_hit_fe_bound;
 }
 
 void cache_set_lin_lambdas(Cache* cache, double lam_mlp, double lam_data, double lam_instr) {
@@ -413,6 +441,7 @@ void init_cache(Cache* cache, const char* name, uns cache_size, uns assoc, uns l
   cache->sb_last_hit = FALSE;
   cache->last_hit_membound = FALSE;
   cache->last_hit_mlp_cost = 0.0;
+  cache->last_hit_bound_frac = 0.0;
   cache->last_hit_fe_bound = FALSE;
   /* --early_evict_stats: cleared here as well as at every insert, so a caller that reads it
      before any insert has happened sees "no eviction" rather than garbage. This runs ahead of
@@ -542,6 +571,7 @@ void* cache_access(Cache* cache, Addr addr, Addr* line_addr, Flag update_repl) {
   cache->sb_last_hit = FALSE;
   cache->last_hit_membound = FALSE;
   cache->last_hit_mlp_cost = 0.0;
+  cache->last_hit_bound_frac = 0.0;
   cache->last_hit_fe_bound = FALSE;
 
   if (cache->repl_policy >= REPL_VOID) {
@@ -577,6 +607,7 @@ void* cache_access(Cache* cache, Addr addr, Addr* line_addr, Flag update_repl) {
          still hit one. */
       cache->last_hit_membound = line->membound_fill;
       cache->last_hit_mlp_cost = line->mlp_cost;
+      cache->last_hit_bound_frac = line->bound_frac;
       cache->last_hit_fe_bound = line->fe_bound_fill;
 
       if (update_repl) {
@@ -1729,6 +1760,7 @@ void* cache_access_strategy(Cache* cache, Addr addr, Addr* line_addr, Flag updat
       /* --membound_stats: see the matching publish in cache_access. */
       cache->last_hit_membound = line->membound_fill;
       cache->last_hit_mlp_cost = line->mlp_cost;
+      cache->last_hit_bound_frac = line->bound_frac;
       cache->last_hit_fe_bound = line->fe_bound_fill;
 
       if (update_repl)
