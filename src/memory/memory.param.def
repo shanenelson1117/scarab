@@ -242,6 +242,32 @@ DEF_PARAM(mlp_sbar_sets, MLP_SBAR_SETS, uns, uns, 32, )
 /* Selection window in RETIRED INSTRUCTIONS per proc (not cycles), matching the RRIP duel. */
 DEF_PARAM(mlp_sbar_window, MLP_SBAR_WINDOW, uns, uns, 1000000, )
 
+/* --mlp_lin_pref_lambda: PENALTY, in LRU stack positions, for a line installed by a prefetch.
+   The exact mirror of the boundness bonus -- same units, opposite sign -- so a prefetched line
+   is pushed DOWN the value ordering and evicted early, where a membound line is pushed up.
+
+   WHY IT EXISTS. Prefetch fills carry no demanding load, so they already score cost 0 and mark
+   0 under LIN and are evicted first by accident. Measured on the google traces that accident
+   appears to be carrying most of LIN's benefit: prefetch share of MLC fills correlates +0.880
+   with LIN's IPC gain over LRU, while average MLP correlates -0.083. This knob makes the effect
+   EXPLICIT and separable, so it can be run WITHOUT the cost model:
+
+     --mlp_lin_lambda 0 --mlp_lin_data_lambda 0 --mlp_lin_instr_lambda 0 --mlp_lin_pref_lambda 14
+
+   is plain LRU plus prefetch deprioritisation and nothing else. If that captures most of the
+   +2.68% mean gain, then LIN's measured benefit here is prefetch handling rather than
+   MLP-awareness, and the cost machinery is along for the ride.
+
+   ON THESE TRACES A PREFETCH IS AN FDIP INSTRUCTION PREFETCH. PARAMS.google runs no data
+   prefetcher (--pref_framework_on 0, --pref_stream_on 0) and FDIP_ENABLE defaults on, while
+   demand ifetch is only 1.5% of MLC misses -- so instruction lines reach the L2 almost entirely
+   as FDIP prefetch. Deprioritising them is therefore an instruction-vs-data CAPACITY
+   PARTITIONING knob on this machine, whatever it would mean elsewhere.
+
+   At 16-way, 14 puts a prefetched line below nearly every non-prefetched one regardless of
+   recency. 0 (the default) disables the term. */
+DEF_PARAM(mlp_lin_pref_lambda, MLP_LIN_PREF_LAMBDA, float, float, 0.0, )
+
 DEF_PARAM(mlp_lin_data_thresh, MLP_LIN_DATA_THRESH, float, float, 0.5, )
 DEF_PARAM(mlp_lin_instr_thresh, MLP_LIN_INSTR_THRESH, float, float, 0.7, )
 

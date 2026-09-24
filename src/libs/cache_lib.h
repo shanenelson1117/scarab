@@ -137,6 +137,16 @@ typedef struct Cache_Entry_struct {
   double bound_frac;
   double mlp_cost;
 
+  /* --mlp_lin_pref_lambda: was this line installed by a PREFETCH request? Staged at fill like
+     the bound flags rather than reusing Cache_Entry.pref, which is only written by
+     cache_insert_lru_replpos and is therefore stale on the plain cache_insert path the MLC
+     uses. Deliberately separate so the existing prefetch accounting keeps its meaning.
+
+     On PARAMS.google every prefetch is an FDIP instruction prefetch -- the data prefetchers are
+     off (--pref_framework_on 0, --pref_stream_on 0) -- so on those traces this flag means
+     "FDIP instruction line". */
+  Flag fill_was_prefetch;
+
   /* --early_evict_stats: cycle_count at the fill that installed THIS line. Subtracted from
      cycle_count when the line is replaced to give its residency, which is what the early-
      eviction counters threshold. Stamped by every insert path, whether or not the stat is
@@ -365,6 +375,9 @@ double cache_last_hit_bound_frac(Cache* cache);
    steal the classification a pending real fill staged -- see cache_get_fill_stage. */
 void cache_get_fill_stage(Flag* membound, Flag* fe_bound, double* bound_frac, double* mlp_cost);
 void cache_put_fill_stage(Flag membound, Flag fe_bound, double bound_frac, double mlp_cost);
+/* --mlp_lin_pref_lambda: stage / read the prefetch flag for the next fill. */
+void cache_set_next_fill_prefetch(Flag is_prefetch);
+Flag cache_get_fill_prefetch(void);
 /* REPL_MLP / SBAR: pin this cache's LIN lambdas (ATD candidate, or the MTD's selection). */
 void cache_set_lin_lambdas(Cache* cache, double lam_mlp, double lam_data, double lam_instr);
 Flag cache_last_hit_fe_bound(Cache* cache);

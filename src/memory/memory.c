@@ -1933,13 +1933,16 @@ static void sbar_init(uns8 proc_id) {
  * and puts the original back. */
 static void sbar_atd_insert(uns8 proc_id, int arm, Addr addr, Flag membound, Flag fe_bound, double frac,
                             double cost) {
-  Flag   s_mb, s_fe;
+  Flag   s_mb, s_fe, s_pref;
   double s_frac, s_cost;
   cache_get_fill_stage(&s_mb, &s_fe, &s_frac, &s_cost);
+  s_pref = cache_get_fill_prefetch();
   cache_put_fill_stage(membound, fe_bound, frac, cost);
+  cache_set_next_fill_prefetch(FALSE);
   Addr atd_line = 0, dummy = 0;
   cache_insert(&g_sbar_atd[proc_id][arm], proc_id, addr, &atd_line, &dummy);
   cache_put_fill_stage(s_mb, s_fe, s_frac, s_cost);
+  cache_set_next_fill_prefetch(s_pref);
 }
 
 /* Apply one demand MLC access to every ATD. `real_hit` and the published last_hit_* values
@@ -5716,6 +5719,9 @@ Flag l1_fill_line(Mem_Req* req) {
        denominated cost -- correct as "what the miss that fetched me cost", but not an
        LLC-miss cost, which nothing measures. */
     cache_set_next_fill_cost(bound_frac, req->mlp_cost);
+    /* --mlp_lin_pref_lambda: on PARAMS.google this is always an FDIP instruction prefetch, the
+       data prefetchers being off. Staged for every fill so the flag is never stale. */
+    cache_set_next_fill_prefetch(mem_req_type_is_prefetch(req->type));
     if (MEMBOUND_STATS && membound_in_roi()) {
       if (mb_fill) {
         STAT_EVENT(req->proc_id, L1_MEMBOUND_FILL);
@@ -6195,6 +6201,9 @@ Flag mlc_fill_line(Mem_Req* req) {
        denominated cost -- correct as "what the miss that fetched me cost", but not an
        LLC-miss cost, which nothing measures. */
     cache_set_next_fill_cost(bound_frac, req->mlp_cost);
+    /* --mlp_lin_pref_lambda: on PARAMS.google this is always an FDIP instruction prefetch, the
+       data prefetchers being off. Staged for every fill so the flag is never stale. */
+    cache_set_next_fill_prefetch(mem_req_type_is_prefetch(req->type));
     if (MEMBOUND_STATS && membound_in_roi()) {
       /* Raw-fraction histogram, MLC ONLY. It lives here and not in membound_classify_fill
          because that helper is shared with l1_fill_line, so histogramming inside it made these

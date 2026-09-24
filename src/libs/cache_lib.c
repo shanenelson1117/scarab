@@ -104,6 +104,7 @@ static Flag   g_next_fill_membound = FALSE;
 static Flag   g_next_fill_fe_bound = FALSE;
 static double g_next_fill_bound_frac = 0.0;
 static double g_next_fill_mlp_cost = 0.0;
+static Flag   g_next_fill_prefetch = FALSE;
 
 void cache_set_next_fill_bound(Flag membound, Flag fe_bound) {
   g_next_fill_membound = membound;
@@ -117,10 +118,15 @@ void cache_set_next_fill_bound(Flag membound, Flag fe_bound) {
  * bug before it was found: -1.4% IPC and -2.7% membound marks, with the selector idle. The ATD
  * path saves the staging, stages its own values per insert, and restores. */
 void cache_get_fill_stage(Flag* membound, Flag* fe_bound, double* bound_frac, double* mlp_cost) {
+  /* NOTE: g_next_fill_prefetch is saved/restored by cache_get/put_fill_prefetch below. */
   *membound = g_next_fill_membound;
   *fe_bound = g_next_fill_fe_bound;
   *bound_frac = g_next_fill_bound_frac;
   *mlp_cost = g_next_fill_mlp_cost;
+}
+
+Flag cache_get_fill_prefetch(void) {
+  return g_next_fill_prefetch;
 }
 
 void cache_put_fill_stage(Flag membound, Flag fe_bound, double bound_frac, double mlp_cost) {
@@ -135,6 +141,10 @@ void cache_set_next_fill_cost(double bound_frac, double mlp_cost) {
   g_next_fill_mlp_cost = mlp_cost;
 }
 
+void cache_set_next_fill_prefetch(Flag is_prefetch) {
+  g_next_fill_prefetch = is_prefetch;
+}
+
 /* Stamp the staged classification onto a freshly allocated line and clear the one-shot.
    The graded pair clears here too, and not in cache_set_next_fill_cost, so a fill that stages
    the Flags but not the costs (any caller that has not been updated) gets 0 rather than the
@@ -144,10 +154,12 @@ static inline void consume_fill_bound(Cache_Entry* line) {
   line->fe_bound_fill = g_next_fill_fe_bound;
   line->bound_frac = g_next_fill_bound_frac;
   line->mlp_cost = g_next_fill_mlp_cost;
+  line->fill_was_prefetch = g_next_fill_prefetch;
   g_next_fill_membound = FALSE;
   g_next_fill_fe_bound = FALSE;
   g_next_fill_bound_frac = 0.0;
   g_next_fill_mlp_cost = 0.0;
+  g_next_fill_prefetch = FALSE;
 }
 
 /* REPL_MLP: quantize an MLP-based cost in cycles to a 3-bit level, 0..7.
@@ -486,6 +498,7 @@ void init_cache(Cache* cache, const char* name, uns cache_size, uns assoc, uns l
       cache->entries[ii][jj].membound_fill = FALSE;
       cache->entries[ii][jj].bound_frac = 0.0;
       cache->entries[ii][jj].mlp_cost = 0.0;
+      cache->entries[ii][jj].fill_was_prefetch = FALSE;
       cache->entries[ii][jj].fe_bound_fill = FALSE;
       cache->entries[ii][jj].fill_cycle = 0;  // --early_evict_stats
       if (data_size) {
@@ -818,6 +831,7 @@ void cache_invalidate(Cache* cache, Addr addr, Addr* line_addr) {
       line->membound_fill = FALSE;
       line->bound_frac = 0.0;
       line->mlp_cost = 0.0;
+      line->fill_was_prefetch = FALSE;
       line->fe_bound_fill = FALSE;
     }
   }
@@ -916,8 +930,11 @@ Cache_Entry* find_repl_entry(Cache* cache, uns8 proc_id, uns set, uns* way) {
           if (jj != ii && other->valid && other->last_access_time < entry->last_access_time)
             rank++;
         }
+        /* The prefetch term SUBTRACTS: eviction takes the minimum value, so a penalty pushes a
+           line down the ordering exactly as the boundness bonus pushes one up. */
         double val = (double)rank + lin_lam_mlp(cache) * (double)mlp_lin_costq(entry->mlp_cost) +
-                     mlp_lin_bound_term(cache, entry);
+                     mlp_lin_bound_term(cache, entry) -
+                     (entry->fill_was_prefetch ? (double)MLP_LIN_PREF_LAMBDA : 0.0);
         if (!have_best || val < best_val) {
           best_val = val;
           best_ind = ii;
@@ -1837,6 +1854,7 @@ void general_action_init(Cache* cache, const char* name, uns cache_size, uns ass
       cache->entries[ii][jj].membound_fill = FALSE;
       cache->entries[ii][jj].bound_frac = 0.0;
       cache->entries[ii][jj].mlp_cost = 0.0;
+      cache->entries[ii][jj].fill_was_prefetch = FALSE;
       cache->entries[ii][jj].fe_bound_fill = FALSE;
       cache->entries[ii][jj].fill_cycle = 0;  // --early_evict_stats
       if (data_size) {
