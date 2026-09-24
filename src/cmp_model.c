@@ -325,12 +325,9 @@ void cmp_done() {
 
 void cmp_per_core_done(uns8 proc_id) {
   topdown_done(proc_id);
-  /* --mlp_sbar_on: publish the per-arm charged-cost totals HERE, not in cmp_done. A core that
-     reaches its instruction limit has its stats dumped inside this same block in sim.c
-     (dump_stats immediately after per_core_done_func), which is BEFORE cmp_done runs -- so a
-     counter written there is emitted after the CSV and reads as zero, which is exactly what
-     happened on the first fixed run. */
-  mlp_sbar_dump_stats(proc_id);
+  /* Before stats_per_core_collect: sim.c dumps this core's stats immediately after this
+     function returns, so anything written later is emitted after the CSV. */
+  mlp_paper_dump_stats(proc_id);
   stats_per_core_collect(proc_id);
   if (PREF_FRAMEWORK_ON)
     pref_per_core_done(proc_id);

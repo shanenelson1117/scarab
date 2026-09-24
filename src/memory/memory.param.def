@@ -192,55 +192,6 @@ DEF_PARAM(mlp_lin_cost_scale, MLP_LIN_COST_SCALE, float, float, 1.0, )
    silently no-op because a stats knob was left off. */
 DEF_PARAM(mlp_lin_data_lambda, MLP_LIN_DATA_LAMBDA, float, float, 0.0, )
 DEF_PARAM(mlp_lin_instr_lambda, MLP_LIN_INSTR_LAMBDA, float, float, 0.0, )
-/* --mlp_sbar_on: SBAR (Sampling Based Adaptive Replacement, Qureshi et al. ISCA'06 section 5)
-   for REPL_MLP, ON THE MLC. Selects online among three candidate lambda triples:
-
-     ATD 0  lru    (0, 0, 0)      true LRU -- the cost term multiplied by zero
-     ATD 1  lin2   (2, 0, 0)      plain LIN, MLP cost only
-     ATD 2  full   (2, 10, 14)    LIN plus both boundness terms
-
-   Chosen so ADJACENT PAIRS DIFFER IN ONE THING: lru vs lin2 isolates the MLP cost term, lin2
-   vs full isolates the boundness terms. A win by `full` over `lin2` is therefore attributable
-   to boundness and not to a different cost weight.
-
-   Three tag-only Auxiliary Tag Directories over --mlp_sbar_sets sampled MLC sets, each running
-   REPL_MLP with its own triple via Cache.lin_lambda_override -- the SAME find_repl_entry code
-   as the real cache, so the ATDs shadow the policy rather than reimplement it. Every demand
-   MLC access to a sampled set is applied to all three, so they see an IDENTICAL access stream.
-   That is what makes their cost totals directly comparable: anything common to all three
-   cancels in the comparison, which is the property the paper's PSEL gets from only moving on
-   disagreement. It is also why this does NOT need the normalisation a leader-set duel would.
-
-   NOT the RRIP-style set duel in this file. That one scores DEMAND MISSES on real leader sets;
-   this scores accumulated MLP COST in shadow directories. Two differences that matter: the
-   metric is stall cycles rather than miss count, and no real set is ever made to run a losing
-   policy, so sampling costs no performance.
-
-   COST OF AN ATD MISS. An ATD miss is hypothetical -- the real cache may have hit -- so the
-   charge is measured, never modelled. If the real cache ALSO missed, the charge is the cost
-   that request's MSHR entry actually accrued, settled when mlp_cost_finalize runs (so a fill
-   landing after a window boundary is charged to the next window; at a 1M-instruction window
-   and ~215-cycle fills that is a rounding error). If the real cache HIT, the charge is the
-   resident line's stored mlp_cost -- what that exact address cost the last time it really was
-   fetched. There is no third case: the ATDs are driven by the real access stream, so an
-   address the ATD sees is one the real cache saw. No fallback estimate is needed anywhere.
-
-   Requires --mlc_cache_repl_policy 9 and --mlp_cost_stats 1. The selection rewrites the real
-   MLC's lambdas each window, overriding the static --mlp_lin_* values. */
-DEF_PARAM(mlp_sbar_on, MLP_SBAR_ON, Flag, Flag, FALSE, )
-/* Sampled MLC sets per ATD. The paper uses 32. Clamped to the MLC's set count. */
-/* Which candidate set the ATDs duel over.
-     0 (default) THREE-WAY: lru (0,0,0) / lin2 (2,0,0) / full (2,10,14). Adjacent pairs differ
-                 in one thing, so lru-vs-lin2 attributes the MLP cost term and lin2-vs-full
-                 attributes the boundness terms.
-     1           TWO-WAY, THE PAPER'S SBAR: lru (0,0,0) / lin4 (4,0,0). LIN against LRU and
-                 nothing else -- no boundness terms, which are not in the paper.
-   NOTE MLC_SBAR_SEL_LIN2 holds arm 1 either way, so under --mlp_sbar_arms 1 that counter is
-   counting lin4. The stat names follow the default arm set. */
-DEF_PARAM(mlp_sbar_arms, MLP_SBAR_ARMS, uns, uns, 0, )
-DEF_PARAM(mlp_sbar_sets, MLP_SBAR_SETS, uns, uns, 32, )
-/* Selection window in RETIRED INSTRUCTIONS per proc (not cycles), matching the RRIP duel. */
-DEF_PARAM(mlp_sbar_window, MLP_SBAR_WINDOW, uns, uns, 1000000, )
 
 /* --mlp_lin_pref_lambda: PENALTY, in LRU stack positions, for a line installed by a prefetch.
    The exact mirror of the boundness bonus -- same units, opposite sign -- so a prefetched line
@@ -270,6 +221,52 @@ DEF_PARAM(mlp_lin_pref_lambda, MLP_LIN_PREF_LAMBDA, float, float, 0.0, )
 
 DEF_PARAM(mlp_lin_data_thresh, MLP_LIN_DATA_THRESH, float, float, 0.5, )
 DEF_PARAM(mlp_lin_instr_thresh, MLP_LIN_INSTR_THRESH, float, float, 0.7, )
+
+/* ============ REPL_MLP_PAPER (enum ordinal 23): LIN exactly as published ============
+   Select with --mlc_cache_repl_policy 23. Value = Recency + lambda*costq, evict the minimum,
+   and nothing else -- no boundness terms, no prefetch term. Those are extensions and live in
+   REPL_MLP (ordinal 9). Requires --mlp_cost_stats 1, or every line carries cost 0 and this is
+   exactly LRU.
+
+   THE ONE DELIBERATE DEPARTURE FROM THE PAPER IS THE BUCKETING. The quantization edges are the
+   equal-population cut points measured on these traces, not the paper's 60-cycle ladder
+   saturating at 420 -- that ladder assumed a 400-cycle memory behind the last-level cache and
+   here leaves four of its eight codes completely unused with 74% of misses in costq=0.
+
+   Everything else follows the paper, including the wrong-path rule below, which the extended
+   REPL_MLP does NOT follow. */
+DEF_PARAM(mlp_paper_lambda, MLP_PAPER_LAMBDA, float, float, 4.0, )
+
+/* Wrong-path, the paper's way: "All misses are treated on correct path until they are confirmed
+   to be on the wrong path." A miss accrues cost and counts toward N from allocation, and is
+   dropped only at branch resolution -- which in Scarab is off_path_confirmed, written by
+   recover_memory() and REQUIRING --set_off_path_confirmed 1 (it is never written otherwise).
+   Default TRUE here so the policy is paper-faithful out of the box; the descriptor must still
+   set --set_off_path_confirmed 1 or the field stays FALSE and nothing is ever excluded.
+
+   This is a third position, distinct from both --mlp_cost_include_offpath settings: the oracle
+   (exclude at allocation, unrealisable) and no gating at all. The paper sits between them. */
+DEF_PARAM(mlp_paper_confirm_offpath, MLP_PAPER_CONFIRM_OFFPATH, Flag, Flag, TRUE, )
+
+/* SBAR (paper section 5), for REPL_MLP_PAPER only. Two tag-only ATDs over sampled MLC sets --
+   one running LIN at --mlp_paper_lambda, one running LRU -- and a saturating PSEL that moves
+   ONLY ON DISAGREEMENT, by the COST of the miss:
+     ATD-LRU misses while ATD-LIN hits  -> LIN is doing better -> move PSEL toward LIN
+     ATD-LIN misses while ATD-LRU hits  -> move PSEL toward LRU
+     both hit or both miss              -> neither is better, PSEL unchanged
+   The real cache follows the PSEL's MSB. Scoring only disagreements is what cancels everything
+   common to the two directories; it is the mechanism, not an optimisation.
+
+   THE ATDs ARE FULL-WIDTH. They are allocated with the MLC's own set count and only the sampled
+   sets are ever touched, so an address lands in the SAME set index it would in the real cache.
+   An earlier attempt sized them to the sample count instead, which re-hashed a filtered address
+   stream into a smaller directory and made the comparison meaningless. Tag-only, so the extra
+   memory is simulator-side and the sets that are never touched cost nothing but address space. */
+DEF_PARAM(mlp_paper_sbar, MLP_PAPER_SBAR, Flag, Flag, FALSE, )
+DEF_PARAM(mlp_paper_sbar_sets, MLP_PAPER_SBAR_SETS, uns, uns, 32, )
+/* PSEL width in bits. The MSB selects, so the counter spans [0, 2^bits) and switches at the
+   halfway point. Wider = more hysteresis = slower to change its mind. */
+DEF_PARAM(mlp_paper_psel_bits, MLP_PAPER_PSEL_BITS, uns, uns, 10, )
 
 /* Mockingjay (HPCA'22) replacement -- REPL_MOCKINGJAY. Select it with
    --mlc_cache_repl_policy 22 (L2) or --l1_cache_repl_policy 22 (LLC); the policy itself is

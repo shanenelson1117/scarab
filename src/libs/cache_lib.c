@@ -232,6 +232,12 @@ static inline double lin_lam_instr(const Cache* c) {
   return c->lin_lambda_override ? c->lin_lambda_instr : (double)MLP_LIN_INSTR_LAMBDA;
 }
 
+/* REPL_MLP_PAPER: the lambda in force. SBAR pins it per-cache via cache_set_lin_lambdas (the
+ * ATDs get their candidate, the real cache gets the selection); otherwise the static param. */
+static inline double mlp_paper_lambda_now(const Cache* c) {
+  return c->lin_lambda_override ? c->lin_lambda_mlp : (double)MLP_PAPER_LAMBDA;
+}
+
 static inline double mlp_lin_bound_term(const Cache* cache, const Cache_Entry* entry) {
   if (entry->membound_fill)
     return entry->bound_frac > (double)MLP_LIN_DATA_THRESH ? lin_lam_data(cache) : 0.0;
@@ -1976,6 +1982,50 @@ Cache_Entry* lru_update_evict(Cache* cache, uns8 proc_id, uns set, uns* way, voi
 }
 
 /**************************************************************************************/
+/* REPL_MLP_PAPER -- MLP-aware LIN exactly as published (Qureshi et al. ISCA'06, section 4).
+ *
+ *     Value = Recency + lambda * costq,   evict the MINIMUM
+ *
+ * and NOTHING else. No boundness terms, no prefetch term -- those are extensions and live in
+ * REPL_MLP. The only deliberate departure from the paper is the QUANTIZATION: the edges are the
+ * equal-population cut points measured on these traces rather than the paper's 60-cycle ladder,
+ * which on this hierarchy leaves four of its eight codes empty (see mlp_lin_costq).
+ *
+ * Recency maintenance is reused from the LRU strategy policy: lru_update_hit / lru_update_insert
+ * keep reference_val as an LRU stack with 0 = MRU. The paper's Recency counts from the LRU end,
+ * so Recency = (assoc-1) - reference_val. Reusing those two keeps the stack logic identical to
+ * the policy this is meant to be compared against, and leaves only victim selection here.
+ *
+ * lambda comes from the SBAR selector when it is running, and from --mlp_paper_lambda otherwise;
+ * mlp_paper_lambda_now() resolves that. lambda 0 makes this exactly the LRU strategy policy. */
+Cache_Entry* mlp_paper_update_evict(Cache* cache, uns8 proc_id, uns set, uns* way, void* arg, Flag if_external);
+
+Cache_Entry* mlp_paper_update_evict(Cache* cache, uns8 proc_id, uns set, uns* way, void* arg, Flag if_external) {
+  const double lam = mlp_paper_lambda_now(cache);
+  Flag         have = FALSE;
+  double       best = 0.0;
+
+  *way = 0;
+  for (int ii = 0; ii < cache->assoc; ii++) {
+    Cache_Entry* entry = &cache->entries[set][ii];
+    if (!entry->valid) { /* a hole evicts nothing, so no cost applies */
+      *way = ii;
+      cache_debug_print_set(cache, set, *way, CACHE_EVENT_EVICT);
+      return entry;
+    }
+    double recency = (double)(cache->assoc - 1 - entry->reference_val);
+    double val = recency + lam * (double)mlp_lin_costq(entry->mlp_cost);
+    if (!have || val < best) {
+      best = val;
+      *way = ii;
+      have = TRUE;
+    }
+  }
+  cache_debug_print_set(cache, set, *way, CACHE_EVENT_EVICT);
+  return &cache->entries[set][*way];
+}
+
+/**************************************************************************************/
 /* NRU */
 void nru_update_hit(Cache* cache, uns set, uns way, void* arg);
 void nru_update_insert(Cache* cache, uns8 proc_id, uns set, uns way, void* arg);
@@ -3158,6 +3208,7 @@ struct repl_policy_func repl_policy_func_table[NUM_REPL] = {
   { REPL_MARKED_RRIP, general_action_init, general_action_repl, marked_rrip_update_hit, marked_rrip_update_insert, marked_rrip_update_evict },
   { REPL_PLRU_TREE, plru_action_init,   general_action_repl,  plru_update_hit,    plru_update_insert,   plru_update_evict   },
   { REPL_MOCKINGJAY, mockingjay_action_init, general_action_repl, mockingjay_update_hit, mockingjay_update_insert, mockingjay_update_evict },
+  { REPL_MLP_PAPER, general_action_init, general_action_repl, lru_update_hit,   lru_update_insert,    mlp_paper_update_evict },
   { REPL_VOID,    NULL,                 NULL,                 NULL,               NULL,                 NULL                },
 };
 // clang-format on

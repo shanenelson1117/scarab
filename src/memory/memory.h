@@ -237,8 +237,8 @@ void update_memory(void);
 
 void mlp_cost_update_cycle(void);
 void mlp_cost_finalize(Mem_Req* req);
-/* --mlp_sbar_on: emit per-arm charged-cost totals at end of simulation. */
-void mlp_sbar_dump_stats(uns8 proc_id);
+/* --mlp_paper_sbar: emit PSEL diagnostics at end of simulation. */
+void mlp_paper_dump_stats(uns8 proc_id);
 
 Flag scan_stores(Addr, uns);
 void op_nuke_mem_req(Op*);

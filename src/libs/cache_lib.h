@@ -73,6 +73,11 @@ typedef enum Repl_Policy_enum {
   REPL_MARKED_RRIP, /* SRRIP variant: marked (memory-bound) lines insert at RRPV 0 */
   REPL_PLRU_TREE,   /* tree-based pseudo-LRU (binary tree of direction bits per set) */
   REPL_MOCKINGJAY,  /* Mockingjay (HPCA'22): PC-signature reuse-distance prediction + ETR */
+  REPL_MLP_PAPER,   /* MLP-aware LIN exactly as published (Qureshi et al. ISCA'06): Recency +
+                       lambda*costq and NOTHING else -- no boundness terms, no prefetch term,
+                       wrong-path handled by confirm-and-retract. Optional SBAR (two ATDs, PSEL
+                       on disagreement). Knobs are --mlp_paper_* in memory.param.def. Distinct
+                       from REPL_MLP, which is the extended version. */
 
   NUM_REPL
 } Repl_Policy;

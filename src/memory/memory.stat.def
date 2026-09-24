@@ -2522,28 +2522,17 @@ DEF_STAT(  MLC_MLP_COST_200MORE               , DIST   , NO_RATIO  )
    everywhere means N==1 always, i.e. the buffer walk is not seeing concurrent misses. */
 DEF_STAT(  MLC_MLP_COST_TOTAL                         , COUNT  , NO_RATIO  )
 DEF_STAT(  MLC_MLP_COST_LATENCY_TOTAL                 , COUNT  , NO_RATIO  )
+/* --mlp_paper_sbar: PSEL outcome. SEL_* is incremented on every PSEL update, so their ratio is
+   how much of the contest each policy was winning. COST_CHARGED is the total cost that moved
+   the counter -- IF IT IS ZERO THE CONTEST NEVER HAPPENED and SEL_* only reflects the seed.
+   FINAL is the counter's end value; the MSB selects, so FINAL below half means it ended on LRU. */
+DEF_STAT(  MLC_PSEL_SEL_LIN                           , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_PSEL_SEL_LRU                           , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_PSEL_COST_CHARGED                      , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_PSEL_FINAL                             , COUNT  , NO_RATIO  )
+
 DEF_STAT(  MLC_MLP_COST_NUM                           , COUNT  , NO_RATIO  )
 
-/* --mlp_sbar_on: SBAR arm selection on the MLC. MLC_SBAR_SEL_* is incremented once per window
-   for whichever arm is selected, so the three counts are that arm's share of windows -- the
-   policy's own record of what it chose over the run. Indexed as MLC_SBAR_SEL_LRU + arm, so the
-   three must stay contiguous and in the g_sbar_lam order (lru, lin2, full).
-   MLC_SBAR_SWITCH counts windows where the selection CHANGED; a value near the window count
-   means the contest is thrashing and the window is too short to resolve it. */
-DEF_STAT(  MLC_SBAR_SEL_LRU                           , COUNT  , NO_RATIO  )
-DEF_STAT(  MLC_SBAR_SEL_LIN2                          , COUNT  , NO_RATIO  )
-DEF_STAT(  MLC_SBAR_SEL_FULL                          , COUNT  , NO_RATIO  )
-DEF_STAT(  MLC_SBAR_SWITCH                            , COUNT  , NO_RATIO  )
-/* Total MLP cost charged to each arm over the run, in MILLI-cycles, indexed MLC_SBAR_COST_LRU+arm
-   so the three must stay contiguous and in g_sbar_lam order. THE FIRST THING TO CHECK: if these
-   are all zero the contest never happened and the SEL counters are just reporting the seed --
-   which is exactly what a pending-table leak produced before it was caught, with no other
-   symptom. MLC_SBAR_PEND_FULL counts deferred charges dropped because the pending table was
-   full; it must be 0. */
-DEF_STAT(  MLC_SBAR_COST_LRU                          , COUNT  , NO_RATIO  )
-DEF_STAT(  MLC_SBAR_COST_LIN2                         , COUNT  , NO_RATIO  )
-DEF_STAT(  MLC_SBAR_COST_FULL                         , COUNT  , NO_RATIO  )
-DEF_STAT(  MLC_SBAR_PEND_FULL                         , COUNT  , NO_RATIO  )
 
 
 /* --membound_stats: distributions of the RAW boundness FRACTIONS, before any threshold.
