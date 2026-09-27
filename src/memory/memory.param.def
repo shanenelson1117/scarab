@@ -285,12 +285,18 @@ DEF_PARAM(mlp_paper_lambda, MLP_PAPER_LAMBDA, float, float, 4.0, )
    to be on the wrong path." A miss accrues cost and counts toward N from allocation, and is
    dropped only at branch resolution -- which in Scarab is off_path_confirmed, written by
    recover_memory() and REQUIRING --set_off_path_confirmed 1 (it is never written otherwise).
-   Default TRUE here so the policy is paper-faithful out of the box; the descriptor must still
-   set --set_off_path_confirmed 1 or the field stays FALSE and nothing is ever excluded.
+   DEFAULT FALSE, deliberately. This knob lives in mlp_cost_tracked, which is SHARED by both
+   REPL_MLP and REPL_MLP_PAPER despite the mlp_paper_ name -- the cost accumulator is one
+   mechanism, not one per policy. Defaulting it TRUE silently changed policy 9's wrong-path
+   behaviour from oracle exclusion to NO GATING AT ALL, because off_path_confirmed is never
+   written unless --set_off_path_confirmed is on, so the test could never fire. That made every
+   earlier policy-9 measurement non-reproducible. Descriptors wanting the paper's rule ask for
+   it explicitly and must set --set_off_path_confirmed 1 too; init_memory asserts on the
+   combination so it cannot silently degrade again.
 
    This is a third position, distinct from both --mlp_cost_include_offpath settings: the oracle
    (exclude at allocation, unrealisable) and no gating at all. The paper sits between them. */
-DEF_PARAM(mlp_paper_confirm_offpath, MLP_PAPER_CONFIRM_OFFPATH, Flag, Flag, TRUE, )
+DEF_PARAM(mlp_paper_confirm_offpath, MLP_PAPER_CONFIRM_OFFPATH, Flag, Flag, FALSE, )
 
 /* SBAR (paper section 5), for REPL_MLP_PAPER only. Two tag-only ATDs over sampled MLC sets --
    one running LIN at --mlp_paper_lambda, one running LRU -- and a saturating PSEL that moves

@@ -1285,6 +1285,20 @@ void init_memory() {
   uns8 proc_id;
 
   ASSERT(0, mem);
+  /* Wrong-path cost accounting: exactly one of three positions is in force, and the two ways of
+     getting it wrong are SILENT, so they are caught here rather than in the results.
+       --mlp_paper_confirm_offpath 1 without --set_off_path_confirmed 1 degrades to NO GATING:
+       off_path_confirmed is only ever written by recover_memory() when the latter is set, so
+       the test never fires. That combination looks paper-faithful and is not -- it is what
+       silently changed policy 9's default and invalidated a set of measurements.
+       Both offpath knobs at once is contradictory: confirm-and-retract takes the branch first
+       and --mlp_cost_include_offpath becomes unreachable. */
+  ASSERTM(0, !(MLP_PAPER_CONFIRM_OFFPATH && !SET_OFF_PATH_CONFIRMED),
+          "--mlp_paper_confirm_offpath 1 needs --set_off_path_confirmed 1, or off_path_confirmed is never "
+          "written and NOTHING is excluded -- that is --mlp_cost_include_offpath 1, not the paper's rule.\n");
+  ASSERTM(0, !(MLP_PAPER_CONFIRM_OFFPATH && MLP_COST_INCLUDE_OFFPATH),
+          "--mlp_paper_confirm_offpath and --mlp_cost_include_offpath are mutually exclusive; the former "
+          "takes precedence and the latter would be silently ignored.\n");
   ASSERT(0, L1_LINE_SIZE <= L1_INTERLEAVE_FACTOR);
   ASSERT(0, L1_LINE_SIZE <= MLC_INTERLEAVE_FACTOR);
   ASSERT(0, L1_LINE_SIZE <= VA_PAGE_SIZE_BYTES);
