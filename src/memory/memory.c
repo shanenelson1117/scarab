@@ -1951,19 +1951,17 @@ static void ps_probe(Mem_Req* req, double cost) {
   for (int a = 0; a < 2; a++) {
     if (!miss[a])
       continue;
-    Flag   s_mb, s_fe, s_pref, s_store;
-    double s_frac, s_cost;
-    cache_get_fill_stage(&s_mb, &s_fe, &s_frac, &s_cost);
-    s_pref = cache_get_fill_prefetch();
-    s_store = cache_get_fill_store();
-    cache_put_fill_stage(FALSE, FALSE, 0.0, cost);
-    cache_set_next_fill_prefetch(FALSE);
-    cache_set_next_fill_store(FALSE);
+    /* Save/restore the WHOLE staging around the ATD insert. cache_insert consumes the one-shot,
+       so without this an ATD insert steals the classification a pending real fill staged and
+       the real line installs blank -- measured at -1.4% IPC with no other symptom. One struct
+       rather than a field at a time, so adding a seventh field cannot reintroduce it. */
+    Cache_Fill_Stage saved;
+    cache_save_fill_stage(&saved);
+    cache_clear_fill_stage();
+    cache_set_next_fill_cost(0.0, cost);
     Addr l = 0, dummy = 0;
     cache_insert(&g_ps_atd[proc_id][a], proc_id, req->addr, &l, &dummy);
-    cache_put_fill_stage(s_mb, s_fe, s_frac, s_cost);
-    cache_set_next_fill_prefetch(s_pref);
-    cache_set_next_fill_store(s_store);
+    cache_restore_fill_stage(&saved);
   }
 }
 
@@ -2985,6 +2983,12 @@ static Flag mem_complete_mlc_access(Mem_Req* req, Mem_Queue_Entry* mlc_queue_ent
   if (td_mlc_pred_staged)
     cache_set_hit_promote_frac(FALSE, 0.0);  // clear one-shot (consumed on hit; drop on miss)
   req->mlc_hit = data ? TRUE : FALSE;
+  /* --mlp_lin_offpath_lambda: an ON-PATH DEMAND hit vindicates a wrong-path fill -- a real
+     access needed the line, so the speculative-garbage assumption is falsified and the penalty
+     is dropped. Demand only: a prefetch hitting it is itself speculative and proves nothing.
+     Gated on the knob so the extra tag lookup costs nothing when the term is off. */
+  if (MLP_LIN_OFFPATH_LAMBDA != 0.0 && req->mlc_hit && !req->off_path && mem_req_type_is_demand(req->type))
+    cache_clear_offpath(&MLC(req->proc_id)->cache, req->addr);
   /* --mlp_paper_sbar: apply this access to the ATDs. On a real hit the charge is the resident
      line's stored cost, read here because cache_lib publishes it as a one-shot. On a real miss
      the cost is not known until fill, so 0 is charged now and the disagreement is resolved on
@@ -5630,6 +5634,8 @@ Flag l1_fill_line(Mem_Req* req) {
        carries modified data. A writeback that HITS an already-resident line is handled
        separately by cache_mark_written, since that happens long after the fill. */
     cache_set_next_fill_store(req->type == MRT_DSTORE || req->type == MRT_WB);
+    /* --mlp_lin_offpath_lambda: oracle wrong-path, matching L1_Data.fetched_by_offpath. */
+    cache_set_next_fill_offpath(req->off_path);
     if (MEMBOUND_STATS && membound_in_roi()) {
       if (mb_fill) {
         STAT_EVENT(req->proc_id, L1_MEMBOUND_FILL);
@@ -6116,6 +6122,8 @@ Flag mlc_fill_line(Mem_Req* req) {
        carries modified data. A writeback that HITS an already-resident line is handled
        separately by cache_mark_written, since that happens long after the fill. */
     cache_set_next_fill_store(req->type == MRT_DSTORE || req->type == MRT_WB);
+    /* --mlp_lin_offpath_lambda: oracle wrong-path, matching L1_Data.fetched_by_offpath. */
+    cache_set_next_fill_offpath(req->off_path);
     if (MEMBOUND_STATS && membound_in_roi()) {
       /* Raw-fraction histogram, MLC ONLY. It lives here and not in membound_classify_fill
          because that helper is shared with l1_fill_line, so histogramming inside it made these

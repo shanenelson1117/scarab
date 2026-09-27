@@ -106,6 +106,7 @@ static double g_next_fill_bound_frac = 0.0;
 static double g_next_fill_mlp_cost = 0.0;
 static Flag   g_next_fill_prefetch = FALSE;
 static Flag   g_next_fill_store = FALSE;
+static Flag   g_next_fill_offpath = FALSE;
 
 void cache_set_next_fill_bound(Flag membound, Flag fe_bound) {
   g_next_fill_membound = membound;
@@ -154,9 +155,53 @@ Flag cache_get_fill_store(void) {
   return g_next_fill_store;
 }
 
+void cache_set_next_fill_offpath(Flag is_offpath) {
+  g_next_fill_offpath = is_offpath;
+}
+
+void cache_save_fill_stage(Cache_Fill_Stage* out) {
+  out->membound = g_next_fill_membound;
+  out->fe_bound = g_next_fill_fe_bound;
+  out->bound_frac = g_next_fill_bound_frac;
+  out->mlp_cost = g_next_fill_mlp_cost;
+  out->prefetch = g_next_fill_prefetch;
+  out->store = g_next_fill_store;
+  out->offpath = g_next_fill_offpath;
+}
+
+void cache_restore_fill_stage(const Cache_Fill_Stage* in) {
+  g_next_fill_membound = in->membound;
+  g_next_fill_fe_bound = in->fe_bound;
+  g_next_fill_bound_frac = in->bound_frac;
+  g_next_fill_mlp_cost = in->mlp_cost;
+  g_next_fill_prefetch = in->prefetch;
+  g_next_fill_store = in->store;
+  g_next_fill_offpath = in->offpath;
+}
+
+void cache_clear_fill_stage(void) {
+  Cache_Fill_Stage z = {FALSE, FALSE, 0.0, 0.0, FALSE, FALSE, FALSE};
+  cache_restore_fill_stage(&z);
+}
+
 /* Set the write flag on a resident line -- a writeback hitting a line already in the cache is
  * how an MLC line becomes dirty, and that happens long after its fill. Costs one tag lookup,
  * so the caller gates it on the knob being on. */
+/* An on-path demand access hit this line, so a wrong-path fill has been vindicated -- drop the
+ * penalty flag. Mirror of cache_mark_written, and one-way in the opposite direction: written is
+ * only ever set, offpath_unproven is only ever cleared. */
+void cache_clear_offpath(Cache* cache, Addr addr) {
+  Addr tag = 0, line_addr = 0;
+  uns  set = ext_cache_index(cache, addr, &tag, &line_addr);
+  for (uns ii = 0; ii < (uns)cache->assoc; ii++) {
+    Cache_Entry* e = &cache->entries[set][ii];
+    if (e->valid && e->tag == tag) {
+      e->offpath_unproven = FALSE;
+      return;
+    }
+  }
+}
+
 void cache_mark_written(Cache* cache, Addr addr) {
   Addr tag = 0, line_addr = 0;
   uns  set = ext_cache_index(cache, addr, &tag, &line_addr);
@@ -180,12 +225,14 @@ static inline void consume_fill_bound(Cache_Entry* line) {
   line->mlp_cost = g_next_fill_mlp_cost;
   line->fill_was_prefetch = g_next_fill_prefetch;
   line->was_written = g_next_fill_store;
+  line->offpath_unproven = g_next_fill_offpath;
   g_next_fill_membound = FALSE;
   g_next_fill_fe_bound = FALSE;
   g_next_fill_bound_frac = 0.0;
   g_next_fill_mlp_cost = 0.0;
   g_next_fill_prefetch = FALSE;
   g_next_fill_store = FALSE;
+  g_next_fill_offpath = FALSE;
 }
 
 /* REPL_MLP: quantize an MLP-based cost in cycles to a 3-bit level, 0..7.
@@ -563,6 +610,7 @@ void init_cache(Cache* cache, const char* name, uns cache_size, uns assoc, uns l
       cache->entries[ii][jj].mlp_cost = 0.0;
       cache->entries[ii][jj].fill_was_prefetch = FALSE;
       cache->entries[ii][jj].was_written = FALSE;
+      cache->entries[ii][jj].offpath_unproven = FALSE;
       cache->entries[ii][jj].fe_bound_fill = FALSE;
       cache->entries[ii][jj].fill_cycle = 0;  // --early_evict_stats
       if (data_size) {
@@ -897,6 +945,7 @@ void cache_invalidate(Cache* cache, Addr addr, Addr* line_addr) {
       line->mlp_cost = 0.0;
       line->fill_was_prefetch = FALSE;
       line->was_written = FALSE;
+      line->offpath_unproven = FALSE;
       line->fe_bound_fill = FALSE;
     }
   }
@@ -1000,7 +1049,8 @@ Cache_Entry* find_repl_entry(Cache* cache, uns8 proc_id, uns set, uns* way) {
         double val = (double)rank + lin_lam_mlp(cache) * (double)mlp_lin_costq(entry->mlp_cost) +
                      mlp_lin_bound_term(cache, entry) -
                      (entry->fill_was_prefetch ? (double)MLP_LIN_PREF_LAMBDA : 0.0) -
-                     (entry->was_written ? (double)MLP_LIN_STORE_LAMBDA : 0.0);
+                     (entry->was_written ? (double)MLP_LIN_STORE_LAMBDA : 0.0) -
+                     (entry->offpath_unproven ? (double)MLP_LIN_OFFPATH_LAMBDA : 0.0);
         if (!have_best || val < best_val) {
           best_val = val;
           best_ind = ii;
@@ -1922,6 +1972,7 @@ void general_action_init(Cache* cache, const char* name, uns cache_size, uns ass
       cache->entries[ii][jj].mlp_cost = 0.0;
       cache->entries[ii][jj].fill_was_prefetch = FALSE;
       cache->entries[ii][jj].was_written = FALSE;
+      cache->entries[ii][jj].offpath_unproven = FALSE;
       cache->entries[ii][jj].fe_bound_fill = FALSE;
       cache->entries[ii][jj].fill_cycle = 0;  // --early_evict_stats
       if (data_size) {

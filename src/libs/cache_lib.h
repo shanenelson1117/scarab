@@ -162,6 +162,18 @@ typedef struct Cache_Entry_struct {
      pointer that cache_lib cannot read -- hence a bit of its own. */
   Flag was_written;
 
+  /* --mlp_lin_offpath_lambda: this line was installed by a WRONG-PATH request AND has not yet
+     been vindicated by an on-path demand hit.
+     NOT named fill_was_offpath, because it is NOT immutable fill history: cache_clear_offpath()
+     clears it the first time an on-path demand access hits the line. Scarab never squashes an
+     off-path request -- it completes and fills -- so wrong-path prefetching is real here, and a
+     line that a real access has since needed has PROVEN its worth. Penalising it after that
+     would demote exactly the speculative fills that turned out to be useful.
+     Set from the oracle req->off_path, matching L1_Data.fetched_by_offpath. The
+     confirm-and-retract signal is unusable at fill time: a miss whose branch has not resolved
+     is not yet known to be off-path. */
+  Flag offpath_unproven;
+
   /* --early_evict_stats: cycle_count at the fill that installed THIS line. Subtracted from
      cycle_count when the line is replaced to give its residency, which is what the early-
      eviction counters threshold. Stamped by every insert path, whether or not the stat is
@@ -393,11 +405,35 @@ void cache_put_fill_stage(Flag membound, Flag fe_bound, double bound_frac, doubl
 /* --mlp_lin_pref_lambda: stage / read the prefetch flag for the next fill. */
 void cache_set_next_fill_prefetch(Flag is_prefetch);
 Flag cache_get_fill_prefetch(void);
+/* --mlp_lin_offpath_lambda: stage the wrong-path flag for the next fill. */
+void cache_set_next_fill_offpath(Flag is_offpath);
+
+/* The complete one-shot fill staging, saved and restored as ONE object.
+ *
+ * There are six fields now. Saving them as separate get/put pairs meant every caller that
+ * wraps a cache_insert had to remember all six, and forgetting one is silent: the ATD inserts
+ * once stole the staged classification a real fill had set, costing -1.4% IPC with no symptom
+ * but the number. One struct makes that class of bug unrepresentable. */
+typedef struct Cache_Fill_Stage_struct {
+  Flag   membound;
+  Flag   fe_bound;
+  double bound_frac;
+  double mlp_cost;
+  Flag   prefetch;
+  Flag   store;
+  Flag   offpath;
+} Cache_Fill_Stage;
+
+void cache_save_fill_stage(Cache_Fill_Stage* out);
+void cache_restore_fill_stage(const Cache_Fill_Stage* in);
+void cache_clear_fill_stage(void);
 /* --mlp_lin_store_lambda: stage the write flag for the next fill, and set it on a resident
    line when a writeback hits it. */
 void cache_set_next_fill_store(Flag is_store);
 Flag cache_get_fill_store(void);
 void cache_mark_written(Cache* cache, Addr addr);
+/* --mlp_lin_offpath_lambda: an on-path demand hit vindicates a wrong-path fill; drop the flag. */
+void cache_clear_offpath(Cache* cache, Addr addr);
 /* REPL_MLP / SBAR: pin this cache's LIN lambdas (ATD candidate, or the MTD's selection). */
 void cache_set_lin_lambdas(Cache* cache, double lam_mlp, double lam_data, double lam_instr);
 Flag cache_last_hit_fe_bound(Cache* cache);

@@ -263,6 +263,36 @@ DEF_PARAM(mlp_lin_pref_lambda, MLP_LIN_PREF_LAMBDA, float, float, 0.0, )
    (policy 23) is the published policy and carries no extra terms by design. */
 DEF_PARAM(mlp_lin_store_lambda, MLP_LIN_STORE_LAMBDA, float, float, 0.0, )
 
+/* --mlp_lin_offpath_lambda: PENALTY, in LRU stack positions, for a line installed by a
+   WRONG-PATH request. Same shape as the prefetch and store penalties -- subtracted, so the
+   line sinks, and set assoc (16 here) to partition cleanly while leaving both groups in LRU
+   order internally.
+
+   DISTINCT FROM THE OFF-PATH COST KNOBS. --mlp_cost_include_offpath and
+   --mlp_paper_confirm_offpath decide whether a wrong-path miss ACCRUES COST; excluding it
+   leaves the line at cost 0, which is the FLOOR, not a penalty. Such a line still carries full
+   recency and sits at MRU when freshly filled, so it is the LAST thing evicted in its set. This
+   knob is what actively demotes it. The prefetch case showed the distinction matters: an
+   explicit penalty measured differently from the implicit cost-0 treatment.
+
+   WHY IT IS WORTH HAVING. Scarab never squashes an off-path request -- recover_memory() only
+   stamps a flag -- so a wrong-path miss completes, consumes bandwidth, and fills the cache.
+   Those lines are real occupants competing for capacity, and 39% of MLC misses are off-path.
+
+   THE FLAG IS CLEARED ON VINDICATION. The first ON-PATH DEMAND hit on the line drops it: a real
+   access needed the line, so the speculative-garbage assumption is falsified and penalising it
+   further would demote exactly the wrong-path fills that turned out useful -- which is real
+   here, since Scarab never squashes an off-path request. Demand only; a prefetch hit is itself
+   speculative and proves nothing. Hence the field is offpath_unproven, not fill_was_offpath.
+
+   Uses the ORACLE req->off_path, matching L1_Data.fetched_by_offpath. A confirm-and-retract
+   version is not possible at fill time: a miss whose branch has not resolved is not yet known
+   to be off-path, so it would have to be set after the fact the way cache_mark_written does.
+
+   0 (the default) disables the term. Applies to REPL_MLP (policy 9) only; REPL_MLP_PAPER
+   (policy 23) is the published policy and carries no extra terms by design. */
+DEF_PARAM(mlp_lin_offpath_lambda, MLP_LIN_OFFPATH_LAMBDA, float, float, 0.0, )
+
 DEF_PARAM(mlp_lin_data_thresh, MLP_LIN_DATA_THRESH, float, float, 0.5, )
 DEF_PARAM(mlp_lin_instr_thresh, MLP_LIN_INSTR_THRESH, float, float, 0.7, )
 
