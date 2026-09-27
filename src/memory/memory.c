@@ -1937,16 +1937,19 @@ static void ps_probe(Mem_Req* req, double cost) {
   for (int a = 0; a < 2; a++) {
     if (!miss[a])
       continue;
-    Flag   s_mb, s_fe, s_pref;
+    Flag   s_mb, s_fe, s_pref, s_store;
     double s_frac, s_cost;
     cache_get_fill_stage(&s_mb, &s_fe, &s_frac, &s_cost);
     s_pref = cache_get_fill_prefetch();
+    s_store = cache_get_fill_store();
     cache_put_fill_stage(FALSE, FALSE, 0.0, cost);
     cache_set_next_fill_prefetch(FALSE);
+    cache_set_next_fill_store(FALSE);
     Addr l = 0, dummy = 0;
     cache_insert(&g_ps_atd[proc_id][a], proc_id, req->addr, &l, &dummy);
     cache_put_fill_stage(s_mb, s_fe, s_frac, s_cost);
     cache_set_next_fill_prefetch(s_pref);
+    cache_set_next_fill_store(s_store);
   }
 }
 
@@ -2377,6 +2380,10 @@ Flag mem_process_mlc_hit_access(Mem_Req* req, Mem_Queue_Entry* mlc_queue_entry, 
         STAT_EVENT(req->proc_id, CORE_MLC_WB_HIT);
       }
       data->dirty |= (req->type == MRT_WB);
+      /* --mlp_lin_store_lambda: mirror the dirtying into Cache_Entry, which is what the policy
+         can read. Gated so the extra tag lookup costs nothing when the term is off. */
+      if (MLP_LIN_STORE_LAMBDA != 0.0 && req->type == MRT_WB)
+        cache_mark_written(&MLC(req->proc_id)->cache, req->addr);
     }
 
     if ((req->type == MRT_DFETCH) || (req->type == MRT_DSTORE) || (req->type == MRT_IFETCH)) {
@@ -5605,6 +5612,10 @@ Flag l1_fill_line(Mem_Req* req) {
     /* --mlp_lin_pref_lambda: on PARAMS.google this is always an FDIP instruction prefetch, the
        data prefetchers being off. Staged for every fill so the flag is never stale. */
     cache_set_next_fill_prefetch(mem_req_type_is_prefetch(req->type));
+    /* --mlp_lin_store_lambda: write traffic. A store miss, or a writeback which by definition
+       carries modified data. A writeback that HITS an already-resident line is handled
+       separately by cache_mark_written, since that happens long after the fill. */
+    cache_set_next_fill_store(req->type == MRT_DSTORE || req->type == MRT_WB);
     if (MEMBOUND_STATS && membound_in_roi()) {
       if (mb_fill) {
         STAT_EVENT(req->proc_id, L1_MEMBOUND_FILL);
@@ -6087,6 +6098,10 @@ Flag mlc_fill_line(Mem_Req* req) {
     /* --mlp_lin_pref_lambda: on PARAMS.google this is always an FDIP instruction prefetch, the
        data prefetchers being off. Staged for every fill so the flag is never stale. */
     cache_set_next_fill_prefetch(mem_req_type_is_prefetch(req->type));
+    /* --mlp_lin_store_lambda: write traffic. A store miss, or a writeback which by definition
+       carries modified data. A writeback that HITS an already-resident line is handled
+       separately by cache_mark_written, since that happens long after the fill. */
+    cache_set_next_fill_store(req->type == MRT_DSTORE || req->type == MRT_WB);
     if (MEMBOUND_STATS && membound_in_roi()) {
       /* Raw-fraction histogram, MLC ONLY. It lives here and not in membound_classify_fill
          because that helper is shared with l1_fill_line, so histogramming inside it made these

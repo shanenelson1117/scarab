@@ -240,6 +240,29 @@ DEF_PARAM(mlp_lin_instr_lambda, MLP_LIN_INSTR_LAMBDA, float, float, 0.0, )
    recency. 0 (the default) disables the term. */
 DEF_PARAM(mlp_lin_pref_lambda, MLP_LIN_PREF_LAMBDA, float, float, 0.0, )
 
+/* --mlp_lin_store_lambda: PENALTY, in LRU stack positions, for a line carrying WRITE traffic.
+   Same shape as the prefetch penalty -- subtracted, so the line sinks rather than floats.
+
+   SET ASSOC (16 at this geometry) TO PARTITION CLEANLY. Recency spans 0..assoc-1, so a penalty
+   of assoc puts every written line strictly below every unwritten one while leaving BOTH GROUPS
+   IN LRU ORDER INTERNALLY -- subtracting a constant is order-preserving. Smaller values let the
+   groups overlap so recency and cost can still rank across the boundary; larger ones buy
+   nothing beyond assoc.
+
+   WHY WRITES. Stores are 28.7% of MLC demand misses and already sit awkwardly in this policy:
+   they accrue MLP cost (they occupy MSHRs like loads) but can never be marked membound, because
+   the membound fraction is a load-window measurement. A written line is also the one whose
+   eviction costs a writeback. This makes the treatment explicit instead of leaving it implicit.
+
+   WHAT COUNTS AS WRITTEN. The fill was a store miss (MRT_DSTORE) or a writeback (MRT_WB), or a
+   writeback later hit the resident line -- which is how an MLC line actually becomes dirty
+   here, the L1D absorbing stores and writing back. NOT Cache_Entry.dirty, which is documented
+   "used only in warmup now" and is never maintained for the MLC.
+
+   0 (the default) disables the term. Applies to REPL_MLP (policy 9) only; REPL_MLP_PAPER
+   (policy 23) is the published policy and carries no extra terms by design. */
+DEF_PARAM(mlp_lin_store_lambda, MLP_LIN_STORE_LAMBDA, float, float, 0.0, )
+
 DEF_PARAM(mlp_lin_data_thresh, MLP_LIN_DATA_THRESH, float, float, 0.5, )
 DEF_PARAM(mlp_lin_instr_thresh, MLP_LIN_INSTR_THRESH, float, float, 0.7, )
 

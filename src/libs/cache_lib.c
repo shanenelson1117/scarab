@@ -105,6 +105,7 @@ static Flag   g_next_fill_fe_bound = FALSE;
 static double g_next_fill_bound_frac = 0.0;
 static double g_next_fill_mlp_cost = 0.0;
 static Flag   g_next_fill_prefetch = FALSE;
+static Flag   g_next_fill_store = FALSE;
 
 void cache_set_next_fill_bound(Flag membound, Flag fe_bound) {
   g_next_fill_membound = membound;
@@ -145,6 +146,29 @@ void cache_set_next_fill_prefetch(Flag is_prefetch) {
   g_next_fill_prefetch = is_prefetch;
 }
 
+void cache_set_next_fill_store(Flag is_store) {
+  g_next_fill_store = is_store;
+}
+
+Flag cache_get_fill_store(void) {
+  return g_next_fill_store;
+}
+
+/* Set the write flag on a resident line -- a writeback hitting a line already in the cache is
+ * how an MLC line becomes dirty, and that happens long after its fill. Costs one tag lookup,
+ * so the caller gates it on the knob being on. */
+void cache_mark_written(Cache* cache, Addr addr) {
+  Addr tag = 0, line_addr = 0;
+  uns  set = ext_cache_index(cache, addr, &tag, &line_addr);
+  for (uns ii = 0; ii < (uns)cache->assoc; ii++) {
+    Cache_Entry* e = &cache->entries[set][ii];
+    if (e->valid && e->tag == tag) {
+      e->was_written = TRUE;
+      return;
+    }
+  }
+}
+
 /* Stamp the staged classification onto a freshly allocated line and clear the one-shot.
    The graded pair clears here too, and not in cache_set_next_fill_cost, so a fill that stages
    the Flags but not the costs (any caller that has not been updated) gets 0 rather than the
@@ -155,11 +179,13 @@ static inline void consume_fill_bound(Cache_Entry* line) {
   line->bound_frac = g_next_fill_bound_frac;
   line->mlp_cost = g_next_fill_mlp_cost;
   line->fill_was_prefetch = g_next_fill_prefetch;
+  line->was_written = g_next_fill_store;
   g_next_fill_membound = FALSE;
   g_next_fill_fe_bound = FALSE;
   g_next_fill_bound_frac = 0.0;
   g_next_fill_mlp_cost = 0.0;
   g_next_fill_prefetch = FALSE;
+  g_next_fill_store = FALSE;
 }
 
 /* REPL_MLP: quantize an MLP-based cost in cycles to a 3-bit level, 0..7.
@@ -536,6 +562,7 @@ void init_cache(Cache* cache, const char* name, uns cache_size, uns assoc, uns l
       cache->entries[ii][jj].bound_frac = 0.0;
       cache->entries[ii][jj].mlp_cost = 0.0;
       cache->entries[ii][jj].fill_was_prefetch = FALSE;
+      cache->entries[ii][jj].was_written = FALSE;
       cache->entries[ii][jj].fe_bound_fill = FALSE;
       cache->entries[ii][jj].fill_cycle = 0;  // --early_evict_stats
       if (data_size) {
@@ -869,6 +896,7 @@ void cache_invalidate(Cache* cache, Addr addr, Addr* line_addr) {
       line->bound_frac = 0.0;
       line->mlp_cost = 0.0;
       line->fill_was_prefetch = FALSE;
+      line->was_written = FALSE;
       line->fe_bound_fill = FALSE;
     }
   }
@@ -971,7 +999,8 @@ Cache_Entry* find_repl_entry(Cache* cache, uns8 proc_id, uns set, uns* way) {
            line down the ordering exactly as the boundness bonus pushes one up. */
         double val = (double)rank + lin_lam_mlp(cache) * (double)mlp_lin_costq(entry->mlp_cost) +
                      mlp_lin_bound_term(cache, entry) -
-                     (entry->fill_was_prefetch ? (double)MLP_LIN_PREF_LAMBDA : 0.0);
+                     (entry->fill_was_prefetch ? (double)MLP_LIN_PREF_LAMBDA : 0.0) -
+                     (entry->was_written ? (double)MLP_LIN_STORE_LAMBDA : 0.0);
         if (!have_best || val < best_val) {
           best_val = val;
           best_ind = ii;
@@ -1892,6 +1921,7 @@ void general_action_init(Cache* cache, const char* name, uns cache_size, uns ass
       cache->entries[ii][jj].bound_frac = 0.0;
       cache->entries[ii][jj].mlp_cost = 0.0;
       cache->entries[ii][jj].fill_was_prefetch = FALSE;
+      cache->entries[ii][jj].was_written = FALSE;
       cache->entries[ii][jj].fe_bound_fill = FALSE;
       cache->entries[ii][jj].fill_cycle = 0;  // --early_evict_stats
       if (data_size) {

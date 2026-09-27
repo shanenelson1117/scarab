@@ -152,6 +152,16 @@ typedef struct Cache_Entry_struct {
      "FDIP instruction line". */
   Flag fill_was_prefetch;
 
+  /* --mlp_lin_store_lambda: does this line carry WRITE traffic? Set when the fill was caused by
+     a store (MRT_DSTORE) or was itself a writeback (MRT_WB), and set later by
+     cache_mark_written() when a writeback hits an already-resident line -- which is how an MLC
+     line actually becomes dirty here, the L1D absorbing stores and writing back.
+
+     NOT Cache_Entry.dirty: that field is documented "used only in warmup now" and is never
+     maintained for the MLC. The real dirty state lives in L1_Data.dirty, behind the opaque data
+     pointer that cache_lib cannot read -- hence a bit of its own. */
+  Flag was_written;
+
   /* --early_evict_stats: cycle_count at the fill that installed THIS line. Subtracted from
      cycle_count when the line is replaced to give its residency, which is what the early-
      eviction counters threshold. Stamped by every insert path, whether or not the stat is
@@ -383,6 +393,11 @@ void cache_put_fill_stage(Flag membound, Flag fe_bound, double bound_frac, doubl
 /* --mlp_lin_pref_lambda: stage / read the prefetch flag for the next fill. */
 void cache_set_next_fill_prefetch(Flag is_prefetch);
 Flag cache_get_fill_prefetch(void);
+/* --mlp_lin_store_lambda: stage the write flag for the next fill, and set it on a resident
+   line when a writeback hits it. */
+void cache_set_next_fill_store(Flag is_store);
+Flag cache_get_fill_store(void);
+void cache_mark_written(Cache* cache, Addr addr);
 /* REPL_MLP / SBAR: pin this cache's LIN lambdas (ATD candidate, or the MTD's selection). */
 void cache_set_lin_lambdas(Cache* cache, double lam_mlp, double lam_data, double lam_instr);
 Flag cache_last_hit_fe_bound(Cache* cache);
