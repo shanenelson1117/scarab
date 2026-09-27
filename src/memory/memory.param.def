@@ -163,6 +163,27 @@ DEF_PARAM(mlp_lin_lambda, MLP_LIN_LAMBDA, float, float, 1.0, )
    it on a machine with longer misses rather than editing the table. */
 DEF_PARAM(mlp_lin_cost_scale, MLP_LIN_COST_SCALE, float, float, 1.0, )
 
+/* --mlp_cost_edges: the seven cost quantization edges, in cycles, as a comma-separated list --
+   "15,20,25,30,45,60,90". Must be exactly seven values and non-decreasing; both are asserted.
+   EMPTY (the default) keeps the built-in tables measured on the google traces.
+
+   WHY THIS IS A PARAMETER. The edges are equal-population cut points of the MEASURED cost
+   distribution, so they are a property of the workload, not of the policy. Compiling them in
+   meant a rebuild per suite, and there is no scaling shortcut: excluding stores moved five of
+   the seven edges and moved the bottom ones DOWN while the mean went UP, so the distribution
+   reshapes rather than shifts and --mlp_lin_cost_scale cannot stand in for re-cutting.
+
+   CALIBRATING A NEW SUITE. Run a measurement config (--mlp_cost_stats 1, default replacement
+   policy, so the policy does not perturb the distribution it is being calibrated from), then
+   take equal-population cut points of MLC_MLP_COST_* at 5-cycle resolution, target-only
+   (_count). utils/mlp_cost_edges.py does this from a collected_stats CSV.
+
+   A SINGLE TABLE PER SUITE IS ALREADY A COMPROMISE. Across the 12 google workloads the
+   per-workload edges vary 2-3x, and one (tahoe) collapses six of seven cut points onto a
+   single value -- under the global table it effectively runs a 1-bit code. Check the
+   per-workload spread before trusting one table for a more heterogeneous suite. */
+DEF_PARAM(mlp_cost_edges, MLP_COST_EDGES, char*, string, "", )
+
 /* SECOND COST TERM, static (no dueling), with an INDEPENDENT WEIGHT PER CLASS:
      Value = Recency + lambda*Cost + (data line ? data_lambda : instr_lambda) * Bound
 

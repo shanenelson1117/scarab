@@ -176,27 +176,58 @@ static inline void consume_fill_bound(Cache_Entry* line) {
  * set and evicted first among equals. That is deliberate but it is also the sharpest edge on
  * this policy: on a prefetch-heavy workload it evicts prefetched lines preferentially, which
  * can swamp the effect being measured. Watch prefetch accuracy when reading results. */
+/* --mlp_cost_edges: parse the seven edges once. Empty string keeps the built-in tables. */
+static double g_mlp_edges[7];
+static Flag   g_mlp_edges_parsed = FALSE;
+static Flag   g_mlp_edges_custom = FALSE;
+
+static void mlp_cost_edges_init(void) {
+  if (g_mlp_edges_parsed)
+    return;
+  g_mlp_edges_parsed = TRUE;
+  const char* spec = MLP_COST_EDGES;
+  if (!spec || !*spec)
+    return; /* built-in tables */
+  int         n = 0;
+  const char* p = spec;
+  while (n < 7 && *p) {
+    char*  end = NULL;
+    double v = strtod(p, &end);
+    if (end == p)
+      break;
+    g_mlp_edges[n++] = v;
+    p = end;
+    while (*p == ',' || *p == ' ')
+      p++;
+  }
+  ASSERTM(0, n == 7, "--mlp_cost_edges needs exactly 7 comma-separated values, parsed %d from '%s'\n", n, spec);
+  for (int i = 1; i < 7; i++)
+    ASSERTM(0, g_mlp_edges[i] >= g_mlp_edges[i - 1],
+            "--mlp_cost_edges must be non-decreasing; edge %d (%f) < edge %d (%f)\n", i, g_mlp_edges[i], i - 1,
+            g_mlp_edges[i - 1]);
+  g_mlp_edges_custom = TRUE;
+}
+
 static inline uns mlp_lin_costq(double cost_cycles) {
   /* Equal-population cut points, MEASURED from MLC_MLP_COST_* at 5-cycle resolution on the
-     google traces, target-only. Two tables because --mlp_cost_exclude_stores removes ~29% of
-     the population and reshapes what is left enough to move five of the seven edges; running
-     the with-stores table on a without-stores distribution leaves the buckets no longer
-     equal-population, which is the whole thing these edges exist to avoid.
+     google traces, target-only. Two built-in tables because --mlp_cost_exclude_stores removes
+     ~29% of the population and reshapes what is left enough to move five of the seven edges.
 
      WITH stores (cost_calib_google, 34.8M misses, mean cost 62.1)
      WITHOUT    (mlp_lin_stores_google/excl_stores, 26.7M misses, mean cost 64.0)
 
-     Note the without-stores edges are LOWER at the bottom and top-heavy, even though the MEAN
-     cost is HIGHER. Excluding stores does not simply shift the distribution up: it removes a
-     band of mid-cost misses and leaves a more skewed one -- more mass low, heavier tail. That
-     is why these are measured per configuration rather than derived by scaling the other
-     table, and why --mlp_lin_cost_scale cannot substitute for re-cutting them. */
+     The without-stores edges are LOWER at the bottom and top-heavy even though the MEAN is
+     HIGHER -- excluding stores removes a band of mid-cost misses and leaves a more skewed
+     distribution. That is why these are measured per configuration rather than scaled, and why
+     a new suite needs --mlp_cost_edges rather than --mlp_lin_cost_scale. */
   static const double edges_with_stores[7] = {15.0, 20.0, 25.0, 30.0, 45.0, 60.0, 90.0};
   static const double edges_without_stores[7] = {10.0, 20.0, 25.0, 30.0, 40.0, 55.0, 90.0};
 
-  const double* edges = MLP_COST_EXCLUDE_STORES ? edges_without_stores : edges_with_stores;
-  const double  scale = (double)MLP_LIN_COST_SCALE;
-  uns           q = 0;
+  mlp_cost_edges_init();
+  const double* edges =
+      g_mlp_edges_custom ? g_mlp_edges : (MLP_COST_EXCLUDE_STORES ? edges_without_stores : edges_with_stores);
+  const double scale = (double)MLP_LIN_COST_SCALE;
+  uns          q = 0;
   for (q = 0; q < 7; q++) {
     if (cost_cycles < edges[q] * scale)
       return q;
