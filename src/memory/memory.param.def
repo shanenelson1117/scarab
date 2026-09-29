@@ -400,6 +400,59 @@ DEF_PARAM(  uop_queue_length               , UOP_QUEUE_LENGTH                , u
 DEF_PARAM(early_evict_stats, EARLY_EVICT_STATS, Flag, Flag, FALSE, )
 DEF_PARAM(early_evict_lat_mult, EARLY_EVICT_LAT_MULT, uns, uns, 2, )
 
+/* --reuse_dist_stats: reuse-distance distribution of MLC and LLC lines, SPLIT BY MARKED CLASS.
+ *
+ * THE UNIT IS ACCESSES TO THE SET, and the distance runs FROM THE LINE'S LAST ACCESS -- its
+ * fill, or its most recent hit -- not from its fill. Both choices matter and neither matches
+ * --early_evict_stats, which is cycles and runs from fill:
+ *
+ *   - ACCESSES, not cycles, because the question is whether a reuse would survive the set's
+ *     replacement pressure, and that is counted in competing accesses. It also makes the number
+ *     directly comparable to ASSOCIATIVITY: a distance below assoc is a reuse plain LRU already
+ *     captures, so only the mass above assoc is what a smarter policy can win.
+ *   - FROM LAST ACCESS, because that is reuse distance. From-fill would be residency: a line
+ *     hit ten times and then replaced would report one long interval rather than ten short ones.
+ *
+ * WHY IT IS SPLIT BY CLASS. The marking machinery (--membound_stats and the marked-RRIP
+ * policies) asserts that membound / FE-bound lines are worth protecting. That claim is about
+ * WHEN they are reused, and until now nothing measured it: MLC_MEMBOUND_HIT says whether a
+ * marked line was reused at all, never how far away the reuse was. A marked population whose
+ * distances sit below assoc needs no protection -- LRU already catches them -- and one whose
+ * distances are unbounded cannot be helped by any capacity-bound policy. Only the band just
+ * above assoc is actionable, and this is what shows where the mass actually sits.
+ *
+ * READ *_NOREUSE FIRST. The histogram necessarily contains only lines that WERE reused, so on
+ * its own it is a biased sample. *_NOREUSE counts lines evicted having never been hit, per
+ * class, and a policy can raise its protected class's mean distance purely by keeping hopeless
+ * lines resident longer -- which moves *_NOREUSE and nothing else. The pair is the measurement;
+ * the histogram alone is not.
+ *
+ * POLICY-INDEPENDENT, like the membound_fill bits it splits on: the counters are maintained on
+ * every replacement policy, so an LRU run and a marked-RRIP run are directly comparable. Note
+ * the distribution is still a property of the policy as well as the workload -- a policy that
+ * evicts a line before its reuse removes that distance from the histogram and adds to
+ * *_NOREUSE -- so it measures the reuse the cache ACTUALLY CAPTURED, not the workload's
+ * intrinsic reuse. For the latter, run it under a very large cache.
+ *
+ * WHAT COUNTS AS AN ACCESS. The per-set clock ticks once per REPLACEMENT-UPDATING cache_access,
+ * so a distance is the number of accesses that could have evicted the line. Two consequences:
+ *   - Probes (update_repl==FALSE) do not tick, and neither do prefetch accesses under
+ *     --prefetch_update_lru_mlc 0 / --prefetch_update_lru_l1 0. Both default TRUE and
+ *     PARAMS.google does not override them, so on the stock config every access counts.
+ *   - A fill does not tick on its own; it is already counted by the access that missed. The one
+ *     gap is a fill with no preceding access on that cache (the prefetch-cache promotion path
+ *     into the LLC), which stamps the line without advancing the clock. That slightly understates
+ *     pressure on those sets and is not corrected, because ticking at both the access and the
+ *     fill would double-count every ordinary miss.
+ *
+ * NOT COVERED: --marked_rrip_stream_buf. A hit served from the one-line victim buffer records no
+ * distance, because the buffer holds a line that is not in any set and so has no set clock to
+ * measure against. The buffer is off by default; with it on, its hits are simply absent here.
+ *
+ * WINDOW: target-only, on the same early_evict_in_roi() gate as the *_EVICT counters, so these
+ * sit on the Periodic_* window. Divide by Periodic_Instructions, never by Cumulative_*. */
+DEF_PARAM(reuse_dist_stats, REUSE_DIST_STATS, Flag, Flag, FALSE, )
+
 /* --mlp_cost_stats: accumulate the MLP-based cost of every demand MLC miss, per
  * "A Case for MLP-Aware Cache Replacement" (Qureshi et al., ISCA'06), Algorithm 1.
  *

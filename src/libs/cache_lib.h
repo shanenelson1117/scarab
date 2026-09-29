@@ -188,6 +188,22 @@ typedef struct Cache_Entry_struct {
      in cycles), so the stamp has to be in cycles too. */
   Counter fill_cycle;
 
+  /* --reuse_dist_stats: the value of Cache.set_access_ctr[set] at this line's LAST ACCESS --
+     its fill, or its most recent hit. The next hit subtracts it to get a reuse distance
+     measured in ACCESSES TO THIS SET, which is the unit the replacement literature uses and is
+     what makes the number comparable against associativity (a distance below assoc is one LRU
+     would have caught). Deliberately NOT fill_cycle, which is cycles and runs from fill: that
+     measures residency, so a line hit ten times then replaced still reads as short-lived.
+     Here every hit restarts the clock, so what is measured is the gap between consecutive uses.
+
+     reuse_seen records whether this line was EVER hit since its fill. Without it the histogram
+     is a biased sample -- it can only contain lines that were reused at all -- and "marked
+     lines are reused at distance 40" would hide "and 70% of them are never reused". Both are
+     maintained on every policy, like membound_fill, so the measurement is policy-independent
+     and a marked-RRIP run can be compared against an LRU one. */
+  Counter last_access_count;
+  Flag reuse_seen;
+
   Flag outcome;       /* for replacement policy */
 } Cache_Entry;
 
@@ -319,6 +335,29 @@ typedef struct Cache_struct {
   double lin_lambda_mlp;
   double lin_lambda_data;
   double lin_lambda_instr;
+
+  /* --reuse_dist_stats: one monotonic access counter per set, incremented once per
+     replacement-updating cache_access that indexes it (hits AND misses -- both are accesses the
+     set sees). NULL when the knob is off, which is also the enable test on every hot path.
+     Counter is 64-bit and never wraps, unlike Mockingjay's 8-bit sampler timestamp, so a long
+     distance is measured rather than saturated.
+
+     A probe with update_repl==FALSE (warmup / oracle lookups) does NOT tick it and does not
+     record a distance: those accesses do not exist as far as replacement is concerned, and
+     counting them would inflate every distance by however many probes happened to interleave. */
+  Counter* set_access_ctr;
+
+  /* --reuse_dist_stats: published by the most recent cache_access, for the caller to count.
+     Same publish-then-count split as last_hit_membound: cache_lib measures, memory.c knows
+     which cache it is holding and therefore which stat chain to charge. */
+  Flag    last_hit_reuse_valid; /* the last access was a hit that produced a distance */
+  Counter last_hit_reuse_dist;  /* that distance, in accesses to the set; >= 1 */
+
+  /* --reuse_dist_stats: published by the most recent insert, describing the line it evicted.
+     last_evict_valid (above) says whether there WAS a victim; these describe it. */
+  Flag last_evict_reused;   /* the victim had been hit at least once since its fill */
+  Flag last_evict_membound; /* the victim was filled by a membound access */
+  Flag last_evict_fe_bound; /* ... or by an FE-bound one (mutually exclusive with membound) */
 } Cache;
 
 /**************************************************************************************/
@@ -447,6 +486,31 @@ Flag cache_last_hit_fe_bound(Cache* cache);
  * describes; call it before any other insert on the same cache. The caller compares *age
  * against its own threshold, because cache_lib knows no cache's access latency. */
 Flag cache_last_evict_age(Cache* cache, Counter* age);
+
+/* --reuse_dist_stats: the REUSE DISTANCE of the most recent cache_access on `cache`, in
+ * ACCESSES TO THAT SET, measured from the hit line's previous access (its fill, or its last
+ * hit). 1 means the very next access to the set reused the line.
+ *
+ * Returns FALSE, leaving *dist untouched, when the last access was a miss, was a probe
+ * (update_repl==FALSE), or when the knob is off. Valid only immediately after the cache_access
+ * it describes. The caller adds the class split: read cache_last_hit_membound /
+ * cache_last_hit_fe_bound alongside this to charge the right histogram.
+ *
+ * Compare against ASSOCIATIVITY, not against a cycle count: a distance below assoc is a reuse
+ * LRU would have captured, so the mass above assoc is what any non-LRU policy is competing for. */
+Flag cache_last_reuse_dist(Cache* cache, Counter* dist);
+
+/* --reuse_dist_stats: describe the line the most recent INSERT on `cache` evicted.
+ *
+ * Returns FALSE when that insert evicted nothing (a free way). Otherwise returns TRUE and
+ * writes whether the victim was ever reused, and which marked class it belonged to.
+ *
+ * This is the other half of the distance histogram and is NOT optional bookkeeping: the
+ * histogram can only contain lines that were reused, so it is a biased sample on its own. A
+ * policy that protects marked lines can raise their mean reuse distance simply by keeping the
+ * hopeless ones alive longer, which shows up here as a rising *_NOREUSE and nowhere else.
+ * Same validity window as cache_last_evict_age. */
+Flag cache_last_evict_reuse(Cache* cache, Flag* reused, Flag* membound, Flag* fe_bound);
 
 /* --td_load_rrip_fixup: rewrite a resident line's RRPV after the fact.
  *

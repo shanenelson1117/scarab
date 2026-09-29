@@ -327,6 +327,84 @@ Flag early_evict_in_roi(void) {
   return warmup_dump_done && warmup_dump_done[0];
 }
 
+/* --reuse_dist_stats ---------------------------------------------------------------------------
+ *
+ * Distances arrive from cache_lib in ACCESSES TO THE SET, measured from the line's last access.
+ * All this does is bucket them and charge the chain for the line's marked class. Shares
+ * early_evict_in_roi() rather than membound_in_roi(): these are always target-only and must not
+ * change window when --membound_stats_roi moves.
+ *
+ * Bucket k is [2^(k-1)+1, 2^k] for k >= 1, with bucket 0 holding exactly distance 1 and the last
+ * bucket saturating -- i.e. the log2 chain named in memory.stat.def (1, 2, 3-4, 5-8, ...). The
+ * spacing is log2 because the question the number answers is which side of ASSOCIATIVITY a reuse
+ * falls on, and associativity is a scale, not an offset. */
+#define REUSE_DIST_BUCKETS 12
+
+static inline uns reuse_dist_bucket(Counter d) {
+  uns     b = 0;
+  Counter edge = 1;
+  /* Walks at most 11 times, so the loop is cheaper than a log and cannot disagree with the
+     stat.def naming the way a closed form derived separately could. */
+  while (b < REUSE_DIST_BUCKETS - 1 && d > edge) {
+    edge <<= 1;
+    b++;
+  }
+  return b;
+}
+
+/* Charge the distance the most recent cache_access on `cache` measured, if it was a hit that
+   produced one. Call immediately after that access, beside the *_MEMBOUND_HIT counters, and for
+   the same access population they count -- a counter fired on a different population cannot be
+   divided by them. */
+static inline void reuse_dist_count_hit(uns8 proc_id, Cache* cache, Flag is_mlc) {
+  Counter d;
+  if (!REUSE_DIST_STATS || !early_evict_in_roi())
+    return;
+  if (!cache_last_reuse_dist(cache, &d))
+    return;
+
+  int base, total;
+  if (cache_last_hit_membound(cache)) {
+    base = is_mlc ? MLC_REUSE_DIST_MEMBOUND_1 : L1_REUSE_DIST_MEMBOUND_1;
+    total = is_mlc ? MLC_REUSE_DIST_MEMBOUND_TOTAL : L1_REUSE_DIST_MEMBOUND_TOTAL;
+  } else if (cache_last_hit_fe_bound(cache)) {
+    base = is_mlc ? MLC_REUSE_DIST_FEBOUND_1 : L1_REUSE_DIST_FEBOUND_1;
+    total = is_mlc ? MLC_REUSE_DIST_FEBOUND_TOTAL : L1_REUSE_DIST_FEBOUND_TOTAL;
+  } else {
+    base = is_mlc ? MLC_REUSE_DIST_UNMARKED_1 : L1_REUSE_DIST_UNMARKED_1;
+    total = is_mlc ? MLC_REUSE_DIST_UNMARKED_TOTAL : L1_REUSE_DIST_UNMARKED_TOTAL;
+  }
+  STAT_EVENT(proc_id, base + reuse_dist_bucket(d));
+  INC_STAT_EVENT(proc_id, total, d);
+}
+
+/* Count the line the most recent insert on `cache` evicted, by class, and whether it was ever
+   reused. This is the half the distance chain cannot contain -- see the stat.def note on why the
+   histogram is a biased sample without it. Call immediately after the insert, next to the
+   *_EARLY_EVICT read, which is the same validity window. */
+static inline void reuse_dist_count_evict(uns8 proc_id, Cache* cache, Flag is_mlc) {
+  Flag reused = FALSE, membound = FALSE, fe_bound = FALSE;
+  if (!REUSE_DIST_STATS || !early_evict_in_roi())
+    return;
+  if (!cache_last_evict_reuse(cache, &reused, &membound, &fe_bound))
+    return;  // the insert took a free way, so nothing was evicted
+
+  int evicted, noreuse;
+  if (membound) {
+    evicted = is_mlc ? MLC_REUSE_EVICT_MEMBOUND : L1_REUSE_EVICT_MEMBOUND;
+    noreuse = is_mlc ? MLC_NOREUSE_MEMBOUND : L1_NOREUSE_MEMBOUND;
+  } else if (fe_bound) {
+    evicted = is_mlc ? MLC_REUSE_EVICT_FEBOUND : L1_REUSE_EVICT_FEBOUND;
+    noreuse = is_mlc ? MLC_NOREUSE_FEBOUND : L1_NOREUSE_FEBOUND;
+  } else {
+    evicted = is_mlc ? MLC_REUSE_EVICT_UNMARKED : L1_REUSE_EVICT_UNMARKED;
+    noreuse = is_mlc ? MLC_NOREUSE_UNMARKED : L1_NOREUSE_UNMARKED;
+  }
+  STAT_EVENT(proc_id, evicted);
+  if (!reused)
+    STAT_EVENT(proc_id, noreuse);
+}
+
 /* --membound_stats: classify a fill by the signal of the access that caused it, and stage the
    result for the cache_insert that follows.
 
@@ -355,8 +433,14 @@ static inline void membound_classify_fill(Mem_Req* req, Flag* is_membound, Flag*
      are written from here. Gating this on --membound_stats alone would mean forgetting that
      knob turns the policy's second term off SILENTLY -- no error, just a sweep where every
      lambda arm lands on its control. So a nonzero LIN boundness lambda opens the
-     classification too. The stats below stay gated on MEMBOUND_STATS. */
-  if (!MEMBOUND_STATS && MLP_LIN_DATA_LAMBDA == 0.0 && MLP_LIN_INSTR_LAMBDA == 0.0)
+     classification too. The stats below stay gated on MEMBOUND_STATS.
+
+     --reuse_dist_stats opens it for the same reason: its histogram is SPLIT on exactly these
+     bits, so without them every line classifies UNMARKED, the MEMBOUND and FEBOUND chains stay
+     at zero, and the run looks like a workload with no marked lines rather than like a missing
+     knob. Self-opening here is the only place that failure can be prevented -- nothing
+     downstream can tell an unmarked line from an unclassified one. */
+  if (!MEMBOUND_STATS && !REUSE_DIST_STATS && MLP_LIN_DATA_LAMBDA == 0.0 && MLP_LIN_INSTR_LAMBDA == 0.0)
     return;
   if (req->type == MRT_IFETCH) {
     double fe_frac = 0.0;
@@ -2295,6 +2379,10 @@ Flag mem_process_l1_hit_access(Mem_Req* req, Mem_Queue_Entry* l1_queue_entry, Ad
       else if (cache_last_hit_fe_bound(&L1(req->proc_id)->cache))
         STAT_EVENT(req->proc_id, L1_FEBOUND_HIT);
     }
+    /* --reuse_dist_stats: how FAR away this reuse was, beside the counter for whether it
+       happened at all. Same guard and same population as the block above for exactly the reason
+       that one documents -- placed here and not at the cache_access, which is re-run on retry. */
+    reuse_dist_count_hit(req->proc_id, &L1(req->proc_id)->cache, FALSE);
     if (0 && DEBUG_EXC_INSERTS) {
       printf("addr:%s hit in L1 type:%s\n", hexstr64s(req->addr), Mem_Req_Type_str(req->type));
     }
@@ -2410,6 +2498,8 @@ Flag mem_process_mlc_hit_access(Mem_Req* req, Mem_Queue_Entry* mlc_queue_entry, 
         else if (cache_last_hit_fe_bound(&MLC(req->proc_id)->cache))
           STAT_EVENT(req->proc_id, MLC_FEBOUND_HIT);
       }
+      /* --reuse_dist_stats: see the matching call on the L1 hit path. */
+      reuse_dist_count_hit(req->proc_id, &MLC(req->proc_id)->cache, TRUE);
       if (0 && DEBUG_EXC_INSERTS) {
         printf("addr:%s hit in MLC type:%s\n", hexstr64s(req->addr), Mem_Req_Type_str(req->type));
       }
@@ -5716,6 +5806,9 @@ Flag l1_fill_line(Mem_Req* req) {
         STAT_EVENT(req->proc_id, L1_EARLY_EVICT);
     }
   }
+  /* --reuse_dist_stats: same victim, same window, its own knob -- did it ever pay off? Outside
+     the block above so the two stats stay independently enableable. */
+  reuse_dist_count_evict(req->proc_id, &L1(req->proc_id)->cache, FALSE);
 
   /* --td_load_rrip_fixup: record where this fill landed, for the correction at window close. */
   td_rrip_fixup_record(l1_fixup_op, TD_RRIP_FIXUP_L1, line_addr, l1_fix_depth, l1_fix_thresh, l1_fix_basic);
@@ -6203,6 +6296,8 @@ Flag mlc_fill_line(Mem_Req* req) {
         STAT_EVENT(req->proc_id, MLC_EARLY_EVICT);
     }
   }
+  /* --reuse_dist_stats: see the matching call in the L1 fill. */
+  reuse_dist_count_evict(req->proc_id, &MLC(req->proc_id)->cache, TRUE);
 
   /* --td_load_rrip_fixup: the line is in now, so its fill_cycle is this cycle. `line_addr` is
      the one the insert above reported for THIS cache, which is what the correction must look
@@ -6534,6 +6629,10 @@ L1_Data* l1_pref_cache_access(Mem_Req* req) {
           STAT_EVENT(req->proc_id, L1_EARLY_EVICT);
       }
     }
+    /* --reuse_dist_stats: this promotion is a real LLC fill and can evict, so it is counted on
+       the same footing as the ordinary path -- keeping *_REUSE_EVICT_* and L1_EVICT over the
+       same population. */
+    reuse_dist_count_evict(req->proc_id, &L1(req->proc_id)->cache, FALSE);
 
     STAT_EVENT(req->proc_id, L1_DATA_EVICT);
     STAT_EVENT(req->proc_id, L1_PREF_MOVE_L1);

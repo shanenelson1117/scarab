@@ -388,7 +388,73 @@ Flag cache_last_hit_fe_bound(Cache* cache) {
 
 /* Record the residency of the line about to be replaced. A victim that is not valid is a free
  * way, i.e. no eviction, and is published as such. */
+/* --reuse_dist_stats -------------------------------------------------------------------------
+ *
+ * Distance is in ACCESSES TO THE SET and runs FROM THE LINE'S LAST ACCESS. See --reuse_dist_stats
+ * in memory.param.def for why both of those differ from --early_evict_stats (cycles, from fill).
+ *
+ * set_access_ctr[] being NULL is the enable test everywhere below, so a run with the knob off
+ * pays one predictable null check per access and nothing else. */
+
+/* One access to `set`. Ticks the set's clock, which is the timestamp both the hit and the fill
+ * path stamp onto a line. Called once per replacement-updating cache_access, for hits AND misses
+ * alike -- a miss is an access the set saw and displaces exactly as a hit does, so omitting it
+ * would understate every distance.
+ *
+ * "Replacement-updating" is the definition, not an accident: the clock counts exactly the
+ * accesses that can move replacement state, so a distance is the number of accesses that could
+ * have evicted the line. Accesses with update_repl==FALSE therefore do not tick -- probes, and
+ * prefetch accesses under --prefetch_update_lru_mlc 0 / --prefetch_update_lru_l1 0 (both default
+ * TRUE, so on the stock config every access counts). Turning either off narrows this clock as
+ * well as the LRU stack, which is consistent but worth knowing when comparing across those runs. */
+static inline void reuse_dist_tick(Cache* cache, uns set) {
+  if (!cache->set_access_ctr)
+    return;
+  cache->set_access_ctr[set]++;
+}
+
+/* A hit on `line` in `set`, after reuse_dist_tick counted this access. Publishes the distance
+ * since the line's previous access and restarts its clock -- restarting is what makes this reuse
+ * distance rather than residency. */
+static inline void reuse_dist_on_hit(Cache* cache, Cache_Entry* line, uns set) {
+  if (!cache->set_access_ctr)
+    return;
+  const Counter now = cache->set_access_ctr[set];
+  /* now > last_access_count always holds: the line was stamped at its fill, which is an earlier
+     access to this same set, and the tick already advanced the clock past it. Guarded anyway
+     because Counter is unsigned and the alternative to a guard is a 2^64 outlier. */
+  cache->last_hit_reuse_dist = (now > line->last_access_count) ? now - line->last_access_count : 1;
+  cache->last_hit_reuse_valid = TRUE;
+  line->last_access_count = now;
+  line->reuse_seen = TRUE;
+}
+
+/* A fill of `line` into `set`. The fill is itself an access, so it starts the line's clock; the
+ * line's FIRST reuse is therefore measured from here, which is the only sensible origin for a
+ * line that has no earlier access. reuse_seen restarts FALSE: this line has not been reused,
+ * whatever the line that previously occupied the way had done. */
+static inline void stamp_reuse_dist(Cache* cache, Cache_Entry* line, uns set) {
+  if (!cache->set_access_ctr)
+    return;
+  line->last_access_count = cache->set_access_ctr[set];
+  line->reuse_seen = FALSE;
+}
+
 static inline void record_evict_age(Cache* cache, Cache_Entry* victim) {
+  /* --reuse_dist_stats: the victim's reuse outcome and marked class, published on the same hook
+     and in the same "still readable" window as the residency below. A victim with reuse_seen
+     FALSE never paid off, which is the half of the measurement the distance histogram cannot
+     contain -- see cache_last_evict_reuse. */
+  if (victim && victim->valid) {
+    cache->last_evict_reused = victim->reuse_seen;
+    cache->last_evict_membound = victim->membound_fill;
+    cache->last_evict_fe_bound = victim->fe_bound_fill;
+  } else {
+    cache->last_evict_reused = FALSE;
+    cache->last_evict_membound = FALSE;
+    cache->last_evict_fe_bound = FALSE;
+  }
+
   if (victim && victim->valid) {
     cache->last_evict_valid = TRUE;
     /* cycle_count can only have advanced since the fill, but the subtraction is guarded anyway:
@@ -410,6 +476,22 @@ Flag cache_last_evict_age(Cache* cache, Counter* age) {
   if (!cache->last_evict_valid)
     return FALSE;
   *age = cache->last_evict_age;
+  return TRUE;
+}
+
+Flag cache_last_reuse_dist(Cache* cache, Counter* dist) {
+  if (!cache->last_hit_reuse_valid)
+    return FALSE;
+  *dist = cache->last_hit_reuse_dist;
+  return TRUE;
+}
+
+Flag cache_last_evict_reuse(Cache* cache, Flag* reused, Flag* membound, Flag* fe_bound) {
+  if (!cache->last_evict_valid)
+    return FALSE;
+  *reused = cache->last_evict_reused;
+  *membound = cache->last_evict_membound;
+  *fe_bound = cache->last_evict_fe_bound;
   return TRUE;
 }
 
@@ -579,6 +661,15 @@ void init_cache(Cache* cache, const char* name, uns cache_size, uns assoc, uns l
   cache->lin_lambda_mlp = 0.0;
   cache->lin_lambda_data = 0.0;
   cache->lin_lambda_instr = 0.0;
+  /* --reuse_dist_stats: the per-set access counters double as the enable test on every hot
+     path, so they are allocated here -- ahead of the strategy branch, so both policy families
+     get them -- and left NULL when the knob is off. num_sets is already derived above. */
+  cache->set_access_ctr = REUSE_DIST_STATS ? (Counter*)calloc(num_sets, sizeof(Counter)) : NULL;
+  cache->last_hit_reuse_valid = FALSE;
+  cache->last_hit_reuse_dist = 0;
+  cache->last_evict_reused = FALSE;
+  cache->last_evict_membound = FALSE;
+  cache->last_evict_fe_bound = FALSE;
   memset(&cache->sb, 0, sizeof(cache->sb));
 
   if (repl_policy >= REPL_VOID) {
@@ -626,6 +717,8 @@ void init_cache(Cache* cache, const char* name, uns cache_size, uns assoc, uns l
       cache->entries[ii][jj].offpath_unproven = FALSE;
       cache->entries[ii][jj].fe_bound_fill = FALSE;
       cache->entries[ii][jj].fill_cycle = 0;  // --early_evict_stats
+      cache->entries[ii][jj].last_access_count = 0;  // --reuse_dist_stats
+      cache->entries[ii][jj].reuse_seen = FALSE;     // --reuse_dist_stats
       if (data_size) {
         cache->entries[ii][jj].data = (void*)malloc(data_size);
         memset(cache->entries[ii][jj].data, 0, data_size);
@@ -707,6 +800,15 @@ void* cache_access(Cache* cache, Addr addr, Addr* line_addr, Flag update_repl) {
   cache->last_hit_mlp_cost = 0.0;
   cache->last_hit_bound_frac = 0.0;
   cache->last_hit_fe_bound = FALSE;
+  cache->last_hit_reuse_valid = FALSE;
+
+  /* --reuse_dist_stats: count this access against the set BEFORE the lookup, so the distance a
+     hit reports includes the hit itself and the minimum distance is 1. Ticked here rather than
+     in each of the two lookup paths because both of them index the same set, and ticking twice
+     would double every distance. Probes (update_repl==FALSE) are not accesses for replacement
+     purposes and must not move the clock. */
+  if (update_repl)
+    reuse_dist_tick(cache, set);
 
   if (cache->repl_policy >= REPL_VOID) {
     void* strategy_data = cache_access_strategy(cache, addr, line_addr, update_repl);
@@ -749,6 +851,7 @@ void* cache_access(Cache* cache, Addr addr, Addr* line_addr, Flag update_repl) {
           line->pref = FALSE;
         }
         cache->num_demand_access++;
+        reuse_dist_on_hit(cache, line, set);  // --reuse_dist_stats
         update_repl_policy(cache, line, set, ii, FALSE);
         DEBUG(0, "(%s, %d) [0x%x, 0x%x]: in access\n\n", cache->name, cache->repl_policy, cache->num_sets,
               cache->assoc);
@@ -847,6 +950,7 @@ void* cache_insert_replpos(Cache* cache, uns8 proc_id, Addr addr, Addr* line_add
   new_line->marked_promote_rrpv = RRIP_DISTANT_VAL - 1;  // neutral; set at marked-RRIP insert
   consume_fill_bound(new_line);    // --membound_stats: non-strategy path (incl. REPL_TRUE_LRU)
   stamp_fill_cycle(new_line);      // --early_evict_stats: start this line's residency clock
+  stamp_reuse_dist(cache, new_line, set);  // --reuse_dist_stats: start its reuse clock
 
   switch (insert_repl_policy) {
     case INSERT_REPL_DEFAULT:
@@ -960,6 +1064,13 @@ void cache_invalidate(Cache* cache, Addr addr, Addr* line_addr) {
       line->was_written = FALSE;
       line->offpath_unproven = FALSE;
       line->fe_bound_fill = FALSE;
+      /* --reuse_dist_stats: the way is leaving the stack, so its reuse history describes a line
+         that is gone. stamp_reuse_dist resets both at the next fill, so this is hygiene rather
+         than load-bearing -- but an invalidated line is never counted at an eviction (it is not
+         valid, so record_evict_age publishes nothing), and leaving reuse_seen set would make it
+         look reused if that ever changed. */
+      line->last_access_count = 0;
+      line->reuse_seen = FALSE;
     }
   }
 
@@ -1872,6 +1983,11 @@ void* cache_insert_strategy(Cache* cache, uns8 proc_id, Addr addr, Addr* line_ad
   else
     *repl_line_addr = 0;
   repl_policy_func_table[policy].action_repl(cache, new_line, proc_id, tag, line_addr, repl_line_addr);
+  /* --reuse_dist_stats: after action_repl, which is where record_evict_age read the victim's
+     reuse outcome -- stamping earlier would overwrite the very field that reports it. Here
+     rather than inside general_action_repl because that one is not passed `set`, and every
+     strategy policy's action_repl funnels through this one call site anyway. */
+  stamp_reuse_dist(cache, new_line, set);
   repl_policy_func_table[policy].update_insert(cache, proc_id, set, repl_index, NULL);
 
   return new_line->data;
@@ -1905,8 +2021,10 @@ void* cache_access_strategy(Cache* cache, Addr addr, Addr* line_addr, Flag updat
       cache->last_hit_bound_frac = line->bound_frac;
       cache->last_hit_fe_bound = line->fe_bound_fill;
 
-      if (update_repl)
+      if (update_repl) {
+        reuse_dist_on_hit(cache, line, set);  // --reuse_dist_stats
         repl_policy_func_table[policy].update_hit(cache, set, ii, NULL);
+      }
 
       return line->data;
     }
@@ -1988,6 +2106,8 @@ void general_action_init(Cache* cache, const char* name, uns cache_size, uns ass
       cache->entries[ii][jj].offpath_unproven = FALSE;
       cache->entries[ii][jj].fe_bound_fill = FALSE;
       cache->entries[ii][jj].fill_cycle = 0;  // --early_evict_stats
+      cache->entries[ii][jj].last_access_count = 0;  // --reuse_dist_stats
+      cache->entries[ii][jj].reuse_seen = FALSE;     // --reuse_dist_stats
       if (data_size) {
         cache->entries[ii][jj].data = (void*)malloc(data_size);
         memset(cache->entries[ii][jj].data, 0, data_size);

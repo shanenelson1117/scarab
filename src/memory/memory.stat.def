@@ -984,6 +984,134 @@ DEF_STAT(  MLC_EARLY_EVICT                ,  RATIO,  MLC_EVICT      )
 DEF_STAT(  L1_EVICT                       ,  COUNT,  NO_RATIO       )
 DEF_STAT(  L1_EARLY_EVICT                 ,  RATIO,  L1_EVICT       )
 
+/* --reuse_dist_stats: reuse-distance distribution, IN ACCESSES TO THE SET, split by marked class.
+
+   Bucket k counts distances in [edge_k, edge_k+1); the chain is named by LOWER EDGE and is
+   log2-spaced -- 1, 2, 3-4, 5-8, ... 513-1024, 1025+ -- because the actionable question is which
+   side of ASSOCIATIVITY a reuse falls on, and that is a scale question, not a linear one. At the
+   16-way MLC everything up to and including the _9 bucket is reuse plain LRU already captures;
+   the mass in _17 and _33 is what a smarter policy can actually convert; anything from _257 up
+   is beyond what a 2MB 16-way set can hold and is not addressable by replacement at all.
+
+   DISTANCE IS FROM THE LINE'S LAST ACCESS, not from its fill, so a line hit ten times reports
+   ten short distances rather than one long residency. Contrast *_EARLY_EVICT above, which is
+   cycles and runs from fill. The two answer different questions and must not be mixed.
+
+   The chain is indexed as <LEVEL>_REUSE_DIST_<CLASS>_1 + reuse_dist_bucket(d) and must stay
+   contiguous, in order, and bracketed by its two DIST entries, which delimit the group for
+   statistics.c. MEMBOUND and FEBOUND are mutually exclusive per line (Cache_Entry.membound_fill
+   vs fe_bound_fill), so the three classes partition every hit.
+
+   *_REUSE_DIST_*_TOTAL is the SUM of the distances in that chain, outside the DIST bracket
+   because a sum between the bracketing entries would corrupt the distribution percentages.
+   Divide it by the chain's count for an exact mean instead of a bucket-midpoint estimate.
+
+   READ *_NOREUSE_* BEFORE THE HISTOGRAM. The chain can only contain lines that WERE reused, so
+   alone it is a biased sample. *_REUSE_EVICT_<CLASS> counts evictions of that class and
+   *_NOREUSE_<CLASS> the subset never hit since their fill, printed as a RATIO of it -- so the
+   output column is directly "what fraction of this class died unused". A policy that protects a
+   class can raise that class's mean distance purely by holding hopeless lines longer, which
+   moves NOREUSE and leaves the histogram looking better. The pair is the measurement.
+
+   WINDOW: target-only, on the early_evict_in_roi() gate, i.e. the Periodic_* window. Divide by
+   Periodic_Instructions, never by Cumulative_*. */
+
+DEF_STAT(  MLC_REUSE_DIST_MEMBOUND_1             , DIST  , NO_RATIO  )
+DEF_STAT(  MLC_REUSE_DIST_MEMBOUND_2             , COUNT , NO_RATIO  )
+DEF_STAT(  MLC_REUSE_DIST_MEMBOUND_3             , COUNT , NO_RATIO  )
+DEF_STAT(  MLC_REUSE_DIST_MEMBOUND_5             , COUNT , NO_RATIO  )
+DEF_STAT(  MLC_REUSE_DIST_MEMBOUND_9             , COUNT , NO_RATIO  )
+DEF_STAT(  MLC_REUSE_DIST_MEMBOUND_17            , COUNT , NO_RATIO  )
+DEF_STAT(  MLC_REUSE_DIST_MEMBOUND_33            , COUNT , NO_RATIO  )
+DEF_STAT(  MLC_REUSE_DIST_MEMBOUND_65            , COUNT , NO_RATIO  )
+DEF_STAT(  MLC_REUSE_DIST_MEMBOUND_129           , COUNT , NO_RATIO  )
+DEF_STAT(  MLC_REUSE_DIST_MEMBOUND_257           , COUNT , NO_RATIO  )
+DEF_STAT(  MLC_REUSE_DIST_MEMBOUND_513           , COUNT , NO_RATIO  )
+DEF_STAT(  MLC_REUSE_DIST_MEMBOUND_1025MORE      , DIST  , NO_RATIO  )
+DEF_STAT(  MLC_REUSE_DIST_MEMBOUND_TOTAL         , COUNT , NO_RATIO  )
+DEF_STAT(  MLC_REUSE_EVICT_MEMBOUND              , COUNT , NO_RATIO  )
+DEF_STAT(  MLC_NOREUSE_MEMBOUND                  , RATIO , MLC_REUSE_EVICT_MEMBOUND  )
+
+DEF_STAT(  MLC_REUSE_DIST_FEBOUND_1              , DIST  , NO_RATIO  )
+DEF_STAT(  MLC_REUSE_DIST_FEBOUND_2              , COUNT , NO_RATIO  )
+DEF_STAT(  MLC_REUSE_DIST_FEBOUND_3              , COUNT , NO_RATIO  )
+DEF_STAT(  MLC_REUSE_DIST_FEBOUND_5              , COUNT , NO_RATIO  )
+DEF_STAT(  MLC_REUSE_DIST_FEBOUND_9              , COUNT , NO_RATIO  )
+DEF_STAT(  MLC_REUSE_DIST_FEBOUND_17             , COUNT , NO_RATIO  )
+DEF_STAT(  MLC_REUSE_DIST_FEBOUND_33             , COUNT , NO_RATIO  )
+DEF_STAT(  MLC_REUSE_DIST_FEBOUND_65             , COUNT , NO_RATIO  )
+DEF_STAT(  MLC_REUSE_DIST_FEBOUND_129            , COUNT , NO_RATIO  )
+DEF_STAT(  MLC_REUSE_DIST_FEBOUND_257            , COUNT , NO_RATIO  )
+DEF_STAT(  MLC_REUSE_DIST_FEBOUND_513            , COUNT , NO_RATIO  )
+DEF_STAT(  MLC_REUSE_DIST_FEBOUND_1025MORE       , DIST  , NO_RATIO  )
+DEF_STAT(  MLC_REUSE_DIST_FEBOUND_TOTAL          , COUNT , NO_RATIO  )
+DEF_STAT(  MLC_REUSE_EVICT_FEBOUND               , COUNT , NO_RATIO  )
+DEF_STAT(  MLC_NOREUSE_FEBOUND                   , RATIO , MLC_REUSE_EVICT_FEBOUND  )
+
+DEF_STAT(  MLC_REUSE_DIST_UNMARKED_1             , DIST  , NO_RATIO  )
+DEF_STAT(  MLC_REUSE_DIST_UNMARKED_2             , COUNT , NO_RATIO  )
+DEF_STAT(  MLC_REUSE_DIST_UNMARKED_3             , COUNT , NO_RATIO  )
+DEF_STAT(  MLC_REUSE_DIST_UNMARKED_5             , COUNT , NO_RATIO  )
+DEF_STAT(  MLC_REUSE_DIST_UNMARKED_9             , COUNT , NO_RATIO  )
+DEF_STAT(  MLC_REUSE_DIST_UNMARKED_17            , COUNT , NO_RATIO  )
+DEF_STAT(  MLC_REUSE_DIST_UNMARKED_33            , COUNT , NO_RATIO  )
+DEF_STAT(  MLC_REUSE_DIST_UNMARKED_65            , COUNT , NO_RATIO  )
+DEF_STAT(  MLC_REUSE_DIST_UNMARKED_129           , COUNT , NO_RATIO  )
+DEF_STAT(  MLC_REUSE_DIST_UNMARKED_257           , COUNT , NO_RATIO  )
+DEF_STAT(  MLC_REUSE_DIST_UNMARKED_513           , COUNT , NO_RATIO  )
+DEF_STAT(  MLC_REUSE_DIST_UNMARKED_1025MORE      , DIST  , NO_RATIO  )
+DEF_STAT(  MLC_REUSE_DIST_UNMARKED_TOTAL         , COUNT , NO_RATIO  )
+DEF_STAT(  MLC_REUSE_EVICT_UNMARKED              , COUNT , NO_RATIO  )
+DEF_STAT(  MLC_NOREUSE_UNMARKED                  , RATIO , MLC_REUSE_EVICT_UNMARKED  )
+
+DEF_STAT(  L1_REUSE_DIST_MEMBOUND_1              , DIST  , NO_RATIO  )
+DEF_STAT(  L1_REUSE_DIST_MEMBOUND_2              , COUNT , NO_RATIO  )
+DEF_STAT(  L1_REUSE_DIST_MEMBOUND_3              , COUNT , NO_RATIO  )
+DEF_STAT(  L1_REUSE_DIST_MEMBOUND_5              , COUNT , NO_RATIO  )
+DEF_STAT(  L1_REUSE_DIST_MEMBOUND_9              , COUNT , NO_RATIO  )
+DEF_STAT(  L1_REUSE_DIST_MEMBOUND_17             , COUNT , NO_RATIO  )
+DEF_STAT(  L1_REUSE_DIST_MEMBOUND_33             , COUNT , NO_RATIO  )
+DEF_STAT(  L1_REUSE_DIST_MEMBOUND_65             , COUNT , NO_RATIO  )
+DEF_STAT(  L1_REUSE_DIST_MEMBOUND_129            , COUNT , NO_RATIO  )
+DEF_STAT(  L1_REUSE_DIST_MEMBOUND_257            , COUNT , NO_RATIO  )
+DEF_STAT(  L1_REUSE_DIST_MEMBOUND_513            , COUNT , NO_RATIO  )
+DEF_STAT(  L1_REUSE_DIST_MEMBOUND_1025MORE       , DIST  , NO_RATIO  )
+DEF_STAT(  L1_REUSE_DIST_MEMBOUND_TOTAL          , COUNT , NO_RATIO  )
+DEF_STAT(  L1_REUSE_EVICT_MEMBOUND               , COUNT , NO_RATIO  )
+DEF_STAT(  L1_NOREUSE_MEMBOUND                   , RATIO , L1_REUSE_EVICT_MEMBOUND  )
+
+DEF_STAT(  L1_REUSE_DIST_FEBOUND_1               , DIST  , NO_RATIO  )
+DEF_STAT(  L1_REUSE_DIST_FEBOUND_2               , COUNT , NO_RATIO  )
+DEF_STAT(  L1_REUSE_DIST_FEBOUND_3               , COUNT , NO_RATIO  )
+DEF_STAT(  L1_REUSE_DIST_FEBOUND_5               , COUNT , NO_RATIO  )
+DEF_STAT(  L1_REUSE_DIST_FEBOUND_9               , COUNT , NO_RATIO  )
+DEF_STAT(  L1_REUSE_DIST_FEBOUND_17              , COUNT , NO_RATIO  )
+DEF_STAT(  L1_REUSE_DIST_FEBOUND_33              , COUNT , NO_RATIO  )
+DEF_STAT(  L1_REUSE_DIST_FEBOUND_65              , COUNT , NO_RATIO  )
+DEF_STAT(  L1_REUSE_DIST_FEBOUND_129             , COUNT , NO_RATIO  )
+DEF_STAT(  L1_REUSE_DIST_FEBOUND_257             , COUNT , NO_RATIO  )
+DEF_STAT(  L1_REUSE_DIST_FEBOUND_513             , COUNT , NO_RATIO  )
+DEF_STAT(  L1_REUSE_DIST_FEBOUND_1025MORE        , DIST  , NO_RATIO  )
+DEF_STAT(  L1_REUSE_DIST_FEBOUND_TOTAL           , COUNT , NO_RATIO  )
+DEF_STAT(  L1_REUSE_EVICT_FEBOUND                , COUNT , NO_RATIO  )
+DEF_STAT(  L1_NOREUSE_FEBOUND                    , RATIO , L1_REUSE_EVICT_FEBOUND  )
+
+DEF_STAT(  L1_REUSE_DIST_UNMARKED_1              , DIST  , NO_RATIO  )
+DEF_STAT(  L1_REUSE_DIST_UNMARKED_2              , COUNT , NO_RATIO  )
+DEF_STAT(  L1_REUSE_DIST_UNMARKED_3              , COUNT , NO_RATIO  )
+DEF_STAT(  L1_REUSE_DIST_UNMARKED_5              , COUNT , NO_RATIO  )
+DEF_STAT(  L1_REUSE_DIST_UNMARKED_9              , COUNT , NO_RATIO  )
+DEF_STAT(  L1_REUSE_DIST_UNMARKED_17             , COUNT , NO_RATIO  )
+DEF_STAT(  L1_REUSE_DIST_UNMARKED_33             , COUNT , NO_RATIO  )
+DEF_STAT(  L1_REUSE_DIST_UNMARKED_65             , COUNT , NO_RATIO  )
+DEF_STAT(  L1_REUSE_DIST_UNMARKED_129            , COUNT , NO_RATIO  )
+DEF_STAT(  L1_REUSE_DIST_UNMARKED_257            , COUNT , NO_RATIO  )
+DEF_STAT(  L1_REUSE_DIST_UNMARKED_513            , COUNT , NO_RATIO  )
+DEF_STAT(  L1_REUSE_DIST_UNMARKED_1025MORE       , DIST  , NO_RATIO  )
+DEF_STAT(  L1_REUSE_DIST_UNMARKED_TOTAL          , COUNT , NO_RATIO  )
+DEF_STAT(  L1_REUSE_EVICT_UNMARKED               , COUNT , NO_RATIO  )
+DEF_STAT(  L1_NOREUSE_UNMARKED                   , RATIO , L1_REUSE_EVICT_UNMARKED  )
+
 /* --td_load_rrip_fixup: did the late RRPV correction actually land?
 
    *_RRIP_FIXUP_TRY   loads whose window closed having installed a line at that level.
