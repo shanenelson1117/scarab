@@ -566,6 +566,19 @@ void init_cache(Cache* cache, const char* name, uns cache_size, uns assoc, uns l
      the init_cache_strategy branch below, so both policy families get it. */
   cache->last_evict_valid = FALSE;
   cache->last_evict_age = 0;
+  /* REPL_MLP / REPL_MLP_PAPER per-cache lambdas. cache_set_lin_lambdas only ever sets the flag
+     TRUE (SBAR pinning a triple onto an ATD or onto the real MLC), so FALSE -- "use the global
+     --mlp_lin_* / --mlp_paper_lambda params" -- has to be established here or it is never written
+     at all on the SBAR-off path. Flag is uns8, so ANY nonzero garbage byte reads TRUE and lambda
+     then comes from lin_lambda_mlp, which would be an uninitialized double: possibly huge, or
+     NaN, which makes every `val < best` false so victim selection silently collapses to way 0.
+     The triple is cleared too, so the struct is fully defined even though the setter always
+     writes all three alongside the flag. Ahead of the strategy branch, so both policy families
+     get it -- REPL_MLP is legacy and REPL_MLP_PAPER is a strategy policy. */
+  cache->lin_lambda_override = FALSE;
+  cache->lin_lambda_mlp = 0.0;
+  cache->lin_lambda_data = 0.0;
+  cache->lin_lambda_instr = 0.0;
   memset(&cache->sb, 0, sizeof(cache->sb));
 
   if (repl_policy >= REPL_VOID) {
@@ -2049,13 +2062,40 @@ void lru_update_hit(Cache* cache, uns set, uns way, void* arg) {
   cache_debug_print_set(cache, set, way, CACHE_EVENT_HIT);
 }
 
+/* reference_val is a RECENCY STACK -- a dense permutation of 0..(valid lines - 1), 0 = MRU -- and
+   this function is what keeps it dense. See the aging loop for why that is not the same thing as
+   an age counter, and mlp_paper_update_evict for what the difference cost. */
 void lru_update_insert(Cache* cache, uns8 proc_id, uns set, uns way, void* arg) {
   int ii;
+
+  /* The victim's stack position, read BEFORE the overwrite below. Still available: the
+     action_repl that runs immediately ahead of this (general_action_repl, for both policies
+     using this function) rewrites tag / valid / base but never reference_val.
+
+     A fill into a HOLE evicted nothing, so no position was vacated and every resident line
+     shifts down; assoc stands in for "vacated from below the whole stack" and makes the loop
+     increment all of them. The victim's own reference_val cannot answer this -- for a hole it is
+     a stale value describing a line that already left the stack -- so the caller's published
+     last_evict_valid is the source. record_evict_age sets it unconditionally as the FIRST
+     statement of general_action_repl, while `valid` still holds the victim's. If that call ever
+     becomes conditional (on --early_evict_stats, say), this breaks silently. */
+  const int ref_orig = cache->last_evict_valid ? cache->entries[set][way].reference_val : (int)cache->assoc;
 
   // insertion
   cache->entries[set][way].reference_val = 0;
 
-  // aging
+  /* Aging, as a STACK and not as an age counter: the victim vacated position ref_orig, so only
+     the lines ABOVE it (reference_val < ref_orig) shift down. The lines below it keep their
+     positions -- the vacated slot is what the new line's arrival absorbs.
+
+     Incrementing every valid line unconditionally, which is what this used to do, is equivalent
+     ONLY when ref_orig == assoc-1, i.e. only when the victim was the LRU line. That holds for
+     every policy evicting by maximum reference_val (REPL_LRU_REF via lru_update_evict), so this
+     change is a no-op for them. It does NOT hold for REPL_MLP_PAPER, whose entire purpose is to
+     decline to evict the LRU line: each time it did, a position was vacated in the middle and
+     never reclaimed, the stack grew a permanent hole, and reference_val drifted past assoc-1 --
+     at which point it is no longer a bounded stack position and Recency is no longer the
+     paper's. */
   for (ii = 0; ii < cache->assoc; ii++) {
     Cache_Entry* entry = &cache->entries[set][ii];
 
@@ -2065,7 +2105,8 @@ void lru_update_insert(Cache* cache, uns8 proc_id, uns set, uns way, void* arg) 
     if (!entry->valid)
       continue;
 
-    entry->reference_val++;
+    if (entry->reference_val < ref_orig)
+      entry->reference_val++;
   }
 
   cache_debug_print_set(cache, set, way, CACHE_EVENT_INSERT);
@@ -2099,14 +2140,32 @@ Cache_Entry* lru_update_evict(Cache* cache, uns8 proc_id, uns set, uns* way, voi
  *     Value = Recency + lambda * costq,   evict the MINIMUM
  *
  * and NOTHING else. No boundness terms, no prefetch term -- those are extensions and live in
- * REPL_MLP. The only deliberate departure from the paper is the QUANTIZATION: the edges are the
+ * REPL_MLP. The one departure from the paper is the QUANTIZATION: the edges are the
  * equal-population cut points measured on these traces rather than the paper's 60-cycle ladder,
  * which on this hierarchy leaves four of its eight codes empty (see mlp_lin_costq).
  *
- * Recency maintenance is reused from the LRU strategy policy: lru_update_hit / lru_update_insert
- * keep reference_val as an LRU stack with 0 = MRU. The paper's Recency counts from the LRU end,
- * so Recency = (assoc-1) - reference_val. Reusing those two keeps the stack logic identical to
- * the policy this is meant to be compared against, and leaves only victim selection here.
+ * RECENCY IS A BOUNDED STACK POSITION, 0 = LRU, assoc-1 = MRU, exactly as the paper defines it.
+ * lru_update_hit / lru_update_insert maintain reference_val as a dense permutation of
+ * 0..(valid lines - 1) with 0 = MRU, so Recency = (assoc-1) - reference_val, and a full set gives
+ * 0..assoc-1. That makes this term IDENTICAL to REPL_MLP's rank over last_access_time, which is
+ * the point: the two policies then differ only in the terms REPL_MLP adds, so the bake-off
+ * measures those and not an accidental difference in what Recency means. Both also short-circuit
+ * to the first invalid way, so a partially-filled set never reaches the value function at all.
+ *
+ * KEEPING THE STACK DENSE IS lru_update_insert'S JOB AND IT IS SUBTLE -- read the aging loop
+ * there before touching either function. It used to age every valid line unconditionally, which
+ * is right only when the victim was the LRU line. This policy exists to decline that, so each
+ * non-LRU eviction left a permanent hole and reference_val drifted past assoc-1. Two things then
+ * went wrong at once: Recency stopped being a bounded stack position, and because assoc is `uns`,
+ * (assoc-1) - reference_val went UNSIGNED and wrapped to ~4.29e9 instead of negative. Eviction
+ * takes the MINIMUM, so every line that survived one non-LRU eviction became effectively
+ * immortal and the set's candidates collapsed to whatever still held reference_val <= assoc-1.
+ * Measured: MLC on-path hit rate 70.0% -> 28.6%, fills 16.46 -> 36.72 per Kinstr, MPKI 10.11 ->
+ * 16.47 at --mlp_paper_lambda 4 on the google traces. lambda 0 never triggered it (eviction then
+ * always takes the maximum, so the stack stays dense), which is why the lambda-0-equals-LRU
+ * check -- the one check that exists to catch a broken Recency -- could not see it. The (int)
+ * cast below is retained as belt-and-braces now that the invariant holds, with the ASSERT to say
+ * so loudly if it ever stops holding.
  *
  * lambda comes from the SBAR selector when it is running, and from --mlp_paper_lambda otherwise;
  * mlp_paper_lambda_now() resolves that. lambda 0 makes this exactly the LRU strategy policy. */
@@ -2125,7 +2184,15 @@ Cache_Entry* mlp_paper_update_evict(Cache* cache, uns8 proc_id, uns set, uns* wa
       cache_debug_print_set(cache, set, *way, CACHE_EVENT_EVICT);
       return entry;
     }
-    double recency = (double)(cache->assoc - 1 - entry->reference_val);
+    /* The stack invariant, asserted rather than assumed: it is maintained in a different function
+       (lru_update_insert) and its failure here is silent -- see the note above. */
+    ASSERTM(proc_id, entry->reference_val >= 0 && entry->reference_val < (int)cache->assoc,
+            "%s: reference_val %d outside the recency stack [0, %u) at set %u way %d -- "
+            "lru_update_insert is no longer keeping it dense\n",
+            cache->name, entry->reference_val, cache->assoc, set, ii);
+    /* (int) kept deliberately: with the invariant above this cannot go negative, but assoc is
+       `uns` and an unsigned wrap here is silent and catastrophic. */
+    double recency = (double)((int)cache->assoc - 1 - entry->reference_val);
     double val = recency + lam * (double)mlp_lin_costq(entry->mlp_cost);
     if (!have || val < best) {
       best = val;
