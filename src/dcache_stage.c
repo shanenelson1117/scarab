@@ -769,6 +769,39 @@ static inline void dcache_cacheline_miss(Op* op, Addr line_addr) {
   }
 }
 
+/* The demanding load's memory-bound fraction for an L1D fill: td_mem_cycles / td_window_cycles
+   accumulated by lsq_tag_inflight_loads over the load's in-flight window (dispatch ->
+   completion). Takes the oldest still-valid load waiting on this fill, on- or off-path -- the
+   fill happens because that load's data returned, so it describes the insert exactly as real
+   hardware would, agnostic to path. FALSE when nothing usable is waiting (prefetch fill, all
+   ops stale/freed, no demanding load), which every caller treats as "no signal".
+
+   CURSOR-FREE: it steps the List_Entry chain directly rather than going through
+   list_start_head_traversal / list_next_element. Scarab's List keeps its traversal state
+   (`current`, `place`) inside the list object, so starting a traversal of req->op_ptrs clobbers
+   any traversal of that same list already in progress up the stack. The marked-RRIP block below
+   runs only under --td_load_rrip_mark, but the --cache_mark block runs whenever marking is on,
+   and an always-on destructive walk here was measured to perturb unrelated front-end counters.
+   Reading the chain directly cannot perturb anyone. The L1D counterpart of memory.c's
+   cache_mark_req_load_frac. */
+static inline Flag dcache_req_load_frac(Mem_Req* req, double* out_frac, Addr* out_pc) {
+  List_Entry* e_p = req->op_ptrs.head;
+  List_Entry* e_u = req->op_uniques.head;
+
+  for (; e_p && e_u; e_p = e_p->next, e_u = e_u->next) {
+    Op*     op = *(Op**)(&e_p->data);
+    Counter u = *(Counter*)(&e_u->data);
+    if (!op || op->unique_num != u || !op->op_pool_valid)
+      continue;  // stale/freed op slot
+    if (op->inst_info->table_info.mem_type != MEM_LD || op->td_window_cycles == 0)
+      continue;
+    *out_frac = (double)op->td_mem_cycles / (double)op->td_window_cycles;
+    *out_pc = op->inst_info->addr;
+    return TRUE;  // oldest valid demanding load (any path)
+  }
+  return FALSE;
+}
+
 static inline Dcache_Data* dcache_fill_get_cacheline(Mem_Req* req) {
   Dcache_Data* data;
   Addr line_addr, repl_line_addr;
@@ -829,24 +862,8 @@ static inline Dcache_Data* dcache_fill_get_cacheline(Mem_Req* req) {
   // threshold in fixed-min mode).
   if (TD_LOAD_RRIP_MARK && !TD_LOAD_RRIP_ON_MLC) {
     double frac = 0.0;
-    Flag   have_frac = FALSE;
     Addr   frac_pc = 0;
-    Op** op_p = (Op**)list_start_head_traversal(&req->op_ptrs);
-    Counter* op_u = (Counter*)list_start_head_traversal(&req->op_uniques);
-    for (; op_p; op_p = (Op**)list_next_element(&req->op_ptrs),
-                 op_u = (Counter*)list_next_element(&req->op_uniques)) {
-      Op* op = *op_p;
-      if (!op || !op_u || op->unique_num != *op_u || !op->op_pool_valid)
-        continue;  // stale/freed op slot
-      // any returning demanding load sets the RRPV, agnostic to on/off path: the line is
-      // being filled because this load's data returned, exactly as real hardware inserts it.
-      if (op->inst_info->table_info.mem_type != MEM_LD || op->td_window_cycles == 0)
-        continue;
-      frac = (double)op->td_mem_cycles / (double)op->td_window_cycles;
-      frac_pc = op->inst_info->addr;
-      have_frac = TRUE;
-      break;  // oldest valid demanding load (any path)
-    }
+    Flag   have_frac = dcache_req_load_frac(req, &frac, &frac_pc);
     int rrpv = have_frac ? marked_rrip_rrpv_from_frac(frac, TD_LOAD_RRIP_MIN_RRPV, TD_LOAD_RRIP_EXTRAPOLATE,
                                                       (double)TD_LOAD_RRIP_EXTRAP_ANCHOR, (double)TD_LOAD_REPLAY_THRESH)
                          : 0;
@@ -854,6 +871,25 @@ static inline Dcache_Data* dcache_fill_get_cacheline(Mem_Req* req) {
     // hit predictor: teach this load PC how membound it is when it actually misses
     if (have_frac && TD_LOAD_RRIP_HIT_PREDICT)
       td_load_pc_pred_update(frac_pc, frac);
+  }
+
+  /* --cache_mark: stage the same signal in policy-agnostic form, so an L1D running any hooked
+     policy (--dcache_repl mockingjay, srrip, ...) can protect the line without the fill path
+     knowing what that policy's priority currency is. Independent of the block above: with
+     --td_load_rrip_mark the L1D is REPL_MARKED_RRIP, which takes no hook and consumes the
+     precomputed RRPV instead, so the two never both apply. Data-only -- an L1D fill is always
+     a load fill -- hence the data gate unconditionally. */
+  if (CACHE_MARK) {
+    double frac = 0.0;
+    Addr   frac_pc = 0;
+    Flag   have_frac = dcache_req_load_frac(req, &frac, &frac_pc);
+    Cache_Mark mark = cache_mark_from_frac(have_frac, frac, (double)TD_LOAD_REPLAY_THRESH);
+    cache_set_mark_next_insert(&mark);
+    if (mark.valid) {
+      STAT_EVENT(dc->proc_id, DCACHE_MARK_FILL_MEASURED);
+      if (mark.marked)
+        STAT_EVENT(dc->proc_id, DCACHE_MARK_FILL_MARKED);
+    }
   }
 
   data = (Dcache_Data*)cache_insert(&dc->dcache, dc->proc_id, req->addr, &line_addr, &repl_line_addr);

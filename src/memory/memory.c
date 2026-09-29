@@ -118,12 +118,17 @@ static inline Flag mockingjay_req_is_wb(Mem_Req* req) {
 }
 
 /* Stage this request's PC/traffic class for the next mockingjay hit or insert on `cache`.
-   No-op (and FALSE) for a cache not running REPL_MOCKINGJAY. */
+   No-op (and FALSE) for a cache not running REPL_MOCKINGJAY.
+
+   bp_ghist/off_path are only read under --mockingjay_path_signature; they are staged
+   unconditionally so the staging call has one shape regardless of mode. */
 static inline Flag mockingjay_stage_access(Cache* cache, Mem_Req* req) {
-  if (cache->repl_policy != REPL_MOCKINGJAY)
+  /* REPL_ARCHAGENT shares the staging path: it reads the same PC / traffic class through the
+     same one-shot, and differs only in what it does with them. */
+  if (cache->repl_policy != REPL_MOCKINGJAY && cache->repl_policy != REPL_ARCHAGENT)
     return FALSE;
   cache_set_mockingjay_next_access(TRUE, mockingjay_req_pc(req), mem_req_type_is_prefetch(req->type),
-                                   mockingjay_req_is_wb(req), req->proc_id);
+                                   mockingjay_req_is_wb(req), req->proc_id, req->bp_ghist, req->off_path);
   return TRUE;
 }
 
@@ -137,13 +142,36 @@ static inline Flag mockingjay_bypass_fill(Cache* cache, Mem_Req* req) {
      dropping one here would silently lose the dirty line. */
   if (mockingjay_req_is_wb(req))
     return FALSE;
+  /* Passed explicitly rather than read from the staged one-shot, because this predicate runs
+     BEFORE mockingjay_stage_access below. Staging first instead would leave context parked
+     across the writeback-request creation that a caller does between this check and its
+     insert, where an unrelated cache op could consume it. */
   if (!cache_mockingjay_should_bypass(cache, req->addr, mockingjay_req_pc(req), mem_req_type_is_prefetch(req->type),
-                                      req->proc_id))
+                                      req->proc_id, req->bp_ghist, req->off_path))
     return FALSE;
 
   mockingjay_stage_access(cache, req);
   cache_mockingjay_note_bypass(cache, req->addr);
   return TRUE;
+}
+
+/* TRUE if ArchAgent's Policy61 would decline to allocate this fill in `cache`.
+
+   Deliberately NOT sharing mockingjay_bypass_fill: the two differ in what happens after the
+   decision, not just in the predicate. Mockingjay stages the access and runs a full replacement
+   -state update for the fill it skipped (cache_mockingjay_note_bypass) -- Policy61 returns from
+   update_replacement_state immediately on a bypass, so a bypassed access here must train
+   nothing, advance no timestamp and leave the PC history register alone. Doing nothing is the
+   correct behaviour, which is why this function has no note_bypass counterpart. */
+static inline Flag archagent_bypass_fill(Cache* cache, Mem_Req* req) {
+  if (cache->repl_policy != REPL_ARCHAGENT || !MOCKINGJAY_BYPASS)
+    return FALSE;
+  /* Never drop a writeback -- the guide excludes writebacks from the bypass test, and dropping
+     one here would silently lose the dirty line. */
+  if (mockingjay_req_is_wb(req))
+    return FALSE;
+  return cache_archagent_should_bypass(cache, req->addr, mockingjay_req_pc(req),
+                                       mem_req_type_is_prefetch(req->type), req->proc_id);
 }
 
 /* Stage the marked-RRIP insertion state for one COMBINED-policy fill. Level-agnostic: the
@@ -254,6 +282,82 @@ static inline void membound_classify_fill(Mem_Req* req, Flag* is_membound, Flag*
     if (td_mlc_req_load_frac(req, &frac, &frac_pc) && frac > (double)TD_LOAD_REPLAY_THRESH)
       *is_membound = TRUE;
   }
+}
+
+/* --cache_mark: build the policy-agnostic mark for one fill (see Cache_Mark in cache_lib.h).
+ *
+ * Deliberately the SAME signals and the SAME gates membound_classify_fill and the marked-RRIP
+ * insert path use -- a data line from the demanding load's membound fraction against
+ * TD_LOAD_REPLAY_THRESH, an instruction line from the L1I fetch miss's front-end-bound
+ * fraction against TD_FE_RRIP_THRESH -- so "marked" means one thing across the policy, the
+ * instrumentation and this hook, and a Mockingjay run is comparable against a marked-RRIP run
+ * line for line.
+ *
+ * What it does NOT do is decide the insertion priority. That is the whole point of the split:
+ * this produces a normalized signal, and the cache's own policy decides what a signal of that
+ * strength is worth in its currency. Contrast td_combined_calc_fill, which has to know the
+ * per-class depths, the per-set duel basic, and that the answer is an RRPV.
+ *
+ * Both fraction lookups are pure reads and the whole thing short-circuits when --cache_mark is
+ * off, so it costs nothing in an unrelated run. Returns an invalid mark for a fill with no
+ * usable signal (prefetch, off-path, no demanding op), which the insert treats as unmarked. */
+/* Same walk as td_mlc_req_load_frac, but CURSOR-FREE: it steps the List_Entry chain directly
+   instead of going through list_start_head_traversal / list_next_element.
+   
+   That is not a style preference. Scarab's List keeps its traversal state (`current`, `place`)
+   INSIDE the list object, so starting a traversal of req->op_ptrs clobbers any traversal of
+   that same list already in progress further up the stack. The pre-existing callers of
+   td_mlc_req_load_frac are all gated off in a default run, so adding an ALWAYS-ON walk here
+   introduced exactly that interference -- measured as shifted ICACHE_HIT and uop-cache counts
+   in a run whose marks were otherwise inert. Reading the chain directly cannot perturb anyone.
+   
+   Kept separate from td_mlc_req_load_frac rather than fixing that one in place: it is on the
+   marked-RRIP path, and changing how it walks would change results for descriptors that are
+   mid-study. The same latent hazard is there if it is ever called from inside a traversal. */
+static inline Flag cache_mark_req_load_frac(Mem_Req* req, double* out_frac) {
+  List_Entry* e_p = req->op_ptrs.head;
+  List_Entry* e_u = req->op_uniques.head;
+
+  for (; e_p && e_u; e_p = e_p->next, e_u = e_u->next) {
+    Op*     op = *(Op**)(&e_p->data);
+    Counter u = *(Counter*)(&e_u->data);
+    if (!op || op->unique_num != u || !op->op_pool_valid)
+      continue;  // stale/freed op slot
+    if (op->inst_info->table_info.mem_type != MEM_LD || op->td_window_cycles == 0)
+      continue;
+    *out_frac = (double)op->td_mem_cycles / (double)op->td_window_cycles;
+    return TRUE;  // oldest valid demanding load (any path)
+  }
+  return FALSE;
+}
+
+static inline Cache_Mark cache_mark_for_fill(Mem_Req* req) {
+  double frac = 0.0;
+  Flag   have_frac;
+
+  if (!CACHE_MARK)
+    return cache_mark_from_frac(FALSE, 0.0, 0.0);
+
+  /* The lookup is sequenced BEFORE the build on purpose: it writes `frac` through a pointer,
+     and C does not order the evaluation of a call's arguments, so folding it into the
+     cache_mark_from_frac(...) argument list can read `frac` before the lookup fills it in. */
+  if (req->type == MRT_IFETCH) {
+    have_frac = icache_fe_frac_for_line(req->proc_id, req->addr, &frac);
+    return cache_mark_from_frac(have_frac, frac, (double)TD_FE_RRIP_THRESH);
+  }
+  have_frac = cache_mark_req_load_frac(req, &frac);
+  return cache_mark_from_frac(have_frac, frac, (double)TD_LOAD_REPLAY_THRESH);
+}
+
+/* Stage `mark` for the cache_insert that follows and count it. Split from the build so the
+   build stays pure and can be called from a path that may still bail out. */
+static inline void cache_mark_stage_fill(uns8 proc_id, const Cache_Mark* mark, Stat_Enum measured, Stat_Enum marked) {
+  cache_set_mark_next_insert(mark);
+  if (!CACHE_MARK || !mark->valid)
+    return;
+  STAT_EVENT(proc_id, measured);
+  if (mark->marked)
+    STAT_EVENT(proc_id, marked);
 }
 
 /* TRUE if REPL_MARKED_RRIP would decline to allocate this fill in `cache`. The depths /
@@ -2254,7 +2358,7 @@ static Flag mem_complete_l1_access(Mem_Req* req, Mem_Queue_Entry* l1_queue_entry
   data = (L1_Data*)cache_access(&L1(req->proc_id)->cache, req->addr, &line_addr,
                                 update_l1_lru);  // access L2
   if (mj_l1_staged)
-    cache_set_mockingjay_next_access(FALSE, 0, FALSE, FALSE, 0);
+    cache_set_mockingjay_next_access(FALSE, 0, FALSE, FALSE, 0, 0, FALSE);
   req->l1_hit = data ? TRUE : FALSE;
   /* A hit the data array missed and the one-line stream buffer caught (--marked_rrip_stream_buf).
      It is a real hit and is already counted as one above; this only says where it came from.
@@ -2491,7 +2595,7 @@ static Flag mem_complete_mlc_access(Mem_Req* req, Mem_Queue_Entry* mlc_queue_ent
   Flag mj_mlc_staged = update_mlc_lru ? mockingjay_stage_access(&MLC(req->proc_id)->cache, req) : FALSE;
   data = (MLC_Data*)cache_access(&MLC(req->proc_id)->cache, req->addr, &line_addr, update_mlc_lru);  // access MLC
   if (mj_mlc_staged)
-    cache_set_mockingjay_next_access(FALSE, 0, FALSE, FALSE, 0);
+    cache_set_mockingjay_next_access(FALSE, 0, FALSE, FALSE, 0, 0, FALSE);
   if (td_mlc_pred_staged)
     cache_set_hit_promote_frac(FALSE, 0.0);  // clear one-shot (consumed on hit; drop on miss)
   req->mlc_hit = data ? TRUE : FALSE;
@@ -4449,6 +4553,19 @@ Flag new_mem_req(Mem_Req_Type type, uns8 proc_id, Addr addr, uns size, uns delay
       new_req->fdip_pref_off_path = 0;
     new_req->ghist = g_bp_data->global_hist;
   }
+  /* REPL_MOCKINGJAY --mockingjay_path_signature modes 2/3. Populated for EVERY request type,
+     unlike ->ghist above, because the path history folds demand traffic as well as prefetches.
+
+     An op carries the history that was live when ITS prediction was made
+     (op->bp_pred_info->pred_global_hist), which is the correctly attributed value -- reading
+     the live register here would instead give whatever the front end has reached by now, many
+     cycles later. MRT_IFETCH passes op == NULL (icache_stage.c), so it falls back to the live
+     per-core register, which is valid at that point because the front end runs inside the
+     per-core loop that calls set_bp_data (cmp_model.c). That is the same assumption the FDIP
+     assignment above already makes. Caveat: for an op-less NON-ifetch request on a multi-core
+     run, g_bp_data may point at whichever core was iterated last. Mockingjay's writeback path
+     returns before the signature is built, so the case that matters most is already excluded. */
+  new_req->bp_ghist = op ? op->bp_pred_info->pred_global_hist : g_bp_data->global_hist;
   new_req->cyc_hit_by_demand_load = 0;
   if (PREF_FRAMEWORK_ON) {
     new_req->bw_prefetchable = PREF_STREAM_ON && pref_stream_bw_prefetchable(proc_id, addr);
@@ -4865,6 +4982,14 @@ Flag l1_fill_line(Mem_Req* req) {
   /* REPL_MOCKINGJAY bypass: see the equivalent block in mlc_fill_line. Checked before
      get_next_repl_line so no victim is chosen and no writeback is scheduled for a fill that
      is not going to happen. */
+  if (archagent_bypass_fill(&L1(req->proc_id)->cache, req)) {
+    STAT_EVENT(req->proc_id, L1_ARCHAGENT_BYPASS);
+    req->l1_miss_satisfied = TRUE;
+    req->l1_miss_cycle = MAX_CTR;
+    if (TRACK_L1_MISS_DEPS || MARK_L1_MISSES)
+      mark_ops_as_l1_miss_satisfied(req);
+    return SUCCESS;
+  }
   if (mockingjay_bypass_fill(&L1(req->proc_id)->cache, req)) {
     STAT_EVENT(req->proc_id, L1_MOCKINGJAY_BYPASS);
     req->l1_miss_satisfied = TRUE;
@@ -5125,6 +5250,13 @@ Flag l1_fill_line(Mem_Req* req) {
     }
   }
 
+  /* --cache_mark: stage the policy-agnostic mark for the insert below. Whatever policy the LLC
+     is configured with translates it through its own hook; a policy without one drops it. */
+  {
+    Cache_Mark mark = cache_mark_for_fill(req);
+    cache_mark_stage_fill(req->proc_id, &mark, L1_MARK_FILL_MEASURED, L1_MARK_FILL_MARKED);
+  }
+
   // REPL_MOCKINGJAY: hand the fill its PC / traffic class (consumed by the insert below).
   mockingjay_stage_access(&L1(req->proc_id)->cache, req);
 
@@ -5312,6 +5444,14 @@ Flag mlc_fill_line(Mem_Req* req) {
      scheduled; the request still completes and still fills the core-side caches, so the only
      effect is that a later access to this line misses in the MLC. Checked before the fill
      stats and before get_next_repl_line so neither observes a fill that did not happen. */
+  if (archagent_bypass_fill(&MLC(req->proc_id)->cache, req)) {
+    STAT_EVENT(req->proc_id, MLC_ARCHAGENT_BYPASS);
+    ASSERT(req->proc_id, req->mlc_miss_cycle != MAX_CTR);
+    ASSERT(req->proc_id, req->mlc_miss);
+    req->mlc_miss_satisfied = TRUE;
+    req->mlc_miss_cycle = MAX_CTR;
+    return SUCCESS;
+  }
   if (mockingjay_bypass_fill(&MLC(req->proc_id)->cache, req)) {
     STAT_EVENT(req->proc_id, MLC_MOCKINGJAY_BYPASS);
     ASSERT(req->proc_id, req->mlc_miss_cycle != MAX_CTR);
@@ -5554,6 +5694,12 @@ Flag mlc_fill_line(Mem_Req* req) {
         }
       }
     }
+  }
+
+  /* --cache_mark: see the identical staging in l1_fill_line. */
+  {
+    Cache_Mark mark = cache_mark_for_fill(req);
+    cache_mark_stage_fill(req->proc_id, &mark, MLC_MARK_FILL_MEASURED, MLC_MARK_FILL_MARKED);
   }
 
   // REPL_MOCKINGJAY: hand the fill its PC / traffic class (consumed by the insert below).

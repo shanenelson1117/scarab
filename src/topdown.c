@@ -48,6 +48,8 @@
 #include "op.h"
 #include "td_load_replay.h"
 
+#include "memory/memory.param.h"  // CACHE_MARK: the measurement gates below include it
+
 const static uns64 TOPDOWN_SCALE_FACTOR = 10000;
 const static int TOPDOWN_RECOVERY_DEPTH = 2;
 
@@ -122,8 +124,12 @@ void topdown_idq_update(uns proc_id, int count_available, int count_issued, int 
   // per-load memory-boundness tracking: classify this cycle and tag every in-flight load's window
   // (needed by the record pass, the in-sim gap-tracking mode, and the on-demand marked-RRIP
   // policy which reads td_mem_cycles/td_window_cycles at fill time -- no record CSV)
+  /* --cache_mark is listed here too: the policy-agnostic mark is derived from exactly this
+     measurement, and it can be enabled WITHOUT any of the td_* policies (that is the point --
+     it drives Mockingjay, SRRIP, ... instead of REPL_MARKED_RRIP). Without this the windows
+     never accumulate, every fraction lookup returns FALSE, and every mark comes back invalid. */
   if (TD_LOAD_TRACK_ENABLE || TD_LOAD_EVICT_TRACK || TD_LOAD_RRIP_MARK || TD_COMBINED_ON_MLC ||
-      TD_COMBINED_ON_L1) {
+      TD_COMBINED_ON_L1 || CACHE_MARK) {
     Flag backend_stall = (count_issued == 0 && idq_stage_get_stage_data()->op_count > 0);
     Flag mem_bound_cycle = backend_stall && (lsq_get_in_flight_load_num() > 0);
     lsq_tag_inflight_loads(mem_bound_cycle);
@@ -132,7 +138,7 @@ void topdown_idq_update(uns proc_id, int count_available, int count_issued, int 
   // td_fe_rrip_*: credit the demand icache miss the front end is blocked on. A front-end-
   // bound cycle = the machine took no ops and it is NOT a backend stall (miss on crit path).
   // Needed for the L1I (td_fe_rrip_mark), the L2 (td_fe_rrip_on_mlc), or the combined L2 policy.
-  if (TD_FE_RRIP_MARK || TD_FE_RRIP_ON_MLC || TD_COMBINED_ON_MLC || TD_COMBINED_ON_L1) {
+  if (TD_FE_RRIP_MARK || TD_FE_RRIP_ON_MLC || TD_COMBINED_ON_MLC || TD_COMBINED_ON_L1 || CACHE_MARK) {
     Flag backend_stall = (count_issued == 0 && idq_stage_get_stage_data()->op_count > 0);
     Flag fe_bound_cycle = !backend_stall && (count_available == 0);
     icache_tag_inflight_miss(proc_id, fe_bound_cycle);

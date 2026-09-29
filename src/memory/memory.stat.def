@@ -868,6 +868,10 @@ DEF_STAT(  MLC_PREF_FILL,    DIST,  NO_RATIO  )
 /* REPL_MOCKINGJAY: fills the policy declined to allocate (the line was not inserted). */
 DEF_STAT(  MLC_MOCKINGJAY_BYPASS         ,  COUNT,  NO_RATIO  )
 DEF_STAT(  L1_MOCKINGJAY_BYPASS          ,  COUNT,  NO_RATIO  )
+/* REPL_ARCHAGENT: same, for ArchAgent's Policy61. Separate counters because the two policies
+   use different bypass rules and never run at once -- a shared counter would be ambiguous. */
+DEF_STAT(  MLC_ARCHAGENT_BYPASS          ,  COUNT,  NO_RATIO  )
+DEF_STAT(  L1_ARCHAGENT_BYPASS           ,  COUNT,  NO_RATIO  )
 
 /* REPL_MARKED_RRIP (--marked_rrip_bypass): fills declined because they would have inserted at
    basic into a set where every resident line was strictly more recently re-referenced. */
@@ -883,6 +887,28 @@ DEF_STAT(  MLC_MARKED_SB_EVICT_DIRTY     ,  COUNT,  NO_RATIO  )
 DEF_STAT(  L1_MARKED_SB_HIT              ,  COUNT,  NO_RATIO  )
 DEF_STAT(  L1_MARKED_SB_EVICT            ,  COUNT,  NO_RATIO  )
 DEF_STAT(  L1_MARKED_SB_EVICT_DIRTY      ,  COUNT,  NO_RATIO  )
+
+/* --cache_mark: policy-agnostic line marking. One pair per level that stages marks.
+   *_MARK_FILL_MEASURED  fills whose causing access had a usable signal at all (a demanding
+                         load with an accumulated window, or a fetch miss with one) -- i.e. the
+                         fills the mechanism could see. Prefetch and signal-less fills are in
+                         neither counter.
+   *_MARK_FILL_MARKED    the subset that cleared its class gate (--td_load_replay_thresh for
+                         data, --td_fe_rrip_thresh for instructions) and was therefore handed
+                         to the policy's update_mark hook.
+   MARKED / MEASURED is the marking rate, the first thing to check when a --cache_mark run
+   looks identical to its baseline: a rate of 0 means the gate is too high, a rate of 1 means
+   it is doing nothing (the data gate DEFAULTS to 0.0 -- see --cache_mark). These count what
+   was STAGED, at every level, whether or not that level's policy has a hook to consume it, so
+   a flat IPC with a healthy rate here points at the policy, not the signal. */
+DEF_STAT(  DCACHE_MARK_FILL_MEASURED     ,  COUNT,  NO_RATIO  )
+DEF_STAT(  DCACHE_MARK_FILL_MARKED       ,  COUNT,  NO_RATIO  )
+DEF_STAT(  ICACHE_MARK_FILL_MEASURED     ,  COUNT,  NO_RATIO  )
+DEF_STAT(  ICACHE_MARK_FILL_MARKED       ,  COUNT,  NO_RATIO  )
+DEF_STAT(  MLC_MARK_FILL_MEASURED        ,  COUNT,  NO_RATIO  )
+DEF_STAT(  MLC_MARK_FILL_MARKED          ,  COUNT,  NO_RATIO  )
+DEF_STAT(  L1_MARK_FILL_MEASURED         ,  COUNT,  NO_RATIO  )
+DEF_STAT(  L1_MARK_FILL_MARKED           ,  COUNT,  NO_RATIO  )
 
 /* --membound_stats. Classification is done AT FILL (a load's membound fraction only exists
    once its dispatch->done window has run), and data vs instruction lines use separate signals

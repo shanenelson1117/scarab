@@ -485,7 +485,7 @@ Flag mem_req_on_icache_miss() {
       // FE policy targets the L1I or the L2). Reset on- and off-path: off-path misses now carry
       // their own window so the L1I marked-RRIP insert can derive an RRPV for them too. (The
       // L2/MLC variant keeps its own on-path gate in icache_fe_frac_for_line, so it is unaffected.)
-      if (TD_FE_RRIP_MARK || TD_FE_RRIP_ON_MLC || TD_COMBINED_ON_MLC || TD_COMBINED_ON_L1) {
+      if (TD_FE_RRIP_MARK || TD_FE_RRIP_ON_MLC || TD_COMBINED_ON_MLC || TD_COMBINED_ON_L1 || CACHE_MARK) {
         ic->fe_miss_window_cycles = 0;
         ic->fe_miss_bound_cycles = 0;
       }
@@ -1120,6 +1120,24 @@ Flag icache_fill_line(Mem_Req* req)  // cmp FIXME maybe needed to be optimized
       }
       cache_set_marked_next_insert(td_fe_have_rrpv, td_fe_rrpv);
     }
+
+    /* --cache_mark: the same FE-bound signal in policy-agnostic form, so an L1I running any
+       hooked policy protects the line without this code knowing that policy's currency.
+       Independent of the block above: --td_fe_rrip_mark makes the L1I REPL_MARKED_RRIP, which
+       takes no hook and uses the precomputed RRPV instead, so the two never both apply. */
+    Cache_Mark td_fe_mark = cache_mark_from_frac(FALSE, 0.0, 0.0);
+    if (CACHE_MARK) {
+      Flag   have_fe_frac = (ic->fe_miss_window_cycles > 0) ? TRUE : FALSE;
+      double fe_frac = have_fe_frac ? (double)ic->fe_miss_bound_cycles / (double)ic->fe_miss_window_cycles : 0.0;
+      td_fe_mark = cache_mark_from_frac(have_fe_frac, fe_frac, (double)TD_FE_RRIP_THRESH);
+      cache_set_mark_next_insert(&td_fe_mark);
+      if (td_fe_mark.valid) {
+        STAT_EVENT(ic->proc_id, ICACHE_MARK_FILL_MEASURED);
+        if (td_fe_mark.marked)
+          STAT_EVENT(ic->proc_id, ICACHE_MARK_FILL_MARKED);
+      }
+    }
+
     ic->line = (Inst_Info**)cache_insert(&ic->icache, ic->proc_id, ic->fetch_addr, &ic->line_addr, &repl_line_addr);
     DEBUG(ic->proc_id, "Got line switch into ic fetch %llx\n", ic->line_addr);
     STAT_EVENT(ic->proc_id, ICACHE_FILL);
@@ -1130,6 +1148,8 @@ Flag icache_fill_line(Mem_Req* req)  // cmp FIXME maybe needed to be optimized
       // eviction victim, so FDIP's eviction tracking (repl_line_addr2) stays correct.
       if (TD_FE_RRIP_MARK)
         cache_set_marked_next_insert(td_fe_have_rrpv, td_fe_rrpv);
+      if (CACHE_MARK)
+        cache_set_mark_next_insert(&td_fe_mark);
       line_info = (Icache_Data*)cache_insert(&ic->icache_line_info, ic->proc_id, ic->fetch_addr, &dummy_addr2,
                                              &repl_line_addr2);
       if (line_info) {

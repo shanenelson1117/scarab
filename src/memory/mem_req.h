@@ -111,6 +111,14 @@ struct Mem_Req_struct {
   uns types;
   Counter fdip_emitted_cycle; /* cycle when the request is emitted. */
   uns64 ghist;
+  /* REPL_MOCKINGJAY --mockingjay_path_signature modes 2/3: the core's global branch history,
+     snapshotted when this request was created. A SEPARATE field from `ghist` above on purpose:
+     that one is populated only for MRT_FDIPPRFON/OFF and is read by FDIP's UC hashing
+     (icache_stage.c), so widening its population would change FDIP behavior. Mem_Req.global_hist
+     is equally unusable here -- it is set only for MRT_DPRF, and most prefetchers hardcode it
+     to 0. Snapshotted at creation rather than read at fill time because a fill lands many
+     cycles after the access that caused it, by which point the live history has moved on. */
+  uns32 bp_ghist;
   Counter demand_icache_emitted_cycle; /* cycle when the request is emitted. */
   Counter emitted_cycle;               /* cycle when request of any type was first initialized */
   struct Mem_Queue_struct* queue;      /* Pointer to the queue this entry is in */

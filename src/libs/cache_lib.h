@@ -70,6 +70,7 @@ typedef enum Repl_Policy_enum {
   REPL_MARKED_RRIP, /* SRRIP variant: marked (memory-bound) lines insert at RRPV 0 */
   REPL_PLRU_TREE,   /* tree-based pseudo-LRU (binary tree of direction bits per set) */
   REPL_MOCKINGJAY,  /* Mockingjay (HPCA'22): PC-signature reuse-distance prediction + ETR */
+  REPL_ARCHAGENT,   /* ArchAgent "Policy61": Mockingjay's sampler/RDP driving 3-bit SRRIP */
 
   NUM_REPL
 } Repl_Policy;
@@ -97,11 +98,15 @@ typedef struct Cache_Entry_struct {
   int  marked_promote_rrpv; /* REPL_MARKED_RRIP: RRPV this line was inserted at; the hit
                                handler promotes to min(0, this) so aging can't erase the
                                membound protection */
-  Flag marked_protected;    /* REPL_MARKED_RRIP: was this line MARKED at insert (its fraction
-                               cleared the class threshold), as opposed to inserted at basic?
-                               Sticky for the line's lifetime -- marked_promote_rrpv is
-                               rewritten on every hit, so it cannot answer this after the
-                               first reuse. Read by the set-duel "protected hits" metric. */
+  Flag marked_protected;    /* Was this line MARKED at insert (its fraction cleared the class
+                               threshold), as opposed to inserted at basic? Sticky for the
+                               line's lifetime -- marked_promote_rrpv is rewritten on every
+                               hit, so it cannot answer this after the first reuse. Written by
+                               REPL_MARKED_RRIP (read by the set-duel "protected hits" metric)
+                               and, under --cache_mark, by mockingjay_update_mark, whose aging
+                               loop reads it back under --mockingjay_mark_age_period. Cleared for
+                               every fresh line by the insert paths, so a recycled way cannot
+                               inherit the previous occupant's mark. */
   /* --membound_stats: what the ACCESS THAT BROUGHT THIS LINE IN looked like, recorded at fill
      and sticky for the line's lifetime. Independent of the replacement policy, so these hold
      under SRRIP / tPLRU / Mockingjay exactly as under REPL_MARKED_RRIP -- unlike
@@ -116,6 +121,46 @@ typedef struct Cache_Entry_struct {
   Flag fe_bound_fill;  /* instruction line, fetch miss's FE-bound fraction > TD_FE_RRIP_THRESH */
   Flag outcome;       /* for replacement policy */
 } Cache_Entry;
+
+/* POLICY-AGNOSTIC LINE MARK (--cache_mark).
+ *
+ * The generalization of REPL_MARKED_RRIP's "this line matters" signal. A Cache_Mark describes
+ * ONE access in units no replacement policy owns; each policy then translates it into its own
+ * priority currency through its update_mark hook (RRPV for the RRIP family, ETR for
+ * Mockingjay, ...). That keeps the producers -- which know about topdown counters, loads and
+ * fetch misses -- free of any knowledge of how the cache they are filling ranks its lines, and
+ * lets the same signal drive a policy that has no notion of an RRPV at all.
+ *
+ * Contract:
+ *   valid    a signal existed for this access at all. FALSE for a prefetch fill, an off-path
+ *            fill with no live op, or a request with no demanding load -- the cases where
+ *            marked-RRIP stages no RRPV and the line lands at `basic`. A hook must leave an
+ *            invalid mark's line exactly as the policy placed it.
+ *   marked   the signal cleared its class threshold, i.e. this is a line the study wants
+ *            protected. `valid && !marked` is a measured-but-ordinary line, which is NOT the
+ *            same as `!valid`: a hook may want to treat the two differently (marked-RRIP does
+ *            not, but a policy with a "definitely unimportant" tier could).
+ *   frac     the raw measured fraction, as the producer measured it, in [0, 1].
+ *   thresh   the threshold `marked` was decided against, kept so a hook can re-derive the
+ *            ramp for itself instead of trusting `strength`.
+ *   strength normalized headroom above the threshold: (frac - thresh) / (1 - thresh), clamped
+ *            to [0, 1]. 0.0 = exactly at the threshold (marked, but barely), 1.0 = the
+ *            strongest signal the class can produce. This is the knob a hook scales its
+ *            protection by when it wants a ramp rather than a binary boost; it is 0.0 whenever
+ *            `marked` is FALSE. Normalizing here rather than passing frac+thresh to every hook
+ *            means a policy does not have to know that the data-side and instruction-side
+ *            thresholds differ (0.0 vs 0.5 by default).
+ *
+ * Staged one-shot with cache_set_mark_next_insert right before the cache_insert it describes,
+ * exactly like cache_set_marked_next_insert and cache_set_next_fill_bound, and consumed (and
+ * cleared) by that insert whether or not the cache's policy has a hook. */
+typedef struct Cache_Mark_struct {
+  Flag   valid;
+  Flag   marked;
+  double frac;
+  double thresh;
+  double strength;
+} Cache_Mark;
 
 // DO NOT CHANGE THIS ORDER
 typedef enum Cache_Insert_Repl_enum {
@@ -219,6 +264,14 @@ struct repl_policy_func {
   void (*update_hit)(Cache*, uns, uns, void*);
   void (*update_insert)(Cache*, uns8, uns, uns, void*);
   Cache_Entry* (*update_evict)(Cache*, uns8, uns, uns*, void*, Flag);
+
+  /* --cache_mark: translate a staged Cache_Mark into this policy's own priority currency.
+     Called by cache_insert_strategy immediately AFTER update_insert, so the policy has already
+     placed the line by its own prediction and the hook only has to adjust it -- a hook is a
+     modifier, never the primary placement. Only invoked for a mark with valid == TRUE. NULL
+     means "this policy ignores marks", which is the default for every policy that has not
+     opted in; the fills still stage marks, they are simply dropped. */
+  void (*update_mark)(Cache*, uns8, uns, uns, const Cache_Mark*);
 };
 
 /* Driven Table */
@@ -268,6 +321,19 @@ Flag cache_marked_last_hit_protected(void);
  * by the next marked_rrip hit. */
 void cache_set_hit_promote_frac(Flag have, double frac);
 
+/* --cache_mark: stage the mark the NEXT cache_insert (into ANY cache) should be translated
+ * through, one-shot. Passing NULL, or a mark with valid == FALSE, clears the staging, which is
+ * what an unmarked fill wants. The mark is consumed and cleared by the next insert whether or
+ * not that cache's policy has an update_mark hook, so an unrelated later fill can never pick
+ * up a stale mark -- the same discipline cache_set_next_fill_bound follows. */
+void cache_set_mark_next_insert(const Cache_Mark* mark);
+/* Build a mark from a measured fraction and the threshold its class is judged against.
+ * have_frac == FALSE yields an invalid (ignored) mark, so a producer can call this
+ * unconditionally on the result of its fraction lookup. `thresh` >= 1.0 is degenerate (a
+ * fraction cannot exceed 1) and yields an unmarked mark. Single definition so every producer
+ * and every hook agree on what `strength` means. */
+Cache_Mark cache_mark_from_frac(Flag have_frac, double frac, double thresh);
+
 /* --membound_stats: stage how the NEXT fill into any cache should be classified, one-shot, in
  * the same style as cache_set_marked_next_insert. The caller computes it (only memory.c can --
  * the membound / FE-bound fractions live on the op and the icache stage), and the next
@@ -311,19 +377,49 @@ Flag cache_stream_buf_last_hit(Cache* cache);
  * PC / traffic class is staged one-shot right before the cache_access or cache_insert that
  * the policy should see it on (same convention as cache_set_marked_next_insert). It is
  * consumed and cleared by the next mockingjay hit/insert/bypass update. have_ctx==FALSE
- * makes the next update behave as a PC-less demand access (signature of PC 0). */
-void cache_set_mockingjay_next_access(Flag have_ctx, Addr pc, Flag is_prefetch, Flag is_writeback, uns8 proc_id);
+ * makes the next update behave as a PC-less demand access (signature of PC 0).
+ *
+ * have_ctx IS LOAD-BEARING under --mockingjay_path_signature, not just descriptive: the path
+ * history is persistent and order-sensitive, so an update that arrives with no staged context
+ * (the warmup path, l1_pref_cache_access, a cache configured to REPL_MOCKINGJAY that nothing
+ * stages for) must leave the register ALONE rather than fold in a PC of 0. A stale one-shot
+ * degrades a single access; a spurious fold corrupts every signature that follows it.
+ *
+ * ghist is the core's global branch history for path-signature modes 2/3; off_path says the
+ * access is wrong-path, honoured only under --mockingjay_path_onpath_only. Both are ignored
+ * entirely when --mockingjay_path_signature is 0. */
+void cache_set_mockingjay_next_access(Flag have_ctx, Addr pc, Flag is_prefetch, Flag is_writeback, uns8 proc_id,
+                                      uns32 ghist, Flag off_path);
 /* REPL_MOCKINGJAY bypass predicate: TRUE when Mockingjay would decline to allocate this fill
  * (its predicted reuse distance is longer than every resident line's remaining time). Scarab's
  * update_evict must name a way, so the caller checks this BEFORE cache_insert and skips the
  * fill entirely. Pure -- it reads state but does not change it. Returns FALSE for any cache
  * not running REPL_MOCKINGJAY, and whenever the set has an invalid way (an available way is
- * always taken, matching the reference implementation). Writebacks must never be bypassed. */
-Flag cache_mockingjay_should_bypass(Cache* cache, Addr addr, Addr pc, Flag is_prefetch, uns8 proc_id);
+ * always taken, matching the reference implementation). Writebacks must never be bypassed.
+ *
+ * pc/ghist/off_path are passed explicitly rather than read from the staged one-shot because
+ * callers run this BEFORE staging. Under --mockingjay_path_signature this function PREVIEWS
+ * the history fold without committing it, so it queries the same RDP entry the following
+ * update will write -- mirroring ChampSim, where llc_find_victim runs before
+ * llc_update_replacement_state and exactly one of the two advances the register. */
+Flag cache_mockingjay_should_bypass(Cache* cache, Addr addr, Addr pc, Flag is_prefetch, uns8 proc_id, uns32 ghist,
+                                    Flag off_path);
 /* REPL_MOCKINGJAY: run the replacement-state update for a fill the caller bypassed. The
  * reference policy still trains the sampler and ages the set on a bypassed fill; only the
  * per-line ETR write is skipped. Call with the same staged context as the skipped insert. */
 void cache_mockingjay_note_bypass(Cache* cache, Addr addr);
+
+/* REPL_ARCHAGENT bypass predicate. Policy61's rule is strictly simpler than Mockingjay's: it
+ * drops the "further out than the most distant resident line" clause and keeps only "predicted
+ * reuse beyond what the cache can hold", so it needs no victim scan at all. It is also checked
+ * BEFORE the victim search rather than after, which matters because Policy61's SRRIP search
+ * mutates RRPVs as it ages -- a bypassed fill must not age the set.
+ *
+ * Returns FALSE for any cache not running REPL_ARCHAGENT and whenever the set has an invalid
+ * way. Unlike Mockingjay there is NO state update for a bypassed fill: Policy61 returns early
+ * from update_replacement_state, so a bypassed access trains nothing, advances no timestamp and
+ * does not move the PC history. That is why there is no note_bypass counterpart here. */
+Flag cache_archagent_should_bypass(Cache* cache, Addr addr, Addr pc, Flag is_prefetch, uns8 proc_id);
 void* cache_insert_replpos(Cache* cache, uns8 proc_id, Addr addr, Addr* line_addr, Addr* repl_line_addr,
                            Cache_Insert_Repl insert_repl_policy, Flag isPrefetch);
 void* cache_insert_lru(Cache*, uns8, Addr, Addr*, Addr*);

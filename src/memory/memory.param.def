@@ -155,6 +155,199 @@ DEF_PARAM(mockingjay_pc_signature_bits, MOCKINGJAY_PC_SIGNATURE_BITS, int, int, 
    <= 256/assoc; the defaults are the paper's. */
 DEF_PARAM(mockingjay_history, MOCKINGJAY_HISTORY, uns, uns, 8, )
 DEF_PARAM(mockingjay_granularity, MOCKINGJAY_GRANULARITY, uns, uns, 8, )
+
+/* PATH-HASHED SIGNATURE (ArchAgent "Policy61", arXiv/archagent.pdf S6.2).
+
+   Stock Mockingjay keys the RDP on a hash of the accessing PC alone, so every access from a
+   given PC shares one reuse-distance prediction. ArchAgent's Policy61 keeps the entire
+   Mockingjay algorithm and changes only that: it folds a running per-core history into the
+   signature, so the same PC reached along different paths predicts differently. Their code is
+
+       core_pc_history[cpu] = ((history << 1) | (history >> 63)) ^ instr_pc;
+
+   i.e. rotate the register left one bit and XOR in the current PC.
+
+   MODE (--mockingjay_path_signature):
+     0  OFF. Bit-identical to stock Mockingjay -- nothing is folded and no register is touched.
+     1  ACCESS-PC PATH. The literal Policy61: fold the PC of each access that reaches this
+        cache. Note this is a path through the ACCESS stream, not through control flow --
+        Policy61 ran as a ChampSim CRC2 policy, whose only hooks (llc_find_victim /
+        llc_update_replacement_state) see no branch outcome, call or return, so the access PC
+        is the only "path" it could observe.
+     2  BRANCH HISTORY. Fold the core's global branch history instead (Mem_Req.bp_ghist,
+        snapshotted at request creation). This is what Policy61's PROSE describes -- "the path
+        taken to reach the current instruction", with a memcpy calling-context example -- and
+        what the work it cites does (Chirp, MICRO'20; Glider, MICRO'19). ChampSim's policy
+        interface could not reach it; Scarab's can.
+     3  BOTH, XORed into the same register. The mode is a bit field: 1 = PC, 2 = ghist.
+
+   SIGNATURE WIDTH MATTERS MORE IN THESE MODES. The RDP is a direct-indexed table of
+   2^pc_signature_bits entries -- 11 bits (2048) on a 2MB/16-way L2. A PC signature has at most
+   as many distinct values as there are accessing PCs; a path signature has vastly more, so it
+   aliases far harder. Sweep --mockingjay_pc_signature_bits alongside any mode != 0, or a real
+   win will be buried under RDP thrashing.
+
+   Writebacks never advance the register: the fold sits after mj_update_state's writeback
+   early-return, matching where Policy61's snippet sits relative to its own WRITEBACK return.
+   The register is per core AND per cache, so an L2 and an LLC both running the policy keep
+   separate histories over their own (very different) access streams. */
+DEF_PARAM(mockingjay_path_signature, MOCKINGJAY_PATH_SIGNATURE, uns, uns, 0, )
+/* Bits rotated per fold. 1 is Policy61's value, which keeps every prior PC alive in the
+   register forever (a rotate loses nothing); larger values spread successive PCs further apart
+   before they collide. 0 disables the rotation entirely, XOR-accumulating with no positional
+   information -- an ablation that isolates how much of the mode's effect is ORDER rather than
+   SET. Taken mod 64. */
+DEF_PARAM(mockingjay_path_rotate, MOCKINGJAY_PATH_ROTATE, uns, uns, 1, )
+/* Exclude wrong-path accesses from the fold. Default FALSE, which matches how the RDP and the
+   sampler already train (Scarab gates neither on off_path), so a mode != 0 run differs from
+   baseline in exactly one way. TRUE is closer to the ChampSim traces Policy61 was measured on,
+   which replay no wrong-path memory accesses -- but it makes the history stream diverge from
+   the training stream, so the flag then changes two things at once. */
+DEF_PARAM(mockingjay_path_onpath_only, MOCKINGJAY_PATH_ONPATH_ONLY, Flag, Flag, FALSE, )
+/* Policy61 folds the history ASYMMETRICALLY: its victim path reads
+       signature_base_pc = instr_pc ^ core_pc_history[cpu]
+   with no rotation and no store, while its update path stores
+       core_pc_history[cpu] = ((h << 1) | (h >> 63)) ^ instr_pc.
+   So the RDP entry its bypass test consults is never the entry the resulting fill trains -- the
+   two differ by one rotation of the history, which the CRC fold turns into an unrelated index.
+   FALSE (the default) reproduces that verbatim, because it is what the published numbers were
+   produced with. TRUE makes the victim path rotate too, so lookup and update agree; the delta
+   measures what the asymmetry costs. Only meaningful when --mockingjay_path_signature != 0, and
+   a no-op at --mockingjay_path_rotate 0, where the two paths already coincide. */
+DEF_PARAM(mockingjay_path_sync_lookup, MOCKINGJAY_PATH_SYNC_LOOKUP, Flag, Flag, FALSE, )
+/* Modes 2/3 only: how many of the most recent conditional-branch outcomes to fold. Scarab's
+   Bp_Data.global_hist is 32 bits with the NEWEST outcome at bit 31 (bp.c: global_hist =
+   (global_hist >> 1) | (pred << 31)), so N bits means ghist >> (32 - N) -- the N most recent
+   branches, oldest bits discarded. 32 (the default) folds the whole register and is a no-op.
+
+   This is the axis a branch-history predictor actually turns; the prior work Policy61 cites
+   (Chirp MICRO'20, Glider MICRO'19) sweeps history length rather than fixing it. Longer history
+   distinguishes more contexts but produces more distinct signatures, each trained less often --
+   the same trade the RDP width knob makes, reached from the other side.
+
+   NOTE the register moves SLOWLY relative to L2 accesses: many accesses can share one ghist
+   value between branches. Combined with --mockingjay_path_rotate 0 that is degenerate, because
+   XOR is self-inverse and two consecutive folds of the same value cancel. Shortening the history
+   makes repeats MORE likely, so treat small values here and rotate 0 as interacting. */
+DEF_PARAM(mockingjay_path_ghist_bits, MOCKINGJAY_PATH_GHIST_BITS, uns, uns, 32, )
+
+/* ArchAgent "Policy61" replacement -- REPL_ARCHAGENT. Select it with --mlc_cache_repl_policy 23
+   (L2) or --l1_cache_repl_policy 23 (LLC). Sizing reuses the --mockingjay_log2_sampled_sets /
+   --mockingjay_pc_signature_bits / --mockingjay_history knobs, because the sampler and RDP are
+   Mockingjay's unchanged, and --mockingjay_bypass gates its allocation filter. The remaining
+   --mockingjay_* knobs (granularity, the path_* family, the mark_* family) belong to policy 22
+   and are ignored here.
+
+   Policy61 makes FOUR changes to Mockingjay at once -- 3-bit SRRIP RRPV in place of ETR and its
+   aging clock, a per-core rotating PC history folded into the signature, a simplified bypass
+   rule moved ahead of victim selection, and no replacement-state update at all on a bypassed
+   access -- so on its own the policy cannot say which of them earns the result. This knob
+   removes the second one: FALSE reverts the signature to Mockingjay's plain PC hash and stops
+   the history register advancing, leaving the other three changes intact.
+
+   That makes archagent / archagent(pc_history 0) / mj_stock a decomposition: the first gap is
+   what the path history buys on top of the restructuring, the second is what the restructuring
+   buys on its own. Worth running because the paper describes Policy61 as "one critical change"
+   to the signature while the authors' conversion guide shows the structural changes are the
+   larger edit. Default TRUE = Policy61 as published. */
+DEF_PARAM(archagent_pc_history, ARCHAGENT_PC_HISTORY, Flag, Flag, TRUE, )
+
+/* ---- POLICY-AGNOSTIC LINE MARKING (--cache_mark) --------------------------------------
+   The generalization of REPL_MARKED_RRIP: instead of the fill path computing an RRPV (which
+   only an RRIP-family policy understands), it stages a Cache_Mark -- "this line matters, this
+   much" -- and whichever replacement policy the cache is configured with translates that into
+   its own currency through its update_mark hook. See Cache_Mark in libs/cache_lib.h and the
+   hook column of repl_policy_func_table.
+
+   Marks are staged at every fill site (L1D, L1I, MLC, LLC) from exactly the signals and gates
+   marked-RRIP and --membound_stats use: a data line from the demanding load's membound
+   fraction against --td_load_replay_thresh, an instruction line from the L1I fetch miss's
+   front-end-bound fraction against --td_fe_rrip_thresh. A cache whose policy has no hook
+   simply drops them, so this can be left on across a sweep.
+
+   INDEPENDENT of --td_load_rrip_mark / --td_fe_rrip_mark / --td_combined_on_*: those switch a
+   cache to REPL_MARKED_RRIP, which takes no hook. To use the marks, leave them off and set the
+   level's own policy knob (--mlc_cache_repl_policy / --l1_cache_repl_policy / --dcache_repl)
+   to the policy you want marked -- e.g. Mockingjay.
+
+   NOTE the data-side gate --td_load_replay_thresh DEFAULTS TO 0.0, so with --cache_mark alone
+   every load with a measured window is marked, which is unlikely to be the intent. Set it. */
+DEF_PARAM(cache_mark, CACHE_MARK, Flag, Flag, FALSE, )
+/* Binary (FALSE, the default) vs graded (TRUE) marks, the analogue of --td_*_rrip_extrapolate.
+   Binary: a marked line is moved all the way to its policy's floor. Graded: it is moved from
+   wherever the policy placed it toward the floor in proportion to the mark's `strength`
+   ((frac - thresh) / (1 - thresh)), so a line that barely cleared its gate keeps almost all of
+   the policy's own prediction. Shared by every hook so the A/B is one flag, not one per
+   policy. */
+DEF_PARAM(cache_mark_scale, CACHE_MARK_SCALE, Flag, Flag, FALSE, )
+/* REPL_MOCKINGJAY hook: the MINIMUM ETR a marked line is given at insert, in
+   GRANULARITY-access units -- a floor on TIME REMAINING, applied as
+
+       etr = (etr > CLAMP) ? etr : CLAMP
+
+   so it only ever ADDS time and never shortens a line the RDP already predicted further out.
+   NEGATIVE (the default) DISABLES IT, so --cache_mark alone leaves stock Mockingjay untouched
+   and this is an opt-in lever. Capped at INF_ETR, where aging stops.
+
+   IT RAISES, IT DOES NOT PULL TOWARD 0, and it is NOT the analogue of --td_load_rrip_min_rrpv
+   -- do not reach for it by analogy. An RRPV is an ordinal bucket with no time in it, so
+   lowest really is strongest there. An ETR is a COUNTDOWN: the line ages toward 0 ("due now")
+   and then past it into negative ("overdue"). Granting ETR = C grants C aging steps BEFORE the
+   line is even due. Forcing it to 0 instead would make the line the safest in the set for one
+   instant and overdue immediately after -- the shortest-lived protection available.
+
+   The comparison is on the SIGNED ETR, so an already-overdue marked line is lifted back to the
+   floor and gets a fresh countdown.
+
+   PAIR IT WITH --mockingjay_mark_no_evict_positive. On its own, raising ETR can raise |ETR|
+   (a line the RDP put at 1, floored to 5), and under stock victim selection |5| is a WORSE
+   victim score than |1| -- so the floor alone can make a marked line more evictable, not less.
+   The immunity flag makes the whole positive range safe and turns the raise into pure
+   extension. Run the floor alone only to measure that interaction deliberately. */
+DEF_PARAM(mockingjay_mark_etr, MOCKINGJAY_MARK_ETR, int, int, -1, )
+/* A marked line cannot be chosen as a victim while its ETR is still POSITIVE, i.e. while its
+   predicted reuse has not yet arrived. The moment it ages to 0 and goes negative -- overdue,
+   the prediction falsified against it -- the immunity lapses and it competes for eviction like
+   any other line. So this is a COUNTDOWN, not a pin: a marked line's protection cannot outlast
+   the ETR it was given, and --mockingjay_mark_etr C bounds it at about C aging steps.
+
+   This is the flag that gives --mockingjay_mark_etr its meaning; alone, the floor can make a
+   marked line MORE evictable (see there). Default FALSE.
+
+   If every way in a set is immune the immunity is dropped for that eviction rather than
+   failing to name a victim -- a fill must always be able to allocate. A fully-marked set
+   therefore degrades to stock Mockingjay, which is how a too-loose --td_load_replay_thresh
+   shows up: the flag quietly stops doing anything rather than deadlocking. Immune ways are
+   also excluded from the |ETR| the bypass predicate compares against, since the comparison it
+   wants is against the line the fill would actually displace. */
+DEF_PARAM(mockingjay_mark_no_evict_positive, MOCKINGJAY_MARK_NO_EVICT_POSITIVE, Flag, Flag, FALSE, )
+/* How much longer a marked line lives: it ages once every N ETR aging steps instead of every
+   one, so its ETR decays N times more slowly and it stays near the protected end of the set
+   about N times as long. 1 (the default) = marked lines age normally, so --cache_mark alone
+   reproduces stock Mockingjay exactly. 2 is "a little longer"; the useful range is small.
+
+   A marked line STILL AGES -- its |ETR| grows without bound like every other line's, just
+   slower -- so it is evicted after roughly N times as many aging steps rather than outliving
+   the set. That is the difference from pinning it: no line is ever exempt.
+
+   This knob, not --mockingjay_mark_etr, is where a Mockingjay mark mostly acts. The insert
+   clamp has little to work with on its own: Mockingjay already inserts an untrained signature
+   -- and any signature predicting reuse closer than --mockingjay_granularity -- at ETR 0, so
+   there is usually nothing to clamp. In this policy protection lives in the DECAY RATE, not
+   the insertion value; the RRPV analogue of that is marked-RRIP re-promoting on every hit
+   rather than only at insert. Modeled on --marked_rrip_age_period, which slows RRPV aging the
+   same way.
+
+   The two Mockingjay levers ablate independently, and BOTH DEFAULT TO OFF: with
+   --mockingjay_mark_etr negative and this at 1, --cache_mark 1 against a Mockingjay cache
+   stages marks on every fill and reproduces stock Mockingjay exactly. That is the control arm
+   -- it costs nothing and proves any effect you measure is a lever rather than the plumbing. */
+DEF_PARAM(mockingjay_mark_age_period, MOCKINGJAY_MARK_AGE_PERIOD, uns, uns, 1, )
+/* RRIP-family hook (SRRIP / BRRIP / DRRIP / SHIP): the RRPV a marked line is clamped down to.
+   0 = near-immediate re-reference. May be negative (reference_val is signed), but a negative
+   RRPV only does anything under --marked_rrip_argmax_evict, because srrip_update_evict selects
+   on equality with RRIP_DISTANT_VAL and merely ages everything below it. */
+DEF_PARAM(rrip_mark_rrpv, RRIP_MARK_RRPV, int, int, 0, )
 /* FDIP Confidence Cache */
 // The cache line size is fixed to ICACHE_LINE_SIZE (64 by default). The number of entries in a FDIP UC is FDIP_UC_SIZE / ICACHE_LINE_SIZE. To have 16K (16384) entries, FDIP_UC_SIZE should be 1048576.
 DEF_PARAM(  fdip_uc_size                   , FDIP_UC_SIZE                    , uns    , uns     , 0                      ,       )

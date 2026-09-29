@@ -116,6 +116,63 @@ static inline void consume_fill_bound(Cache_Entry* line) {
   g_next_fill_fe_bound = FALSE;
 }
 
+/**************************************************************************************/
+/* --cache_mark: policy-agnostic line marking (see Cache_Mark in cache_lib.h).
+ *
+ * One-shot, staged by the fill path right before its cache_insert and consumed by that insert.
+ * Global rather than per-cache for the same reason the marked-RRIP one-shots are: the strategy
+ * dispatcher passes no per-access context, so the only way to hand an insert something is to
+ * park it here across the call. Every insert path clears it, so a fill that is bypassed or
+ * abandoned cannot leak its mark onto a later, unrelated one. */
+static Cache_Mark g_next_mark; /* zero-initialized: valid == FALSE == "no mark staged" */
+
+void cache_set_mark_next_insert(const Cache_Mark* mark) {
+  if (mark && mark->valid) {
+    g_next_mark = *mark;
+  } else {
+    g_next_mark.valid = FALSE;
+    g_next_mark.marked = FALSE;
+    g_next_mark.frac = 0.0;
+    g_next_mark.thresh = 0.0;
+    g_next_mark.strength = 0.0;
+  }
+}
+
+Cache_Mark cache_mark_from_frac(Flag have_frac, double frac, double thresh) {
+  Cache_Mark m;
+
+  m.valid = have_frac;
+  m.marked = FALSE;
+  m.frac = have_frac ? frac : 0.0;
+  m.thresh = thresh;
+  m.strength = 0.0;
+  if (!have_frac)
+    return m;
+
+  /* Strictly greater, matching marked_rrip_rrpv_from_frac's fixed-min test and
+     membound_classify_fill, so "marked" means one thing everywhere. With the data-side
+     default (--td_load_replay_thresh 0.0) that marks every load with a measured window. */
+  if (frac > thresh) {
+    double denom = 1.0 - thresh;
+    m.marked = TRUE;
+    if (denom < 1e-9)
+      denom = 1e-9;  /* thresh at (or above) 1.0: degenerate, treat the mark as maximal */
+    m.strength = (frac - thresh) / denom;
+    if (m.strength < 0.0)
+      m.strength = 0.0;
+    if (m.strength > 1.0)
+      m.strength = 1.0;
+  }
+  return m;
+}
+
+/* Read the staged mark and clear the one-shot. Every insert path calls this exactly once. */
+static inline Cache_Mark consume_mark(void) {
+  Cache_Mark m = g_next_mark;
+  cache_set_mark_next_insert(NULL);
+  return m;
+}
+
 Flag cache_last_hit_membound(Cache* cache) {
   return cache->last_hit_membound;
 }
@@ -493,7 +550,12 @@ void* cache_insert_replpos(Cache* cache, uns8 proc_id, Addr addr, Addr* line_add
 
   new_line->pw_start_addr = addr;  // only means anything for uop cache
   new_line->marked_promote_rrpv = RRIP_DISTANT_VAL - 1;  // neutral; set at marked-RRIP insert
+  new_line->marked_protected = FALSE;                    // see general_action_repl
   consume_fill_bound(new_line);    // --membound_stats: non-strategy path (incl. REPL_TRUE_LRU)
+  /* --cache_mark: no policy on this path is in repl_policy_func_table, so there is no hook to
+     run -- but the one-shot still has to be consumed here, or a mark staged for a fill into
+     e.g. a REPL_TRUE_LRU LLC would survive to be applied to the next strategy-policy insert. */
+  (void)consume_mark();
 
   switch (insert_repl_policy) {
     case INSERT_REPL_DEFAULT:
@@ -1462,6 +1524,17 @@ void* cache_insert_strategy(Cache* cache, uns8 proc_id, Addr addr, Addr* line_ad
   repl_policy_func_table[policy].action_repl(cache, new_line, proc_id, tag, line_addr, repl_line_addr);
   repl_policy_func_table[policy].update_insert(cache, proc_id, set, repl_index, NULL);
 
+  /* --cache_mark: the policy has now placed the line by its own prediction; let it fold in the
+     staged mark. Consumed unconditionally, so a policy with no hook still clears the staging.
+     After update_insert on purpose -- the hook adjusts a placement rather than replacing it,
+     which is what lets one signal ride on top of policies whose insert logic has nothing in
+     common (see mockingjay_update_mark). */
+  {
+    Cache_Mark mark = consume_mark();
+    if (mark.valid && repl_policy_func_table[policy].update_mark)
+      repl_policy_func_table[policy].update_mark(cache, proc_id, set, repl_index, &mark);
+  }
+
   return new_line->data;
 }
 
@@ -1604,6 +1677,10 @@ void general_action_repl(Cache* cache, Cache_Entry* new_line, uns8 proc_id, Addr
   new_line->valid = TRUE;
   new_line->tag = tag;
   new_line->base = *line_addr;
+  /* Every fresh line starts unmarked. marked_rrip_update_insert overwrites this a moment later
+     with its own verdict, and mockingjay_update_mark raises it only for a marked fill -- so
+     without this clear a recycled way would inherit the previous occupant's mark. */
+  new_line->marked_protected = FALSE;
   consume_fill_bound(new_line);  // --membound_stats: strategy path (>= REPL_VOID)
 }
 
@@ -1747,6 +1824,47 @@ void srrip_update_insert(Cache* cache, uns8 proc_id, uns set, uns way, void* arg
   cache->entries[set][way].reference_val = RRIP_DISTANT_VAL - 1;
 
   cache_debug_print_set(cache, set, way, CACHE_EVENT_INSERT);
+}
+
+/* --cache_mark hook for the plain RRIP family (SRRIP / BRRIP / DRRIP / SHIP).
+ *
+ * The currency is the RRPV, so this is the direct expression of the mechanism: clamp a marked
+ * line's insertion RRPV down to --rrip_mark_rrpv (default 0, the nearest re-reference these
+ * policies can predict), or, under --cache_mark_scale, ramp it from wherever the policy put
+ * the line toward that floor in proportion to `strength`.
+ *
+ * This is deliberately NOT marked-RRIP. It rides on top of an unmodified policy -- SHIP's
+ * signature prediction, DRRIP's duel -- and only pulls a line nearer, never further, so the
+ * host policy keeps every decision the mark does not override. REPL_MARKED_RRIP instead has
+ * the callers precompute the whole RRPV (basic, depth, per-set duel values) and stage it, so
+ * it takes no hook: see the table below.
+ *
+ * The floor is not clamped to 0 from below -- reference_val is signed and marked-RRIP's depth
+ * sweeps use negative RRPVs -- but a negative floor only means anything under
+ * --marked_rrip_argmax_evict, since srrip_update_evict selects on equality with
+ * RRIP_DISTANT_VAL and simply ages everything below it. */
+void rrip_update_mark(Cache* cache, uns8 proc_id, uns set, uns way, const Cache_Mark* mark);
+void rrip_update_mark(Cache* cache, uns8 proc_id, uns set, uns way, const Cache_Mark* mark) {
+  int rrpv, floor_rrpv, target;
+
+  if (!mark->marked)
+    return;
+
+  floor_rrpv = RRIP_MARK_RRPV;
+  rrpv = cache->entries[set][way].reference_val;
+
+  if (CACHE_MARK_SCALE) {
+    double v = (double)rrpv - mark->strength * (double)(rrpv - floor_rrpv);
+    target = (int)(v >= 0.0 ? v + 0.5 : v - 0.5);  // round to nearest (sign-symmetric)
+  } else {
+    target = floor_rrpv;
+  }
+
+  if (target < floor_rrpv)
+    target = floor_rrpv;
+  if (rrpv <= target)
+    return;  // the policy already predicts a nearer re-reference than the mark asks for
+  cache->entries[set][way].reference_val = target;
 }
 
 /* MARKED_RRIP: SRRIP variant that protects "important" lines. Each caller precomputes the
@@ -2409,6 +2527,9 @@ typedef struct Mockingjay_State_struct {
   double flexmin_penalty;
 
   int* etr_clock;         /* per set: accesses until the next ETR aging step */
+  /* --mockingjay_mark_age_period > 1: per set, how many aging steps have passed since the
+     marked lines in it last aged. Only allocated when the knob is on. */
+  uns* mark_age_ctr;
   int* current_timestamp; /* per set: sampler timestamp, wraps at 2^TIMESTAMP_BITS */
 
   int* rdp;        /* direct-indexed by signature; predicted reuse distance */
@@ -2417,6 +2538,14 @@ typedef struct Mockingjay_State_struct {
   int* sampled_rank; /* per set: dense sampler rank, or -1 if the set is not sampled */
   Mockingjay_Sampled_Line* sampler; /* (num_sampled << LOG2_SAMPLER_SETS) groups of WAYS */
   uns  num_sampled_sets;
+
+  /* --mockingjay_path_signature: the folded path history, one register per core. Lives HERE,
+     per cache instance, rather than in a file-scope per-core array: an L2 and an LLC both
+     running the policy see completely different access streams, and a shared register would
+     interleave them into a history that describes neither. Indexed by the STAGED proc_id --
+     the Cache struct itself carries no core identity, since MLC is always shared across cores
+     and L1 is too unless --private_l1. Zeroed by the calloc in mockingjay_action_init. */
+  uns64 path_hist[MAX_NUM_PROCS];
 } Mockingjay_State;
 
 void mockingjay_action_init(Cache* cache, const char* name, uns cache_size, uns assoc, uns line_size, uns data_size,
@@ -2431,12 +2560,22 @@ static Addr g_mj_pc = 0;
 static Flag g_mj_is_prefetch = FALSE;
 static Flag g_mj_is_writeback = FALSE;
 static uns8 g_mj_proc_id = 0;
+/* --mockingjay_path_signature only. g_mj_have_ctx distinguishes "staged with a PC of 0" from
+   "nothing staged", which the cleared values alone cannot -- see cache_set_mockingjay_next_access
+   in the header for why that distinction has to exist once the history is persistent. */
+static Flag  g_mj_have_ctx = FALSE;
+static uns32 g_mj_ghist = 0;
+static Flag  g_mj_off_path = FALSE;
 
-void cache_set_mockingjay_next_access(Flag have_ctx, Addr pc, Flag is_prefetch, Flag is_writeback, uns8 proc_id) {
+void cache_set_mockingjay_next_access(Flag have_ctx, Addr pc, Flag is_prefetch, Flag is_writeback, uns8 proc_id,
+                                      uns32 ghist, Flag off_path) {
   g_mj_pc = have_ctx ? pc : 0;
   g_mj_is_prefetch = have_ctx ? is_prefetch : FALSE;
   g_mj_is_writeback = have_ctx ? is_writeback : FALSE;
   g_mj_proc_id = have_ctx ? proc_id : 0;
+  g_mj_have_ctx = have_ctx;
+  g_mj_ghist = have_ctx ? ghist : 0;
+  g_mj_off_path = have_ctx ? off_path : FALSE;
 }
 
 static inline void mj_clear_ctx(void) {
@@ -2444,6 +2583,9 @@ static inline void mj_clear_ctx(void) {
   g_mj_is_prefetch = FALSE;
   g_mj_is_writeback = FALSE;
   g_mj_proc_id = 0;
+  g_mj_have_ctx = FALSE;
+  g_mj_ghist = 0;
+  g_mj_off_path = FALSE;
 }
 
 static inline Mockingjay_State* mj_state(Cache* cache) {
@@ -2483,6 +2625,77 @@ static inline uns mj_pc_signature(Mockingjay_State* s, Addr pc, Flag hit, Flag p
   }
   sig = mj_crc_hash(sig);
   return (uns)(sig & ((((uns64)1) << s->pc_signature_bits) - 1));
+}
+
+/* --mockingjay_path_signature (ArchAgent "Policy61"): fold this access into the per-core path
+ * history and return the value that should feed mj_pc_signature in place of the bare PC.
+ *
+ * Policy61's own line is  history = ((history << 1) | (history >> 63)) ^ instr_pc,  i.e. a
+ * 64-bit rotate-left-by-one then XOR. A rotate (not a shift) is the point: nothing is ever
+ * shifted out, so every PC ever folded still contributes, just at a rotating bit offset. Mode
+ * 2 substitutes the branch history for the PC and mode 3 folds both; the mode is a bit field.
+ *
+ * commit==FALSE PREVIEWS the fold without storing it, for the bypass predicate, which runs
+ * before the update that will commit the same value. Exactly one of the two advances the
+ * register per fill.
+ *
+ * have_ctx/ghist/off_path are arguments rather than reads of the g_mj_* one-shots because the
+ * bypass predicate calls this before anything has been staged; it supplies its own.
+ *
+ * Returns `pc` untouched -- and leaves the register alone -- whenever the mode is off, no
+ * context was staged, or the access is wrong-path and --mockingjay_path_onpath_only is set.
+ * The unstaged case is the important one: mj_update_state is reachable from paths that never
+ * stage (warmup via cmp_warmup, l1_pref_cache_access, any cache pointed at REPL_MOCKINGJAY
+ * with no staging wired up), and folding their PC of 0 would corrupt every later signature
+ * rather than just their own. */
+static inline Addr mj_path_fold(Mockingjay_State* s, Addr pc, uns8 proc_id, Flag have_ctx, uns32 ghist, Flag off_path,
+                                Flag advance) {
+  uns   mode = MOCKINGJAY_PATH_SIGNATURE;
+  uns   rot;
+  uns64 h;
+
+  if (mode == 0 || !have_ctx)
+    return pc;
+  if (MOCKINGJAY_PATH_ONPATH_ONLY && off_path)
+    return pc;
+  ASSERT(0, proc_id < MAX_NUM_PROCS);
+
+  h = s->path_hist[proc_id];
+
+  /* THE TWO PATHS ARE NOT SYMMETRIC, AND THAT IS POLICY61'S OWN SHAPE, NOT AN OVERSIGHT HERE.
+     Its update path rotates before folding and stores the result:
+         core_pc_history[cpu] = ((h << 1) | (h >> 63)) ^ instr_pc;
+     but its victim path takes a bare XOR of the CURRENT register and does not rotate or store:
+         signature_base_pc = instr_pc ^ core_pc_history[cpu];
+     So the entry the bypass test reads is NOT the entry the following update trains -- the two
+     differ by one rotation of the history component, which after the CRC fold is an unrelated
+     RDP index. Reproduced verbatim because these are the semantics the paper's numbers were
+     produced with; --mockingjay_path_sync_lookup makes the lookup rotate too if you want to
+     measure whether that asymmetry costs anything.
+
+     NOTE this makes --mockingjay_path_rotate 0 do double duty: at rot 0 the update stops
+     rotating as well, so the two paths coincide and the arm is no longer a clean "does order
+     matter" ablation. Pair it with --mockingjay_path_sync_lookup 1 to separate the effects.
+
+     mod 64 because a shift of 64 on a 64-bit value is undefined. */
+  rot = (advance || MOCKINGJAY_PATH_SYNC_LOOKUP) ? (MOCKINGJAY_PATH_ROTATE % 64) : 0;
+  if (rot)
+    h = (h << rot) | (h >> (64 - rot));
+  if (mode & 1)
+    h ^= (uns64)pc;
+  if (mode & 2) {
+    /* --mockingjay_path_ghist_bits N: keep the N most recent branch outcomes. global_hist puts
+       the newest at bit 31, so the recent end is the TOP of the register and a right shift is
+       what drops the old bits. 32 shifts by 0 and folds the whole thing. */
+    uns gbits = MOCKINGJAY_PATH_GHIST_BITS;
+    h ^= (uns64)(gbits >= 32 ? ghist : (ghist >> (32 - gbits)));
+  }
+
+  /* Only the update path advances the register: one commit per access, on the hit, fill or
+     bypassed-fill update. The victim path is a pure read. */
+  if (advance)
+    s->path_hist[proc_id] = h;
+  return (Addr)h;
 }
 
 /* Sampler index: the low (LOG2_SAMPLER_SETS + log2_sets) bits of the block address. Its low
@@ -2560,25 +2773,56 @@ static inline int mj_time_elapsed(int global, int local) {
   return global + (1 << MOCKINGJAY_TIMESTAMP_BITS) - local;
 }
 
-/* Victim choice over a full set: largest |ETR|, ties broken toward an overdue (negative) ETR.
- * Also reports that largest |ETR|, which the bypass predicate compares the RDP against. */
-static uns mj_victim_way(Cache* cache, uns set, int* out_max_etr) {
+/* One scan of a set for the Mockingjay victim: largest |ETR|, ties broken toward an overdue
+ * (negative) ETR. `honor_immunity` skips the ways --mockingjay_mark_no_evict_positive protects.
+ * Reports whether any way was eligible at all, so the caller can retry without immunity. */
+static uns mj_scan_victim(Cache* cache, uns set, Flag honor_immunity, int* out_max_etr, Flag* out_found) {
   uns victim_way = 0;
   int max_etr = 0;
+  Flag found = FALSE;
   uns ii;
 
   for (ii = 0; ii < cache->assoc; ii++) {
     int etr = cache->entries[set][ii].reference_val;
     int abs_etr = mj_abs(etr);
-    if (abs_etr > max_etr || (abs_etr == max_etr && etr < 0)) {
+    /* --mockingjay_mark_no_evict_positive: a marked line whose ETR is still POSITIVE has not
+       yet reached its predicted reuse, so it is not a candidate. Once it ages to 0 and goes
+       negative -- overdue, the prediction falsified -- the immunity lapses and it competes for
+       eviction like anything else. That bound is the whole point: immunity is a countdown, not
+       a pin, and it cannot outlast the ETR the mark handed the line. */
+    if (honor_immunity && cache->entries[set][ii].marked_protected && etr > 0)
+      continue;
+    if (!found || abs_etr > max_etr || (abs_etr == max_etr && etr < 0)) {
       max_etr = abs_etr;
       victim_way = ii;
+      found = TRUE;
     }
   }
 
   if (out_max_etr)
     *out_max_etr = max_etr;
+  if (out_found)
+    *out_found = found;
   return victim_way;
+}
+
+/* Victim choice over a full set. Also reports the largest |ETR| among the ways that were
+ * actually eligible, which the bypass predicate compares the RDP against -- the comparison the
+ * bypass wants is against the line the fill would really displace, so immune ways are excluded
+ * from it too.
+ *
+ * If EVERY way is immune the immunity is dropped for this eviction rather than failing to name
+ * a victim: a fill must always be able to allocate. That makes a fully-marked set degrade to
+ * stock Mockingjay instead of deadlocking, which is also why a too-loose gate shows up as "the
+ * flag stopped doing anything" rather than as a crash. */
+static uns mj_victim_way(Cache* cache, uns set, int* out_max_etr) {
+  Flag found = FALSE;
+  uns  victim_way;
+
+  victim_way = mj_scan_victim(cache, set, MOCKINGJAY_MARK_NO_EVICT_POSITIVE, out_max_etr, &found);
+  if (found)
+    return victim_way;
+  return mj_scan_victim(cache, set, FALSE, out_max_etr, &found);
 }
 
 void mockingjay_action_init(Cache* cache, const char* name, uns cache_size, uns assoc, uns line_size, uns data_size,
@@ -2606,6 +2850,18 @@ void mockingjay_action_init(Cache* cache, const char* name, uns cache_size, uns 
   s->granularity = (int)MOCKINGJAY_GRANULARITY;
   ASSERTM(0, s->history > 0 && s->granularity > 0, "REPL_MOCKINGJAY needs history/granularity > 0 (%d/%d)\n",
           s->history, s->granularity);
+
+  /* --mockingjay_path_signature is a 2-bit field (1 = access PC, 2 = branch history). Caught
+     here rather than ignored, because a stray 4 would silently rotate the register on every
+     access while folding nothing in -- a mode that looks live but predicts on pure noise. */
+  ASSERTM(0, MOCKINGJAY_PATH_SIGNATURE <= 3,
+          "--mockingjay_path_signature must be 0..3 (0=off, 1=access PC, 2=branch history, 3=both), got %u\n",
+          MOCKINGJAY_PATH_SIGNATURE);
+  /* 0 would fold a constant 0 and silently turn mode 2 into "rotate only"; above 32 there are no
+     more bits in Bp_Data.global_hist to take. */
+  ASSERTM(0, MOCKINGJAY_PATH_GHIST_BITS >= 1 && MOCKINGJAY_PATH_GHIST_BITS <= 32,
+          "--mockingjay_path_ghist_bits must be 1..32 (global_hist is 32 bits), got %u\n",
+          MOCKINGJAY_PATH_GHIST_BITS);
 
   s->inf_rd = (int)assoc * s->history - 1;
   s->inf_etr = ((int)assoc * s->history / s->granularity) - 1;
@@ -2649,6 +2905,10 @@ void mockingjay_action_init(Cache* cache, const char* name, uns cache_size, uns 
   for (ii = 0; ii < cache->num_sets; ii++)
     s->etr_clock[ii] = s->granularity;
 
+  /* --mockingjay_mark_age_period: one counter per set, allocated only when marked lines
+     actually age on a different schedule (period 1 means they do not). */
+  s->mark_age_ctr = (MOCKINGJAY_MARK_AGE_PERIOD > 1) ? (uns*)calloc(cache->num_sets, sizeof(uns)) : NULL;
+
   s->rdp = (int*)calloc((size_t)1 << s->pc_signature_bits, sizeof(int));
   s->rdp_valid = (Flag*)calloc((size_t)1 << s->pc_signature_bits, sizeof(Flag));
 
@@ -2674,6 +2934,78 @@ void mockingjay_action_init(Cache* cache, const char* name, uns cache_size, uns 
 /* The reference's llc_update_replacement_state, shared by the hit, fill and bypass paths.
  * way == cache->assoc means the fill was bypassed (the reference passes LLC_WAY): the sampler
  * is still trained and the set still ages, only the per-line ETR write is skipped. */
+/* The Mockingjay sampled-cache training step, shared verbatim by REPL_MOCKINGJAY and
+ * REPL_ARCHAGENT. ArchAgent's Policy61 replaces Mockingjay's ETR machinery wholesale but
+ * keeps this block unchanged (see the authors' conversion guide, S4.4), so it lives in one
+ * place rather than being duplicated. Caller checks mj_is_sampled_set first.
+ *
+ * Reads no per-access globals: `sig` and `is_prefetch` are passed, because the two policies
+ * derive their signature differently. */
+static void mj_train_sampler(Mockingjay_State* s, uns set, Addr line_addr, uns sig, Flag is_prefetch) {
+  uns   idx = mj_sampler_index(s, line_addr);
+  uns64 stag = mj_sampler_tag(s, line_addr);
+  Mockingjay_Sampled_Line* group = mj_sampler_group(s, idx);
+  int   sampler_way = mj_sampler_search(s, stag, idx);
+  int   lru_way = -1;
+  int   lru_rd = -1;
+  int   w;
+
+  /* Reuse of a sampled block: the elapsed time is a measured reuse distance for the
+     signature that last touched it. Train the RDP toward it and free the entry. */
+  if (sampler_way > -1) {
+    uns last_sig = (uns)group[sampler_way].signature;
+    int last_timestamp = group[sampler_way].timestamp;
+    int sample = mj_time_elapsed(s->current_timestamp[set], last_timestamp);
+
+    if (sample <= s->inf_rd) {
+      /* FLEXMIN: a prefetched line's measured distance is inflated so prefetch-fed lines
+         are retained less aggressively than demand-fed ones. */
+      if (is_prefetch)
+        sample = (int)(sample * s->flexmin_penalty);
+      if (s->rdp_valid[last_sig]) {
+        s->rdp[last_sig] = mj_temporal_difference(s, s->rdp[last_sig], sample);
+      } else {
+        s->rdp_valid[last_sig] = TRUE;
+        s->rdp[last_sig] = sample;
+      }
+      group[sampler_way].valid = FALSE;
+    }
+  }
+
+  /* Make room in the sampler group: prefer an invalid entry, detrain anything that has aged
+     past INF_RD, otherwise detrain the oldest. */
+  for (w = 0; w < MOCKINGJAY_SAMPLED_CACHE_WAYS; w++) {
+    int sample;
+    if (!group[w].valid) {
+      lru_way = w;
+      lru_rd = s->inf_rd + 1;
+      continue;
+    }
+    sample = mj_time_elapsed(s->current_timestamp[set], group[w].timestamp);
+    if (sample > s->inf_rd) {
+      lru_way = w;
+      lru_rd = s->inf_rd + 1;
+      mj_detrain(s, idx, w);
+    } else if (sample > lru_rd) {
+      lru_way = w;
+      lru_rd = sample;
+    }
+  }
+  mj_detrain(s, idx, lru_way);
+
+  for (w = 0; w < MOCKINGJAY_SAMPLED_CACHE_WAYS; w++) {
+    if (!group[w].valid) {
+      group[w].valid = TRUE;
+      group[w].signature = sig;
+      group[w].tag = stag;
+      group[w].timestamp = s->current_timestamp[set];
+      break;
+    }
+  }
+
+  s->current_timestamp[set] = mj_increment_timestamp(s->current_timestamp[set]);
+}
+
 static void mj_update_state(Cache* cache, uns set, uns way, Addr line_addr, Flag hit) {
   Mockingjay_State* s = mj_state(cache);
   uns sig;
@@ -2687,77 +3019,40 @@ static void mj_update_state(Cache* cache, uns set, uns way, Addr line_addr, Flag
     return;
   }
 
-  sig = mj_pc_signature(s, g_mj_pc, hit, g_mj_is_prefetch, g_mj_proc_id);
+  /* --mockingjay_path_signature: COMMIT the fold here (commit=TRUE) -- this is the one update
+     per access that advances the register. Placed after the writeback early-return above, so a
+     writeback never advances the history, matching where Policy61's snippet sits relative to
+     its own WRITEBACK return. A no-op returning g_mj_pc when the mode is off. */
+  sig = mj_pc_signature(s, mj_path_fold(s, g_mj_pc, g_mj_proc_id, g_mj_have_ctx, g_mj_ghist, g_mj_off_path, TRUE), hit,
+                        g_mj_is_prefetch, g_mj_proc_id);
 
-  if (mj_is_sampled_set(s, set)) {
-    uns   idx = mj_sampler_index(s, line_addr);
-    uns64 stag = mj_sampler_tag(s, line_addr);
-    Mockingjay_Sampled_Line* group = mj_sampler_group(s, idx);
-    int   sampler_way = mj_sampler_search(s, stag, idx);
-    int   lru_way = -1;
-    int   lru_rd = -1;
-    int   w;
-
-    /* Reuse of a sampled block: the elapsed time is a measured reuse distance for the
-       signature that last touched it. Train the RDP toward it and free the entry. */
-    if (sampler_way > -1) {
-      uns last_sig = (uns)group[sampler_way].signature;
-      int last_timestamp = group[sampler_way].timestamp;
-      int sample = mj_time_elapsed(s->current_timestamp[set], last_timestamp);
-
-      if (sample <= s->inf_rd) {
-        /* FLEXMIN: a prefetched line's measured distance is inflated so prefetch-fed lines
-           are retained less aggressively than demand-fed ones. */
-        if (g_mj_is_prefetch)
-          sample = (int)(sample * s->flexmin_penalty);
-        if (s->rdp_valid[last_sig]) {
-          s->rdp[last_sig] = mj_temporal_difference(s, s->rdp[last_sig], sample);
-        } else {
-          s->rdp_valid[last_sig] = TRUE;
-          s->rdp[last_sig] = sample;
-        }
-        group[sampler_way].valid = FALSE;
-      }
-    }
-
-    /* Make room in the sampler group: prefer an invalid entry, detrain anything that has aged
-       past INF_RD, otherwise detrain the oldest. */
-    for (w = 0; w < MOCKINGJAY_SAMPLED_CACHE_WAYS; w++) {
-      int sample;
-      if (!group[w].valid) {
-        lru_way = w;
-        lru_rd = s->inf_rd + 1;
-        continue;
-      }
-      sample = mj_time_elapsed(s->current_timestamp[set], group[w].timestamp);
-      if (sample > s->inf_rd) {
-        lru_way = w;
-        lru_rd = s->inf_rd + 1;
-        mj_detrain(s, idx, w);
-      } else if (sample > lru_rd) {
-        lru_way = w;
-        lru_rd = sample;
-      }
-    }
-    mj_detrain(s, idx, lru_way);
-
-    for (w = 0; w < MOCKINGJAY_SAMPLED_CACHE_WAYS; w++) {
-      if (!group[w].valid) {
-        group[w].valid = TRUE;
-        group[w].signature = sig;
-        group[w].tag = stag;
-        group[w].timestamp = s->current_timestamp[set];
-        break;
-      }
-    }
-
-    s->current_timestamp[set] = mj_increment_timestamp(s->current_timestamp[set]);
-  }
+  if (mj_is_sampled_set(s, set))
+    mj_train_sampler(s, set, line_addr, sig, g_mj_is_prefetch);
 
   /* Age every other line in the set once per GRANULARITY accesses. */
   if (s->etr_clock[set] == s->granularity) {
+    /* --mockingjay_mark_age_period N: a --cache_mark line ages once every N aging steps
+       instead of every one, i.e. its ETR decays N times more slowly, so it sits near the
+       protected end of the set N times longer than an unmarked line would. It still ages: its
+       |ETR| grows without bound like everyone else's, just slower, so a marked line is
+       evicted after roughly N times as many aging steps rather than outliving the set.
+       Period 1 (the default) allocates no counter and ages marked lines normally.
+
+       This is where a Mockingjay mark has to act. The insert-time clamp below is nearly a
+       no-op on its own, because Mockingjay already inserts an untrained signature -- and any
+       signature predicting reuse closer than GRANULARITY -- at ETR 0, which is already the
+       floor. In this policy the protection is in the decay rate, not the insertion value,
+       which is exactly why marked-RRIP re-promotes on every hit rather than only at insert.
+       Modeled on --marked_rrip_age_period, which does the same thing to RRPV aging. */
+    Flag age_marked = TRUE;
+    if (MOCKINGJAY_MARK_AGE_PERIOD > 1 && s->mark_age_ctr) {
+      s->mark_age_ctr[set] = (s->mark_age_ctr[set] + 1) % MOCKINGJAY_MARK_AGE_PERIOD;
+      age_marked = (s->mark_age_ctr[set] == 0) ? TRUE : FALSE;
+    }
     for (ii = 0; ii < cache->assoc; ii++) {
       int etr = cache->entries[set][ii].reference_val;
+      if (!age_marked && cache->entries[set][ii].marked_protected)
+        continue;  // this line's turn to be skipped; it ages on a later step
       if (ii != way && mj_abs(etr) < s->inf_etr)
         cache->entries[set][ii].reference_val = etr - 1;
     }
@@ -2790,6 +3085,99 @@ void mockingjay_update_insert(Cache* cache, uns8 proc_id, uns set, uns way, void
   cache_debug_print_set(cache, set, way, CACHE_EVENT_INSERT);
 }
 
+/* --cache_mark hook for REPL_MOCKINGJAY: the ETR analogue of marked-RRIP's RRPV clamp.
+ *
+ * Mockingjay's priority currency is ETR -- the predicted time remaining until the line is
+ * re-referenced, in units of GRANULARITY accesses. mj_victim_way evicts the largest |ETR|
+ * (ties toward a negative, i.e. already-overdue, ETR), so the direction of protection is
+ * |ETR| -> 0, exactly as marked-RRIP's is RRPV -> min_rrpv. Note it is the MAGNITUDE that
+ * matters: a large negative ETR is the most evictable state there is, not the most protected
+ * one, so a marked line's sign is forced positive rather than its value merely decreased.
+ *
+ * The clamp RAISES a marked line's ETR to at least --mockingjay_mark_etr:
+ *
+ *     etr = (etr > CLAMP) ? etr : CLAMP
+ *
+ * It is a FLOOR ON TIME REMAINING, not a pull toward 0, and that direction is deliberate. ETR
+ * is a countdown: the line ages toward 0 ("due now") and past it into negative ("overdue").
+ * Granting a line ETR = C therefore grants it C aging steps before it is even due, which is
+ * exactly what --mockingjay_mark_no_evict_positive then makes unevictable. Pulling it DOWN to
+ * 0 would do the opposite -- safest for one instant, then immediately overdue -- which is the
+ * mistake the RRPV analogy invites, since an RRPV has no countdown in it and lowest really is
+ * strongest there.
+ *
+ * Scaled mode (--cache_mark_scale) ramps the floor with the mark: strength 0 grants nothing,
+ * strength 1 grants the full C, so a line that barely cleared its gate keeps the policy's own
+ * prediction and a maximally-marked one gets the whole extension.
+ *
+ * NOTE this can RAISE |ETR|, e.g. a line the RDP put at 1 with C = 5. Under stock victim
+ * selection that is a weakening: |5| is a worse victim score than |1|. The flag is meant to be
+ * paired with --mockingjay_mark_no_evict_positive, which makes the entire positive range safe
+ * and turns the raise into pure extension. Run it alone only to measure that interaction.
+ *
+ * The clamp is OFF by default (a negative --mockingjay_mark_etr), so this hook only records the
+ * mark on the line unless a study opts in.
+ *
+ * CLAMP, NEVER WEAKEN: if the RDP already predicts a nearer reuse than the mark would grant,
+ * the prediction stands. The mark is a floor on protection, not an assignment -- it must not
+ * be able to demote a line Mockingjay had already decided to keep, which a plain assignment
+ * could do for any line whose |ETR| was below the floor.
+ *
+ * An UNMARKED mark (measured, below threshold) is left alone. Nothing here trains the RDP or
+ * touches the sampler: the mark is an external opinion about one line, not evidence about the
+ * signature, and feeding it back into the predictor would let it contaminate every other line
+ * that shares the PC. */
+void mockingjay_update_mark(Cache* cache, uns8 proc_id, uns set, uns way, const Cache_Mark* mark);
+void mockingjay_update_mark(Cache* cache, uns8 proc_id, uns set, uns way, const Cache_Mark* mark) {
+  Mockingjay_State* s = mj_state(cache);
+  int etr, floor_etr, target;
+
+  if (!mark->marked)
+    return;
+  if (way >= cache->assoc)
+    return;
+
+  /* Sticky record that this line was marked at insert, read by the aging loop under
+     --mockingjay_mark_age_period (and by anything else that wants to tell marked lines apart).
+     Set before the clamp's early-outs, and even when the clamp is a no-op: the line IS marked
+     either way, and with Mockingjay inserting most lines at ETR 0 the no-op case is the common
+     one. This is also what makes "clamp off, aging on" a reachable ablation arm. */
+  cache->entries[set][way].marked_protected = TRUE;
+
+  /* NEGATIVE = CLAMP DISABLED, which is the DEFAULT: --cache_mark against a Mockingjay cache
+     reproduces stock Mockingjay until a study opts this lever in. It is also the ablation arm
+     that isolates the aging lever. A negative ETR would be a nonsensical target anyway (it
+     reads as overdue, i.e. evict me first), so the value space is free. Disabling it this way
+     rather than by setting the floor to INF_ETR keeps the arm independent of the cache's
+     geometry, since INF_ETR is derived from assoc / --mockingjay_history /
+     --mockingjay_granularity. */
+  if (MOCKINGJAY_MARK_ETR < 0)
+    return;
+
+  floor_etr = MOCKINGJAY_MARK_ETR;
+  /* INF_ETR is where aging stops, so a floor above it would grant time the policy cannot
+     count down. */
+  if (floor_etr > s->inf_etr)
+    floor_etr = s->inf_etr;
+
+  etr = cache->entries[set][way].reference_val;
+
+  if (CACHE_MARK_SCALE) {
+    /* 0 (strength 0, at the threshold) -> floor_etr (strength 1). Rounded to nearest; the
+       operand is non-negative so a plain +0.5 is correct. */
+    target = (int)(mark->strength * (double)floor_etr + 0.5);
+  } else {
+    target = floor_etr;
+  }
+
+  /* etr = (etr > target) ? etr : target -- never SHORTEN a line the RDP already predicted to
+     be reused further out, so the mark can only ever add time. Note this compares the SIGNED
+     ETR, so an already-overdue marked line (negative) is lifted back to the floor and gets a
+     fresh countdown, which is the sensible reading of "this line matters" arriving late. */
+  if (etr < target)
+    cache->entries[set][way].reference_val = target;
+}
+
 Cache_Entry* mockingjay_update_evict(Cache* cache, uns8 proc_id, uns set, uns* way, void* arg, Flag if_external) {
   uns ii;
 
@@ -2808,7 +3196,8 @@ Cache_Entry* mockingjay_update_evict(Cache* cache, uns8 proc_id, uns set, uns* w
   return &cache->entries[set][*way];
 }
 
-Flag cache_mockingjay_should_bypass(Cache* cache, Addr addr, Addr pc, Flag is_prefetch, uns8 proc_id) {
+Flag cache_mockingjay_should_bypass(Cache* cache, Addr addr, Addr pc, Flag is_prefetch, uns8 proc_id, uns32 ghist,
+                                    Flag off_path) {
   Mockingjay_State* s;
   Addr tag, line_addr;
   uns  set, ii, sig;
@@ -2828,8 +3217,11 @@ Flag cache_mockingjay_should_bypass(Cache* cache, Addr addr, Addr pc, Flag is_pr
 
   (void)mj_victim_way(cache, set, &max_etr);
 
-  /* hit=FALSE here: the reference forms the bypass signature from a miss. */
-  sig = mj_pc_signature(s, pc, FALSE, is_prefetch, proc_id);
+  /* hit=FALSE here: the reference forms the bypass signature from a miss.
+     --mockingjay_path_signature: advance=FALSE, which is Policy61's victim-path form -- a bare
+     XOR of the current register, neither rotated nor stored (see mj_path_fold). have_ctx=TRUE
+     because the caller hands us real values rather than relying on anything staged. */
+  sig = mj_pc_signature(s, mj_path_fold(s, pc, proc_id, TRUE, ghist, off_path, FALSE), FALSE, is_prefetch, proc_id);
   if (!s->rdp_valid[sig])
     return FALSE;
 
@@ -2851,20 +3243,231 @@ void cache_mockingjay_note_bypass(Cache* cache, Addr addr) {
 }
 
 /**************************************************************************************/
+/* ARCHAGENT "Policy61" -- Gupta et al., "ArchAgent: Agentic AI-driven Computer Architecture
+ * Discovery", S6.2, implemented from the authors' mj.cc -> aa.cc conversion guide.
+ *
+ * Despite being seeded from Mockingjay, this is largely a different policy. It KEEPS
+ * Mockingjay's training machinery -- the sampled cache, the reuse-distance predictor, the
+ * temporal-difference update, FLEXMIN, the set sampling and the CRC signature hash, all reused
+ * here unmodified -- and REPLACES everything the policy does with that prediction:
+ *
+ *   1. Per-line state is a 3-bit SRRIP RRPV (0..7), not Mockingjay's signed ETR. GRANULARITY,
+ *      INF_ETR, the etr array and the etr_clock aging tick are all gone; aging now happens
+ *      inside victim selection, the SRRIP way.
+ *   2. The signature is built from a per-core rotating PC history register, folded as
+ *          signature_base_pc = pc ^ history        (the CURRENT, pre-update value)
+ *          history           = rotl(history, 1) ^ pc
+ *      Note these are DIFFERENT expressions: the signature uses the un-rotated register and the
+ *      rotation only feeds the next access. Both the victim path and the update path use the
+ *      same `pc ^ history`, so they agree -- the two paths are consistent, unlike what the
+ *      published one-line excerpt of this policy suggested in isolation.
+ *   3. Bypass is simplified to "predicted reuse exceeds MAX_RD" -- Mockingjay's second clause
+ *      (further out than the most distant resident line) is dropped, so no victim scan is
+ *      needed -- and it is checked BEFORE victim selection, which matters because the SRRIP
+ *      search mutates RRPVs as it ages.
+ *   4. A bypassed access updates NOTHING: no sampler training, no RDP write, no timestamp
+ *      advance, no history rotation. Mockingjay did all of those on a bypass.
+ *
+ * Insertion is the whole point of the RDP here: a signature predicted to be reused within
+ * MAX_RD enters at RRPV_MAX-1 (survives one aging round), anything else -- including an unseen
+ * signature -- enters at RRPV_MAX (evict-on-arrival). A hit always promotes to 0. Mockingjay's
+ * single-core special case, where an unseen signature was optimistically kept at ETR 0, is
+ * gone: Policy61 is pessimistic about signatures it has not learned.
+ *
+ * Scarab adaptation notes, all shared with the REPL_MOCKINGJAY port above:
+ *  - RRPV lives in Cache_Entry.reference_val, so no per-line storage is added.
+ *  - The accessing PC / traffic class arrives through the same one-shot staging call,
+ *    cache_set_mockingjay_next_access(), because the strategy dispatcher passes no context.
+ *  - Scarab's update_evict must name a way, so the bypass decision is split out into the pure
+ *    predicate cache_archagent_should_bypass(), which callers consult before cache_insert.
+ *  - Sizing reuses the --mockingjay_log2_sampled_sets / --mockingjay_pc_signature_bits /
+ *    --mockingjay_history knobs, since that machinery is identical. --mockingjay_granularity
+ *    and the --mockingjay_path_* knobs do not apply and are ignored.
+ */
+
+#define ARCHAGENT_RRPV_MAX 7 /* 3-bit RRPV, per the conversion guide */
+
+void archagent_action_init(Cache* cache, const char* name, uns cache_size, uns assoc, uns line_size, uns data_size,
+                           Repl_Policy repl_policy);
+void archagent_update_hit(Cache* cache, uns set, uns way, void* arg);
+void archagent_update_insert(Cache* cache, uns8 proc_id, uns set, uns way, void* arg);
+Cache_Entry* archagent_update_evict(Cache* cache, uns8 proc_id, uns set, uns* way, void* arg, Flag if_external);
+
+/* Policy61's signature. `advance` is TRUE on the update path, which is the one place the
+ * register moves; the victim path passes FALSE and only reads it. Both return the signature of
+ * the SAME pre-update value, so the entry the bypass test consults is the entry the resulting
+ * fill trains. */
+static inline uns aa_signature(Mockingjay_State* s, Addr pc, Flag hit, Flag prefetch, uns8 proc_id, Flag advance) {
+  uns64 h;
+
+  /* --archagent_pc_history 0: fall back to Mockingjay's plain PC signature and leave the
+     register frozen, isolating Policy61's structural changes from its signature change. */
+  if (!ARCHAGENT_PC_HISTORY)
+    return mj_pc_signature(s, pc, hit, prefetch, proc_id);
+
+  ASSERT(0, proc_id < MAX_NUM_PROCS);
+  h = s->path_hist[proc_id];
+  if (advance)
+    s->path_hist[proc_id] = ((h << 1) | (h >> 63)) ^ (uns64)pc;
+  /* The signature uses the PRE-update register, and the rotation only feeds the next access --
+     two different expressions. Both the victim and update paths compute this same value, so the
+     entry the bypass test reads is the entry the resulting fill trains. */
+  return mj_pc_signature(s, (Addr)((uns64)pc ^ h), hit, prefetch, proc_id);
+}
+
+void archagent_action_init(Cache* cache, const char* name, uns cache_size, uns assoc, uns line_size, uns data_size,
+                           Repl_Policy repl_policy) {
+  uns ii, jj;
+
+  /* Geometry, RDP, sampler and per-set timestamps are identical to Mockingjay's, so take that
+     setup wholesale. etr_clock / granularity / inf_etr are allocated and then never read -- a
+     few KB, in exchange for one copy of the sizing logic. */
+  mockingjay_action_init(cache, name, cache_size, assoc, line_size, data_size, repl_policy);
+
+  /* Every way starts at RRPV_MAX, so a cold set evicts in way order until it fills. */
+  for (ii = 0; ii < cache->num_sets; ii++)
+    for (jj = 0; jj < assoc; jj++)
+      cache->entries[ii][jj].reference_val = ARCHAGENT_RRPV_MAX;
+
+  DEBUG(0, "%s: REPL_ARCHAGENT sets=%u assoc=%u RRPV_MAX=%d MAX_RD=%d sig_bits=%d\n", cache->name, cache->num_sets,
+        assoc, ARCHAGENT_RRPV_MAX, mj_state(cache)->max_rd, mj_state(cache)->pc_signature_bits);
+}
+
+/* The guide's update_replacement_state, shared by the hit and fill paths. */
+static void aa_update_state(Cache* cache, uns set, uns way, Addr line_addr, Flag hit) {
+  Mockingjay_State* s = mj_state(cache);
+  uns sig;
+
+  /* Bypassed accesses return before everything (guide S4.1). Scarab never calls this on a
+     bypass -- the caller simply skips the insert -- so this is a guard, not a live path. */
+  if (way >= cache->assoc)
+    return;
+
+  /* A writeback that missed enters at RRPV_MAX so it leaves first, and trains nothing. Note
+     this returns BEFORE the history rotation, so writebacks do not move the register. */
+  if (g_mj_is_writeback) {
+    if (!hit)
+      cache->entries[set][way].reference_val = ARCHAGENT_RRPV_MAX;
+    return;
+  }
+
+  sig = aa_signature(s, g_mj_pc, hit, g_mj_is_prefetch, g_mj_proc_id, TRUE);
+
+  if (mj_is_sampled_set(s, set))
+    mj_train_sampler(s, set, line_addr, sig, g_mj_is_prefetch);
+
+  if (hit) {
+    /* Unconditional promotion -- the RDP is not consulted on a hit. */
+    cache->entries[set][way].reference_val = 0;
+  } else {
+    Flag predict_reused = (s->rdp_valid[sig] && s->rdp[sig] <= s->max_rd) ? TRUE : FALSE;
+    cache->entries[set][way].reference_val = predict_reused ? (ARCHAGENT_RRPV_MAX - 1) : ARCHAGENT_RRPV_MAX;
+  }
+}
+
+void archagent_update_hit(Cache* cache, uns set, uns way, void* arg) {
+  aa_update_state(cache, set, way, cache->entries[set][way].base, TRUE);
+  mj_clear_ctx();
+  cache_debug_print_set(cache, set, way, CACHE_EVENT_HIT);
+}
+
+void archagent_update_insert(Cache* cache, uns8 proc_id, uns set, uns way, void* arg) {
+  /* general_action_repl has already written base/tag, so the sampler sees the filled line. */
+  aa_update_state(cache, set, way, cache->entries[set][way].base, FALSE);
+  mj_clear_ctx();
+  cache_debug_print_set(cache, set, way, CACHE_EVENT_INSERT);
+}
+
+/* Textbook SRRIP victim search: take the first way at RRPV_MAX, otherwise age the whole set by
+ * one and look again. Aging here rather than on a clock is the structural difference from
+ * Mockingjay, and it is why the bypass test has to run before this function. */
+Cache_Entry* archagent_update_evict(Cache* cache, uns8 proc_id, uns set, uns* way, void* arg, Flag if_external) {
+  uns ii;
+  uns rounds;
+
+  for (ii = 0; ii < cache->assoc; ii++) {
+    if (!cache->entries[set][ii].valid) {
+      *way = ii;
+      cache_debug_print_set(cache, set, *way, CACHE_EVENT_EVICT);
+      return &cache->entries[set][*way];
+    }
+  }
+
+  /* Bounded: every RRPV is in [0, RRPV_MAX] (init, hit and insert only ever write 0,
+     RRPV_MAX-1 or RRPV_MAX), so at most RRPV_MAX aging rounds are ever needed. The bound turns
+     a state corruption into an assert instead of a hang. */
+  for (rounds = 0; rounds <= ARCHAGENT_RRPV_MAX; rounds++) {
+    for (ii = 0; ii < cache->assoc; ii++) {
+      if (cache->entries[set][ii].reference_val >= ARCHAGENT_RRPV_MAX) {
+        *way = ii;
+        cache_debug_print_set(cache, set, *way, CACHE_EVENT_EVICT);
+        return &cache->entries[set][*way];
+      }
+    }
+    for (ii = 0; ii < cache->assoc; ii++)
+      cache->entries[set][ii].reference_val++;
+  }
+
+  ASSERTM(0, FALSE, "REPL_ARCHAGENT: no way reached RRPV_MAX in set %u after %d aging rounds\n", set,
+          ARCHAGENT_RRPV_MAX);
+  *way = 0;
+  return &cache->entries[set][0];
+}
+
+Flag cache_archagent_should_bypass(Cache* cache, Addr addr, Addr pc, Flag is_prefetch, uns8 proc_id) {
+  Mockingjay_State* s;
+  Addr tag, line_addr;
+  uns  set, ii, sig;
+
+  if (cache->repl_policy != REPL_ARCHAGENT)
+    return FALSE;
+  s = mj_state(cache);
+  set = cache_index(cache, addr, &tag, &line_addr);
+
+  /* The invalid-way check comes first in the guide, before the bypass test, so a set with a
+     free way never bypasses. */
+  for (ii = 0; ii < cache->assoc; ii++) {
+    if (!cache->entries[set][ii].valid)
+      return FALSE;
+  }
+
+  /* hit=FALSE and advance=FALSE: the bypass signature is formed from a miss and must not move
+     the history register -- only update_replacement_state does that. */
+  sig = aa_signature(s, pc, FALSE, is_prefetch, proc_id, FALSE);
+
+  /* The whole rule. Mockingjay's "or further out than the most distant resident line" clause is
+     deliberately absent, which is why no victim scan happens here. */
+  return (s->rdp_valid[sig] && s->rdp[sig] > s->max_rd) ? TRUE : FALSE;
+}
+
+/**************************************************************************************/
 /* Driven Table */
 
 // clang-format off
+/* The last column is the --cache_mark hook: how this policy translates a staged Cache_Mark
+   into its own priority currency. NULL = the policy ignores marks.
+     - the RRIP family shares rrip_update_mark (clamp the RRPV toward --rrip_mark_rrpv);
+     - REPL_MOCKINGJAY clamps |ETR| toward --mockingjay_mark_etr;
+     - REPL_MARKED_RRIP takes NO hook on purpose. Its callers already precompute the whole
+       insertion RRPV -- depth, per-class threshold, per-set duel basic -- and stage it through
+       cache_set_marked_next_insert, so a hook here would apply the same signal a second time
+       and silently override the duel. Running --cache_mark against a marked-RRIP cache is
+       therefore a no-op, which is what makes the two mechanisms A/B-comparable on one build;
+     - REPL_LRU_REF / REPL_NRU / REPL_PLRU_TREE have no numeric priority to clamp (recency
+       order and tree direction bits), so expressing a graded mark in them needs a design
+       decision -- an insertion position, say -- rather than a clamp. Left unhooked. */
 struct repl_policy_func repl_policy_func_table[NUM_REPL] = {
-  { REPL_LRU_REF, general_action_init,  general_action_repl,  lru_update_hit,     lru_update_insert,    lru_update_evict    },
-  { REPL_NRU,     general_action_init,  general_action_repl,  nru_update_hit,     nru_update_insert,    nru_update_evict    },
-  { REPL_SRRIP,   general_action_init,  general_action_repl,  nru_update_hit,     srrip_update_insert,  srrip_update_evict  },
-  { REPL_BRRIP,   brrip_action_init,    general_action_repl,  nru_update_hit,     brrip_update_insert,  srrip_update_evict  },
-  { REPL_DRRIP,   drrip_action_init,    general_action_repl,  nru_update_hit,     drrip_update_insert,  drrip_update_evict  },
-  { REPL_SHIP,    ship_action_init,     general_action_repl,  ship_update_hit,    ship_update_insert,   ship_update_evict   },
-  { REPL_MARKED_RRIP, general_action_init, general_action_repl, marked_rrip_update_hit, marked_rrip_update_insert, marked_rrip_update_evict },
-  { REPL_PLRU_TREE, plru_action_init,   general_action_repl,  plru_update_hit,    plru_update_insert,   plru_update_evict   },
-  { REPL_MOCKINGJAY, mockingjay_action_init, general_action_repl, mockingjay_update_hit, mockingjay_update_insert, mockingjay_update_evict },
-  { REPL_VOID,    NULL,                 NULL,                 NULL,               NULL,                 NULL                },
+  { REPL_LRU_REF, general_action_init,  general_action_repl,  lru_update_hit,     lru_update_insert,    lru_update_evict,    NULL              },
+  { REPL_NRU,     general_action_init,  general_action_repl,  nru_update_hit,     nru_update_insert,    nru_update_evict,    NULL              },
+  { REPL_SRRIP,   general_action_init,  general_action_repl,  nru_update_hit,     srrip_update_insert,  srrip_update_evict,  rrip_update_mark  },
+  { REPL_BRRIP,   brrip_action_init,    general_action_repl,  nru_update_hit,     brrip_update_insert,  srrip_update_evict,  rrip_update_mark  },
+  { REPL_DRRIP,   drrip_action_init,    general_action_repl,  nru_update_hit,     drrip_update_insert,  drrip_update_evict,  rrip_update_mark  },
+  { REPL_SHIP,    ship_action_init,     general_action_repl,  ship_update_hit,    ship_update_insert,   ship_update_evict,   rrip_update_mark  },
+  { REPL_MARKED_RRIP, general_action_init, general_action_repl, marked_rrip_update_hit, marked_rrip_update_insert, marked_rrip_update_evict, NULL },
+  { REPL_PLRU_TREE, plru_action_init,   general_action_repl,  plru_update_hit,    plru_update_insert,   plru_update_evict,   NULL              },
+  { REPL_MOCKINGJAY, mockingjay_action_init, general_action_repl, mockingjay_update_hit, mockingjay_update_insert, mockingjay_update_evict, mockingjay_update_mark },
+  { REPL_ARCHAGENT, archagent_action_init, general_action_repl, archagent_update_hit, archagent_update_insert, archagent_update_evict, NULL },
+  { REPL_VOID,    NULL,                 NULL,                 NULL,               NULL,                 NULL,                NULL              },
 };
 // clang-format on
 
