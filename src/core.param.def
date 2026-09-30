@@ -151,6 +151,35 @@ DEF_PARAM(td_load_dir, TD_LOAD_DIR, char*, string, ".", )
  * run that asked only for this, both chains would be empty, and the result would read as "every
  * window is zero-length" rather than as a missing knob. */
 DEF_PARAM(td_load_window_stats, TD_LOAD_WINDOW_STATS, Flag, Flag, FALSE, )
+
+/* --memproxy_stats: compare the two memory-bound CYCLE PROXIES against each other, per cycle.
+ *
+ * There are two ways to say "this cycle was memory-bound" and nothing has ever measured how
+ * often they agree:
+ *   BACKEND  backend_stall && loads-in-flight, where backend_stall is (issued nothing && ops
+ *            were available). This is what mem_bound_cycle and TOPDOWN_MEM_LOAD_STALLS_CYCLES
+ *            already use. It infers the stall from back-pressure at the IDQ->rename boundary,
+ *            so it also fires on register-file exhaustion in update_map_stage, which has nothing
+ *            to do with memory.
+ *   FU       exec->fus_busy == 0 && loads-in-flight. Measured at the execution units: no unit is
+ *            doing non-memory work (fus_busy excludes held_by_mem by construction) while a load
+ *            is outstanding. Cannot be tripped by a rename-local resource.
+ *
+ * BOTH SAMPLE THE LOAD QUEUE AT THE SAME INSTANT, which is the whole point of doing this in
+ * topdown_idq_update rather than in update_exec_stage. The back end updates in reverse pipeline
+ * order (dcache, exec, node, map, idq), so lsq_commit in update_node_stage can retire entries
+ * between the two stages; a counter placed at the exec stage would sample a different load queue
+ * than the incumbent proxy does, and the comparison would confound the proxy with the sampling
+ * point. exec->fus_busy persists on the Exec_Stage struct and is already final for this cycle by
+ * the time the IDQ stage runs, so reading it here is exact, not stale.
+ *
+ * Emits two partitions of every cycle, each summing to NODE_CYCLE:
+ *   MEMPROXY_FU{0,BUSY}_{LOADS,NOLOADS}  the 2x2 of (no FU working) x (loads in flight)
+ *   MEMPROXY_AGREE_{BOUND,NOT} / MEMPROXY_ONLY_{BACKEND,FU}   where the two proxies land
+ * plus MEMPROXY_AGREE, the convenience sum of the two AGREE_* cases -- the single number for
+ * "the proxies agreed this cycle". MEMPROXY_ONLY_BACKEND is the incumbent calling a cycle
+ * memory-bound that the execution units say was not, and MEMPROXY_ONLY_FU is the reverse. */
+DEF_PARAM(memproxy_stats, MEMPROXY_STATS, Flag, Flag, FALSE, )
 /* Per-load membound window shape. Both knobs act ONLY inside lsq_tag_inflight_loads, i.e. they
    change which loads get td_window_cycles/td_mem_cycles credited on a given cycle. They do NOT
    change how a cycle is classified memory-bound (that stays the global backend-stall AND

@@ -678,6 +678,52 @@ DEF_STAT(  FUS_UNAVAIL_DIST_17         , COUNT, NO_RATIO  )
 DEF_STAT(  FUS_UNAVAIL_DIST_18         , COUNT, NO_RATIO  )
 DEF_STAT(  FUS_UNAVAIL_DIST_19         , COUNT, NO_RATIO  )
 DEF_STAT(  FUS_UNAVAIL_DIST_20MORE     , DIST , NO_RATIO  )
+
+/* --memproxy_stats: the two memory-bound CYCLE PROXIES, compared per cycle. See --memproxy_stats
+   in core.param.def for what each proxy is and why both are sampled in topdown_idq_update.
+
+   BACKEND proxy = backend_stall && loads-in-flight  (the incumbent: mem_bound_cycle and
+                   TOPDOWN_MEM_LOAD_STALLS_CYCLES)
+   FU proxy      = exec->fus_busy == 0 && loads-in-flight
+
+   TWO PARTITIONS OF EVERY CYCLE. Each group sums to NODE_CYCLE, which is the self-check to run
+   first -- if either sum misses, the emission is on the wrong path.
+
+     MEMPROXY_FU0_LOADS      no FU doing non-memory work, >=1 load in flight  == the FU proxy
+     MEMPROXY_FU0_NOLOADS    no FU working, no load in flight
+     MEMPROXY_FUBUSY_LOADS   some FU working while a load is in flight
+     MEMPROXY_FUBUSY_NOLOADS some FU working, no load in flight
+
+     MEMPROXY_FU0_LOAD1      SUB-COUNT of MEMPROXY_FU0_LOADS: nothing executing and EXACTLY ONE
+                             load outstanding, i.e. MLP 1 -- the isolated miss, where the machine
+                             pays the miss's full latency with nothing to overlap it. NOT a fifth
+                             cell of the partition, so do NOT add it into the sum-to-NODE_CYCLE
+                             check; the >=2 complement is MEMPROXY_FU0_LOADS - MEMPROXY_FU0_LOAD1.
+                             This is the same population --mlp_cost_stats charges 1/N = 1 to.
+
+     MEMPROXY_AGREE_BOUND    both proxies say memory-bound
+     MEMPROXY_AGREE_NOT      both say not
+     MEMPROXY_ONLY_BACKEND   incumbent says bound, the execution units say otherwise -- the
+                             cycles the current definition adds, e.g. a rename-local stall
+     MEMPROXY_ONLY_FU        nothing executing with a load outstanding, but rename was still
+                             consuming, so the incumbent does not count it
+
+   MEMPROXY_AGREE is AGREE_BOUND + AGREE_NOT, i.e. "the proxies agreed this cycle", kept as one
+   number so agreement can be read without summing. It is deliberately redundant with the pair
+   above and must equal their sum.
+
+   WINDOW: ungated DEF_STAT counters -- _count is target-only, _total_count spans warmup. Divide
+   by NODE_CYCLE (also ungated), never by Periodic_*. */
+DEF_STAT(  MEMPROXY_FU0_LOADS               , COUNT, NO_RATIO  )
+DEF_STAT(  MEMPROXY_FU0_LOAD1               , COUNT, NO_RATIO  )
+DEF_STAT(  MEMPROXY_FU0_NOLOADS             , COUNT, NO_RATIO  )
+DEF_STAT(  MEMPROXY_FUBUSY_LOADS            , COUNT, NO_RATIO  )
+DEF_STAT(  MEMPROXY_FUBUSY_NOLOADS          , COUNT, NO_RATIO  )
+DEF_STAT(  MEMPROXY_AGREE_BOUND             , COUNT, NO_RATIO  )
+DEF_STAT(  MEMPROXY_AGREE_NOT               , COUNT, NO_RATIO  )
+DEF_STAT(  MEMPROXY_ONLY_BACKEND            , COUNT, NO_RATIO  )
+DEF_STAT(  MEMPROXY_ONLY_FU                 , COUNT, NO_RATIO  )
+DEF_STAT(  MEMPROXY_AGREE                   , COUNT, NO_RATIO  )
 DEF_STAT(  FU_STARVED,         RATIO,  NODE_CYCLE     )
 DEF_STAT(  CHIP_UTILIZATION,   RATIO,  NODE_CYCLE     )
 DEF_STAT(  CYCLES_UNDER_MEM_REQ,                       COUNT,  NO_RATIO       )

@@ -42,6 +42,7 @@
 #include "globals/utils.h"
 
 #include "dcache_stage.h"
+#include "exec_stage.h"  // --memproxy_stats: exec->fus_busy, the FU-based proxy's stall term
 #include "icache_stage.h"
 #include "idq_stage.h"
 #include "lsq.h"
@@ -149,10 +150,49 @@ void topdown_idq_update(uns proc_id, int count_available, int count_issued, int 
      instead of as a knob that was never turned on. */
   if (TD_LOAD_TRACK_ENABLE || TD_LOAD_EVICT_TRACK || TD_LOAD_RRIP_MARK || TD_COMBINED_ON_MLC ||
       TD_COMBINED_ON_L1 || MEMBOUND_STATS || MARKED_LOAD_RECORD || MLP_LIN_DATA_LAMBDA != 0.0 ||
-      TD_LOAD_WINDOW_STATS) {
+      TD_LOAD_WINDOW_STATS || MEMPROXY_STATS) {
     Flag backend_stall = (count_issued == 0 && idq_stage_get_stage_data()->op_count > 0);
-    Flag mem_bound_cycle = backend_stall && (lsq_get_in_flight_load_num() > 0);
+    const int in_flight = lsq_get_in_flight_load_num();
+    Flag mem_bound_cycle = backend_stall && (in_flight > 0);
     lsq_tag_inflight_loads(mem_bound_cycle);
+
+    /* --memproxy_stats: the incumbent proxy above against the FU-based one, on THIS cycle and
+       off THIS SINGLE load-queue sample -- `in_flight` is read once and shared, so the two
+       proxies differ only in their stall term and not in when they looked at the LSQ. That is
+       why this lives here and not in update_exec_stage: the back end updates in reverse pipeline
+       order, so lsq_commit in update_node_stage can retire entries between the two stages.
+       exec->fus_busy is already final for this cycle by the time the IDQ stage runs. */
+    if (MEMPROXY_STATS) {
+      const Flag loads = (in_flight > 0);
+      const Flag fu_idle = (exec->fus_busy == 0);
+      const Flag fu_proxy = fu_idle && loads;
+
+      /* 2x2 over every cycle; these four partition NODE_CYCLE. */
+      if (fu_idle)
+        STAT_EVENT(proc_id, loads ? MEMPROXY_FU0_LOADS : MEMPROXY_FU0_NOLOADS);
+      else
+        STAT_EVENT(proc_id, loads ? MEMPROXY_FUBUSY_LOADS : MEMPROXY_FUBUSY_NOLOADS);
+
+      /* The ISOLATED-MISS arm: nothing executing and EXACTLY ONE load outstanding, i.e. MLP 1.
+         A SUB-COUNT of MEMPROXY_FU0_LOADS, not a fifth cell of the partition above -- it must
+         not be added into the sum-to-NODE_CYCLE check, and the >=2 complement is
+         MEMPROXY_FU0_LOADS - MEMPROXY_FU0_LOAD1.
+
+         Worth separating because these cycles are where a miss costs the machine its full
+         latency: with one load outstanding there is nothing to overlap it with, which is exactly
+         the population the MLP-aware cost model (--mlp_cost_stats, Algorithm 1) charges 1/N = 1
+         to. The rest of MEMPROXY_FU0_LOADS is stalled-but-overlapped. */
+      if (fu_idle && in_flight == 1)
+        STAT_EVENT(proc_id, MEMPROXY_FU0_LOAD1);
+
+      /* Where the two proxies land; these four also partition NODE_CYCLE. */
+      if (mem_bound_cycle == fu_proxy) {
+        STAT_EVENT(proc_id, mem_bound_cycle ? MEMPROXY_AGREE_BOUND : MEMPROXY_AGREE_NOT);
+        STAT_EVENT(proc_id, MEMPROXY_AGREE);
+      } else {
+        STAT_EVENT(proc_id, mem_bound_cycle ? MEMPROXY_ONLY_BACKEND : MEMPROXY_ONLY_FU);
+      }
+    }
   }
 
   // td_fe_rrip_*: credit the demand icache miss the front end is blocked on. A front-end-
