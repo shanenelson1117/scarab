@@ -425,7 +425,8 @@ static inline void reuse_dist_count_evict(uns8 proc_id, Cache* cache, Flag is_ml
    can also count the miss and its merges. */
 static inline void membound_classify_fill(Mem_Req* req, Flag* is_membound, Flag* is_fe_bound,
                                           double* bound_frac, Flag* have_frac, Counter* out_window,
-                                          double* out_fu0_frac, double* out_fu_wait_frac) {
+                                          double* out_fu0_frac, double* out_fu_wait_frac,
+                                          double* out_policy_frac) {
   *is_membound = FALSE;
   *is_fe_bound = FALSE;
   *bound_frac = 0.0;
@@ -444,6 +445,11 @@ static inline void membound_classify_fill(Mem_Req* req, Flag* is_membound, Flag*
   /* The sharpened form: dependence-stall cycles only (nothing ready to schedule). */
   if (out_fu_wait_frac)
     *out_fu_wait_frac = 0.0;
+  /* --mlp_lin_bound_signal: the one the POLICY consumes, selected below. Kept separate from
+     *bound_frac so the measurement chains keep reporting the membound signal whatever the knob
+     says, and a sweep over it stays comparable against a fixed set of histograms. */
+  if (out_policy_frac)
+    *out_policy_frac = 0.0;
   /* REPL_MLP's boundness term reads membound_fill / fe_bound_fill / bound_frac, all of which
      are written from here. Gating this on --membound_stats alone would mean forgetting that
      knob turns the policy's second term off SILENTLY -- no error, just a sweep where every
@@ -462,6 +468,10 @@ static inline void membound_classify_fill(Mem_Req* req, Flag* is_membound, Flag*
     if (icache_fe_frac_for_line(req->proc_id, req->addr, &fe_frac)) {
       *bound_frac = fe_frac;
       *have_frac = TRUE;
+      /* Instruction fills have no load window, so --mlp_lin_bound_signal does not apply here;
+         the FE fraction is the policy's value on this path whatever the knob says. */
+      if (out_policy_frac)
+        *out_policy_frac = fe_frac;
       if (fe_frac > (double)TD_FE_RRIP_THRESH)
         *is_fe_bound = TRUE;
     }
@@ -485,7 +495,21 @@ static inline void membound_classify_fill(Mem_Req* req, Flag* is_membound, Flag*
       if (out_fu_wait_frac && frac_op && frac_op->td_window_cycles)
         *out_fu_wait_frac =
             (double)frac_op->td_fu_wait_cycles / (double)frac_op->td_window_cycles;
-      if (frac > (double)TD_LOAD_REPLAY_THRESH)
+      /* --mlp_lin_bound_signal: pick the signal the policy sees. All three share this load and
+         this denominator, so selecting one swaps the numerator and nothing else. The MARK is
+         derived from the SELECTED fraction, against the same --td_load_replay_thresh gate, so
+         the threshold keeps its meaning across the three. Out of range falls back to MEMBOUND,
+         which is also the default -- init_memory asserts the range so that cannot pass silently. */
+      double policy_frac = frac;
+      if (frac_op && frac_op->td_window_cycles) {
+        if (MLP_LIN_BOUND_SIGNAL == BOUND_SIGNAL_FU0)
+          policy_frac = (double)frac_op->td_fu0_cycles / (double)frac_op->td_window_cycles;
+        else if (MLP_LIN_BOUND_SIGNAL == BOUND_SIGNAL_FU_WAIT)
+          policy_frac = (double)frac_op->td_fu_wait_cycles / (double)frac_op->td_window_cycles;
+      }
+      if (out_policy_frac)
+        *out_policy_frac = policy_frac;
+      if (policy_frac > (double)TD_LOAD_REPLAY_THRESH)
         *is_membound = TRUE;
     }
   }
@@ -1408,6 +1432,13 @@ void init_memory() {
   ASSERTM(0, !(MLP_PAPER_CONFIRM_OFFPATH && MLP_COST_INCLUDE_OFFPATH),
           "--mlp_paper_confirm_offpath and --mlp_cost_include_offpath are mutually exclusive; the former "
           "takes precedence and the latter would be silently ignored.\n");
+  /* --mlp_lin_bound_signal: an out-of-range value would fall back to MEMBOUND inside
+     membound_classify_fill, i.e. a typo would silently run the control arm and look like a real
+     data point. Reject it here instead. */
+  ASSERTM(0, MLP_LIN_BOUND_SIGNAL < NUM_BOUND_SIGNALS,
+          "--mlp_lin_bound_signal %u is out of range; valid values are 0 (MEMBOUND, the default), "
+          "1 (FU0) and 2 (FU_WAIT). See the Bound_Signal enum in memory.h.\n",
+          MLP_LIN_BOUND_SIGNAL);
   ASSERT(0, L1_LINE_SIZE <= L1_INTERLEAVE_FACTOR);
   ASSERT(0, L1_LINE_SIZE <= MLC_INTERLEAVE_FACTOR);
   ASSERT(0, L1_LINE_SIZE <= VA_PAGE_SIZE_BYTES);
@@ -5733,9 +5764,9 @@ Flag l1_fill_line(Mem_Req* req) {
     double bound_frac = 0.0;
     Flag   mb_have_frac = FALSE;
     Counter mb_window = 0;
-    double mb_fu0_frac = 0.0, mb_fu_wait_frac = 0.0;
+    double mb_fu0_frac = 0.0, mb_fu_wait_frac = 0.0, mb_policy_frac = 0.0;
     membound_classify_fill(req, &mb_fill, &fe_fill, &bound_frac, &mb_have_frac, &mb_window,
-                           &mb_fu0_frac, &mb_fu_wait_frac);
+                           &mb_fu0_frac, &mb_fu_wait_frac, &mb_policy_frac);
     /* Stage the bit even during warmup: a line filled before the ROI that is REUSED inside it
        must still be recognisable as membound, or the hit counter would miss it. Only the
        counting below is scoped to the ROI. */
@@ -5744,7 +5775,9 @@ Flag l1_fill_line(Mem_Req* req) {
        cost is the MLP cost of THIS request's MLC miss, so an LLC line carries an MLC-
        denominated cost -- correct as "what the miss that fetched me cost", but not an
        LLC-miss cost, which nothing measures. */
-    cache_set_next_fill_cost(bound_frac, req->mlp_cost);
+    /* --mlp_lin_bound_signal: the line carries the SELECTED signal, which is what
+       mlp_lin_bound_term thresholds. Identical to bound_frac at the default (MEMBOUND). */
+    cache_set_next_fill_cost(mb_policy_frac, req->mlp_cost);
     /* --mlp_lin_pref_lambda: on PARAMS.google this is always an FDIP instruction prefetch, the
        data prefetchers being off. Staged for every fill so the flag is never stale. */
     cache_set_next_fill_prefetch(mem_req_type_is_prefetch(req->type));
@@ -6227,9 +6260,9 @@ Flag mlc_fill_line(Mem_Req* req) {
     double bound_frac = 0.0;
     Flag   mb_have_frac = FALSE;
     Counter mb_window = 0;
-    double mb_fu0_frac = 0.0, mb_fu_wait_frac = 0.0;
+    double mb_fu0_frac = 0.0, mb_fu_wait_frac = 0.0, mb_policy_frac = 0.0;
     membound_classify_fill(req, &mb_fill, &fe_fill, &bound_frac, &mb_have_frac, &mb_window,
-                           &mb_fu0_frac, &mb_fu_wait_frac);
+                           &mb_fu0_frac, &mb_fu_wait_frac, &mb_policy_frac);
     /* Stage the bit even during warmup: a line filled before the ROI that is REUSED inside it
        must still be recognisable as membound, or the hit counter would miss it. Only the
        counting below is scoped to the ROI. */
@@ -6238,7 +6271,9 @@ Flag mlc_fill_line(Mem_Req* req) {
        cost is the MLP cost of THIS request's MLC miss, so an LLC line carries an MLC-
        denominated cost -- correct as "what the miss that fetched me cost", but not an
        LLC-miss cost, which nothing measures. */
-    cache_set_next_fill_cost(bound_frac, req->mlp_cost);
+    /* --mlp_lin_bound_signal: the line carries the SELECTED signal, which is what
+       mlp_lin_bound_term thresholds. Identical to bound_frac at the default (MEMBOUND). */
+    cache_set_next_fill_cost(mb_policy_frac, req->mlp_cost);
     /* --mlp_lin_pref_lambda: on PARAMS.google this is always an FDIP instruction prefetch, the
        data prefetchers being off. Staged for every fill so the flag is never stale. */
     cache_set_next_fill_prefetch(mem_req_type_is_prefetch(req->type));

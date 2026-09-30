@@ -237,6 +237,24 @@ void update_memory(void);
 
 void mlp_cost_update_cycle(void);
 void mlp_cost_finalize(Mem_Req* req);
+/* --mlp_lin_bound_signal: which per-load stall signal REPL_MLP's boundness term consumes.
+ *
+ * All three are the SAME load's window with the SAME denominator (td_window_cycles); they differ
+ * only in which cycles the numerator counts. Selecting one changes ONLY what the policy sees --
+ * the MLC_MEMBOUND_FRAC_* / MLC_FU0_FRAC_* / MLC_FU_WAIT_FRAC_* measurement chains keep
+ * reporting all three regardless, so a sweep over this knob stays comparable against a fixed
+ * set of histograms. */
+typedef enum Bound_Signal_enum {
+  BOUND_SIGNAL_MEMBOUND = 0, /* td_mem_cycles: backend_stall && >=1 load in flight. The DEFAULT,
+                                and what every measurement before this knob existed used. */
+  BOUND_SIGNAL_FU0 = 1,      /* td_fu0_cycles: no FU doing non-memory work && >=1 load in flight.
+                                Measured at the execution units, so it cannot be tripped by
+                                register-file exhaustion at the rename boundary. */
+  BOUND_SIGNAL_FU_WAIT = 2,  /* td_fu_wait_cycles: no FU executing && >=1 op waiting on operands.
+                                A dependence stall stated directly rather than inferred. */
+  NUM_BOUND_SIGNALS
+} Bound_Signal;
+
 /* --mlp_paper_sbar: emit PSEL diagnostics at end of simulation. */
 void mlp_paper_dump_stats(uns8 proc_id);
 
