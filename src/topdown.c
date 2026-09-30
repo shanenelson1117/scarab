@@ -158,7 +158,20 @@ void topdown_idq_update(uns proc_id, int count_available, int count_issued, int 
        unconditionally (not under MEMPROXY_STATS) because lsq_tag_inflight_loads accumulates it
        per load: td_fu0_cycles must cover the whole window or the per-load fraction is wrong. */
     Flag fu0_cycle = (exec->fus_busy == 0) && (in_flight > 0);
-    lsq_tag_inflight_loads(mem_bound_cycle, fu0_cycle);
+    /* THE SIGNAL: no FU is executing an op, AND the scheduling window holds at least one op
+       whose operands are not ready. That is a dependence stall, stated directly rather than
+       inferred -- unlike backend_stall, which reads back-pressure at the IDQ->rename boundary
+       and also fires on register-file exhaustion, and unlike bare fus_busy == 0, which cannot
+       tell a dependence stall from a structural one or from front-end starvation.
+
+       node_ops_waiting_on_operands() is exact: an op joins rdy_head exactly when its sources
+       become ready, so every RS occupant outside that list is still waiting on one.
+
+       Deliberately NOT conditioned on a load being in flight -- the operands could be coming
+       from a long-latency ALU chain. MEMPROXY_FU0_WAIT_LOADS below adds that term, and the
+       difference between the two counters is the non-memory share. */
+    Flag fu_wait_cycle = (exec->fus_busy == 0) && node_ops_waiting_on_operands();
+    lsq_tag_inflight_loads(mem_bound_cycle, fu0_cycle, fu_wait_cycle);
 
     /* --memproxy_stats: the incumbent proxy above against the FU-based one, on THIS cycle and
        off THIS SINGLE load-queue sample -- `in_flight` is read once and shared, so the two
@@ -188,6 +201,15 @@ void topdown_idq_update(uns proc_id, int count_available, int count_issued, int 
          to. The rest of MEMPROXY_FU0_LOADS is stalled-but-overlapped. */
       if (fu_idle && in_flight == 1)
         STAT_EVENT(proc_id, MEMPROXY_FU0_LOAD1);
+
+      /* THE SIGNAL, per cycle, and its memory-specific form. Both are SUB-COUNTS -- WAIT is not
+         part of the 2x2 (it drops the load term entirely), and WAIT_LOADS is a subset of
+         FU0_LOADS -- so neither may be added into the sum-to-NODE_CYCLE checks. */
+      if (fu_wait_cycle) {
+        STAT_EVENT(proc_id, MEMPROXY_FU0_WAIT);
+        if (loads)
+          STAT_EVENT(proc_id, MEMPROXY_FU0_WAIT_LOADS);
+      }
 
       /* Where the two proxies land; these four also partition NODE_CYCLE. */
       if (mem_bound_cycle == fu_proxy) {

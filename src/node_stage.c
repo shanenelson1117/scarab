@@ -147,6 +147,7 @@ void reset_node_stage() {
   node->node_head = NULL;
   node->node_tail = NULL;
   node->rdy_head = NULL;
+  node->rdy_count = 0;
   node->next_op_into_rs = NULL;
 
   node->node_count = 0;
@@ -203,6 +204,8 @@ void flush_ready_list() {
       ASSERT(node->proc_id, op->op_num > bp_recovery_info->recovery_op_num);
       *last = op->next_rdy;
       op->in_rdy_list = FALSE;
+      node->rdy_count--;
+      ASSERT(node->proc_id, node->rdy_count >= 0);
     } else
       last = &op->next_rdy;
   }
@@ -672,6 +675,22 @@ void node_retire() {
 /**************************************************************************************/
 /* is_node_stage_stalled: returns TRUE if node table is full and there are no
  * ready ops */
+
+/* TRUE when the scheduling window holds at least one op whose operands are not ready.
+ *
+ * Exact, not an estimate: an op joins rdy_head exactly when op_sources_not_rdy_is_clear(op)
+ * becomes true (both entry paths check it), so every RS occupant that is NOT in the ready list
+ * is by definition still waiting on a source. Hence rs_total - rdy_count is that population.
+ *
+ * O(NUM_RS) -- a handful of counters -- rather than walking rdy_head, which is why rdy_count is
+ * maintained at the in_rdy_list transitions instead of being recomputed here. */
+Flag node_ops_waiting_on_operands(void) {
+  int32 rs_total = 0;
+  for (uns rs_id = 0; rs_id < NUM_RS; ++rs_id)
+    rs_total += node->rs[rs_id].rs_op_count;
+  ASSERT(node->proc_id, rs_total >= node->rdy_count);
+  return rs_total > node->rdy_count;
+}
 
 Flag is_node_stage_stalled() {
   return (node->node_count == NODE_TABLE_SIZE) && /* node table is full */

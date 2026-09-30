@@ -50,6 +50,14 @@ typedef struct Node_Stage_struct {
    * or after they are issued and another op wakes them up. */
   Op* rdy_head;
 
+  /* Length of the rdy_head list, maintained O(1) at every in_rdy_list transition so the count is
+     available without walking. BOTH entry paths into the list (node_issue_queue_fill_rs and the
+     wake-up path in cmp_model.c) are gated on op_sources_not_rdy_is_clear(op), i.e. an op joins
+     exactly when its operands become available. That is what makes
+        sum(rs[i].rs_op_count) - rdy_count  ==  ops in the scheduling window WAITING ON OPERANDS
+     an exact identity rather than an approximation -- see node_ops_waiting_on_operands(). */
+  int32 rdy_count;
+
   Counter ret_op;                // next op number to retire
   Counter last_scheduled_opnum;  // op num of the last scheduled op
 
@@ -79,6 +87,9 @@ void recover_node_stage(void);
 void debug_node_stage(void);
 void update_node_stage(Stage_Data*);
 Flag is_node_stage_stalled(void);
+/* TRUE when the scheduling window holds at least one op whose operands are not yet ready.
+ * Exact, by the rdy_count invariant above; O(NUM_RS), no list walk. */
+Flag node_ops_waiting_on_operands(void);
 
 /**************************************************************************************/
 

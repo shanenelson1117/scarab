@@ -54,7 +54,7 @@ int lsq_get_in_flight_load_num();
  * window, increment its td_window_cycles (and td_mem_cycles when mem_bound_cycle,
  * td_fu0_cycles when fu0_cycle). Both flags are the SAME cycle's classification under the two
  * competing memory-bound proxies, so the two per-load fractions stay directly comparable. */
-void lsq_tag_inflight_loads(Flag mem_bound_cycle, Flag fu0_cycle);
+void lsq_tag_inflight_loads(Flag mem_bound_cycle, Flag fu0_cycle, Flag fu_wait_cycle);
 
 #ifdef __cplusplus
 }

@@ -213,6 +213,15 @@ struct Op_struct {
      for the SAME load. The two proxies disagree on ~18% of all cycles; this is what that
      disagreement looks like per load rather than per cycle. */
   Counter td_fu0_cycles;
+  /* THE SIGNAL, per load: the subset of td_window_cycles on which no FU was executing an op AND
+     the scheduling window held at least one op whose operands were not ready -- a dependence
+     stall, stated directly rather than inferred from back-pressure. Exact, because an op joins
+     rdy_head exactly when its sources become ready, so every RS occupant outside that list is
+     still waiting on one (node_ops_waiting_on_operands).
+
+     NOT conditioned on a load being in flight, so this is <= td_fu0_cycles only when a load
+     happens to be outstanding; in general the two are different cuts, not nested. */
+  Counter td_fu_wait_cycles;
   Flag td_forced_l1_hit;    // td_load_replay: load was force-completed at L1 latency; fill must not re-wake it
   Flag td_recorded;         // td_load record: this load's membound row was already emitted (emit once)
   /* --marked_load_replay: the L2 / LLC outcome this load experienced, carried from the access

@@ -425,7 +425,7 @@ static inline void reuse_dist_count_evict(uns8 proc_id, Cache* cache, Flag is_ml
    can also count the miss and its merges. */
 static inline void membound_classify_fill(Mem_Req* req, Flag* is_membound, Flag* is_fe_bound,
                                           double* bound_frac, Flag* have_frac, Counter* out_window,
-                                          double* out_fu0_frac) {
+                                          double* out_fu0_frac, double* out_fu_wait_frac) {
   *is_membound = FALSE;
   *is_fe_bound = FALSE;
   *bound_frac = 0.0;
@@ -441,6 +441,9 @@ static inline void membound_classify_fill(Mem_Req* req, Flag* is_membound, Flag*
      for this load bucket for bucket. */
   if (out_fu0_frac)
     *out_fu0_frac = 0.0;
+  /* The sharpened form: dependence-stall cycles only (nothing ready to schedule). */
+  if (out_fu_wait_frac)
+    *out_fu_wait_frac = 0.0;
   /* REPL_MLP's boundness term reads membound_fill / fe_bound_fill / bound_frac, all of which
      are written from here. Gating this on --membound_stats alone would mean forgetting that
      knob turns the policy's second term off SILENTLY -- no error, just a sweep where every
@@ -479,6 +482,9 @@ static inline void membound_classify_fill(Mem_Req* req, Flag* is_membound, Flag*
         *out_window = frac_op->td_window_cycles;
       if (out_fu0_frac && frac_op && frac_op->td_window_cycles)
         *out_fu0_frac = (double)frac_op->td_fu0_cycles / (double)frac_op->td_window_cycles;
+      if (out_fu_wait_frac && frac_op && frac_op->td_window_cycles)
+        *out_fu_wait_frac =
+            (double)frac_op->td_fu_wait_cycles / (double)frac_op->td_window_cycles;
       if (frac > (double)TD_LOAD_REPLAY_THRESH)
         *is_membound = TRUE;
     }
@@ -5727,9 +5733,9 @@ Flag l1_fill_line(Mem_Req* req) {
     double bound_frac = 0.0;
     Flag   mb_have_frac = FALSE;
     Counter mb_window = 0;
-    double mb_fu0_frac = 0.0;
+    double mb_fu0_frac = 0.0, mb_fu_wait_frac = 0.0;
     membound_classify_fill(req, &mb_fill, &fe_fill, &bound_frac, &mb_have_frac, &mb_window,
-                           &mb_fu0_frac);
+                           &mb_fu0_frac, &mb_fu_wait_frac);
     /* Stage the bit even during warmup: a line filled before the ROI that is REUSED inside it
        must still be recognisable as membound, or the hit counter would miss it. Only the
        counting below is scoped to the ROI. */
@@ -6221,9 +6227,9 @@ Flag mlc_fill_line(Mem_Req* req) {
     double bound_frac = 0.0;
     Flag   mb_have_frac = FALSE;
     Counter mb_window = 0;
-    double mb_fu0_frac = 0.0;
+    double mb_fu0_frac = 0.0, mb_fu_wait_frac = 0.0;
     membound_classify_fill(req, &mb_fill, &fe_fill, &bound_frac, &mb_have_frac, &mb_window,
-                           &mb_fu0_frac);
+                           &mb_fu0_frac, &mb_fu_wait_frac);
     /* Stage the bit even during warmup: a line filled before the ROI that is REUSED inside it
        must still be recognisable as membound, or the hit counter would miss it. Only the
        counting below is scoped to the ROI. */
@@ -6261,9 +6267,15 @@ Flag mlc_fill_line(Mem_Req* req) {
            shape is the two proxies disagreeing, not two different sets of loads. Data side only;
            the instruction side has no load window, and it shares MLC_MEMBOUND_FRAC_NONE rather
            than carrying a duplicate _NONE counter of its own. */
-        if (req->type != MRT_IFETCH)
+        if (req->type != MRT_IFETCH) {
           STAT_EVENT(req->proc_id,
                      MLC_FU0_FRAC_0 + (uns)MIN2((uns64)(mb_fu0_frac * 20.0), (uns64)19));
+          /* Sharpened: dependence-stall cycles only. Same buckets, same denominator, same
+             population -- so all three chains (MEMBOUND / FU0 / FU_WAIT) are comparable bucket
+             for bucket for the SAME loads. */
+          STAT_EVENT(req->proc_id,
+                     MLC_FU_WAIT_FRAC_0 + (uns)MIN2((uns64)(mb_fu_wait_frac * 20.0), (uns64)19));
+        }
       } else {
         STAT_EVENT(req->proc_id,
                    req->type == MRT_IFETCH ? MLC_FEBOUND_FRAC_NONE : MLC_MEMBOUND_FRAC_NONE);

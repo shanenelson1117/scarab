@@ -361,6 +361,7 @@ void cmp_wake(Op* src_op, Op* dep_op, uns rdy_bit) {
     dep_op->next_rdy = node->rdy_head;
     node->rdy_head = dep_op;
     dep_op->in_rdy_list = TRUE;
+    node->rdy_count++;
   }
 }
 

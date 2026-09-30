@@ -239,6 +239,8 @@ void node_issue_queue_clear() {
           disasm_op(op, TRUE), op->engine_info.l1_miss);
     *last = op->next_rdy;
     op->in_rdy_list = FALSE;
+    node->rdy_count--;  /* keep rdy_count == list length; see node_stage.h */
+    ASSERT(node->proc_id, node->rdy_count >= 0);
     ASSERT(node->proc_id, node->rs[op->rs_id].rs_op_count > 0);
     node->rs[op->rs_id].rs_op_count--;
     STAT_EVENT(node->proc_id, OP_ISSUED);
@@ -282,6 +284,7 @@ void node_issue_queue_dispatch() {
       op->next_rdy = node->rdy_head;
       node->rdy_head = op;
       op->in_rdy_list = TRUE;
+      node->rdy_count++;
     }
 
     // maximum number of operations to fill into the RS per cycle (0 = unlimited)

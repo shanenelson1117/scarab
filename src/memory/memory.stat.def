@@ -2782,6 +2782,36 @@ DEF_STAT(  MLC_FU0_FRAC_85                       , COUNT, NO_RATIO  )
 DEF_STAT(  MLC_FU0_FRAC_90                       , COUNT, NO_RATIO  )
 DEF_STAT(  MLC_FU0_FRAC_95                       , DIST , NO_RATIO  )
 
+/* MLC_FU_WAIT_FRAC_*: the SHARPENED FU proxy's per-load fraction,
+   td_fu_wait_cycles / td_window_cycles -- the share of a load's window on which nothing
+   executed AND nothing was even ready to schedule (a dependence stall), as opposed to
+   MLC_FU0_FRAC_* which also counts structural stalls and front-end starvation.
+
+   Same buckets, same denominator, same emission site, same population as MLC_MEMBOUND_FRAC_* and
+   MLC_FU0_FRAC_*, so all THREE chains are comparable bucket for bucket for the SAME loads.
+   Ordering is guaranteed per load: NR <= FU0, and NR vs MEMBOUND is the open question.
+   Shares MLC_MEMBOUND_FRAC_NONE. Data side only. ROI-gated with the membound block. */
+DEF_STAT(  MLC_FU_WAIT_FRAC_0                     , DIST , NO_RATIO  )
+DEF_STAT(  MLC_FU_WAIT_FRAC_5                     , COUNT, NO_RATIO  )
+DEF_STAT(  MLC_FU_WAIT_FRAC_10                    , COUNT, NO_RATIO  )
+DEF_STAT(  MLC_FU_WAIT_FRAC_15                    , COUNT, NO_RATIO  )
+DEF_STAT(  MLC_FU_WAIT_FRAC_20                    , COUNT, NO_RATIO  )
+DEF_STAT(  MLC_FU_WAIT_FRAC_25                    , COUNT, NO_RATIO  )
+DEF_STAT(  MLC_FU_WAIT_FRAC_30                    , COUNT, NO_RATIO  )
+DEF_STAT(  MLC_FU_WAIT_FRAC_35                    , COUNT, NO_RATIO  )
+DEF_STAT(  MLC_FU_WAIT_FRAC_40                    , COUNT, NO_RATIO  )
+DEF_STAT(  MLC_FU_WAIT_FRAC_45                    , COUNT, NO_RATIO  )
+DEF_STAT(  MLC_FU_WAIT_FRAC_50                    , COUNT, NO_RATIO  )
+DEF_STAT(  MLC_FU_WAIT_FRAC_55                    , COUNT, NO_RATIO  )
+DEF_STAT(  MLC_FU_WAIT_FRAC_60                    , COUNT, NO_RATIO  )
+DEF_STAT(  MLC_FU_WAIT_FRAC_65                    , COUNT, NO_RATIO  )
+DEF_STAT(  MLC_FU_WAIT_FRAC_70                    , COUNT, NO_RATIO  )
+DEF_STAT(  MLC_FU_WAIT_FRAC_75                    , COUNT, NO_RATIO  )
+DEF_STAT(  MLC_FU_WAIT_FRAC_80                    , COUNT, NO_RATIO  )
+DEF_STAT(  MLC_FU_WAIT_FRAC_85                    , COUNT, NO_RATIO  )
+DEF_STAT(  MLC_FU_WAIT_FRAC_90                    , COUNT, NO_RATIO  )
+DEF_STAT(  MLC_FU_WAIT_FRAC_95                    , DIST , NO_RATIO  )
+
 /* --td_load_window_stats: distribution of td_window_cycles -- the DENOMINATOR of every membound
    fraction. Counters only; the per-load CSVs stay on --td_load_track_enable alone.
 

@@ -694,6 +694,19 @@ DEF_STAT(  FUS_UNAVAIL_DIST_20MORE     , DIST , NO_RATIO  )
      MEMPROXY_FUBUSY_LOADS   some FU working while a load is in flight
      MEMPROXY_FUBUSY_NOLOADS some FU working, no load in flight
 
+     MEMPROXY_FU0_WAIT       THE SIGNAL: no FU executing an op AND the scheduling window holds
+                             at least one op whose operands are not ready -- a dependence stall,
+                             stated directly rather than inferred. Exact: an op joins rdy_head
+                             exactly when op_sources_not_rdy_is_clear(op) becomes true, so every
+                             RS occupant outside that list is still waiting on a source
+                             (node_ops_waiting_on_operands). NOT conditioned on a load being in
+                             flight -- the operands may be coming from a long-latency ALU chain.
+     MEMPROXY_FU0_WAIT_LOADS the same with >=1 load in flight, i.e. the memory-specific form.
+                             WAIT - WAIT_LOADS is the non-memory share.
+                             BOTH ARE SUB-COUNTS: WAIT is not part of the 2x2 (it drops the load
+                             term), WAIT_LOADS is a subset of FU0_LOADS. Neither may be added
+                             into the sum-to-NODE_CYCLE checks.
+
      MEMPROXY_FU0_LOAD1      SUB-COUNT of MEMPROXY_FU0_LOADS: nothing executing and EXACTLY ONE
                              load outstanding, i.e. MLP 1 -- the isolated miss, where the machine
                              pays the miss's full latency with nothing to overlap it. NOT a fifth
@@ -716,6 +729,8 @@ DEF_STAT(  FUS_UNAVAIL_DIST_20MORE     , DIST , NO_RATIO  )
    by NODE_CYCLE (also ungated), never by Periodic_*. */
 DEF_STAT(  MEMPROXY_FU0_LOADS               , COUNT, NO_RATIO  )
 DEF_STAT(  MEMPROXY_FU0_LOAD1               , COUNT, NO_RATIO  )
+DEF_STAT(  MEMPROXY_FU0_WAIT                 , COUNT, NO_RATIO  )
+DEF_STAT(  MEMPROXY_FU0_WAIT_LOADS           , COUNT, NO_RATIO  )
 DEF_STAT(  MEMPROXY_FU0_NOLOADS             , COUNT, NO_RATIO  )
 DEF_STAT(  MEMPROXY_FUBUSY_LOADS            , COUNT, NO_RATIO  )
 DEF_STAT(  MEMPROXY_FUBUSY_NOLOADS          , COUNT, NO_RATIO  )
