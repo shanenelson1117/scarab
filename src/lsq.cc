@@ -350,7 +350,7 @@ int lsq_get_in_flight_load_num() {
   return in_flight_num;
 }
 
-void lsq_tag_inflight_loads(Flag mem_bound_cycle) {
+void lsq_tag_inflight_loads(Flag mem_bound_cycle, Flag fu0_cycle) {
   if (!LSQ_ENABLE)
     return;
 
@@ -402,6 +402,9 @@ void lsq_tag_inflight_loads(Flag mem_bound_cycle) {
     op->td_window_cycles++;
     if (mem_bound_cycle)
       op->td_mem_cycles++;
+    /* The FU-based proxy's verdict for the same cycle, accumulated over the same window. */
+    if (fu0_cycle)
+      op->td_fu0_cycles++;
 
     // --td_load_window_scope 1: credit only the LQ head, i.e. the oldest load still in its
     // window. entries is a deque in dispatch order (allocate pushes back, free pops front and

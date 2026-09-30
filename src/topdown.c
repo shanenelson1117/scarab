@@ -154,7 +154,11 @@ void topdown_idq_update(uns proc_id, int count_available, int count_issued, int 
     Flag backend_stall = (count_issued == 0 && idq_stage_get_stage_data()->op_count > 0);
     const int in_flight = lsq_get_in_flight_load_num();
     Flag mem_bound_cycle = backend_stall && (in_flight > 0);
-    lsq_tag_inflight_loads(mem_bound_cycle);
+    /* The FU-based proxy's verdict for this same cycle, off this same load-queue sample. Computed
+       unconditionally (not under MEMPROXY_STATS) because lsq_tag_inflight_loads accumulates it
+       per load: td_fu0_cycles must cover the whole window or the per-load fraction is wrong. */
+    Flag fu0_cycle = (exec->fus_busy == 0) && (in_flight > 0);
+    lsq_tag_inflight_loads(mem_bound_cycle, fu0_cycle);
 
     /* --memproxy_stats: the incumbent proxy above against the FU-based one, on THIS cycle and
        off THIS SINGLE load-queue sample -- `in_flight` is read once and shared, so the two
@@ -165,7 +169,7 @@ void topdown_idq_update(uns proc_id, int count_available, int count_issued, int 
     if (MEMPROXY_STATS) {
       const Flag loads = (in_flight > 0);
       const Flag fu_idle = (exec->fus_busy == 0);
-      const Flag fu_proxy = fu_idle && loads;
+      const Flag fu_proxy = fu0_cycle;  // same expression, computed once above
 
       /* 2x2 over every cycle; these four partition NODE_CYCLE. */
       if (fu_idle)

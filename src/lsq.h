@@ -51,8 +51,10 @@ void lsq_commit(Op* mem_op);            // free the entry when the mem op is ret
 int lsq_get_in_flight_load_num();
 
 /* top-down per-load tracking: for every on-path load still in its dispatch->done
- * window, increment its td_window_cycles (and td_mem_cycles when mem_bound_cycle). */
-void lsq_tag_inflight_loads(Flag mem_bound_cycle);
+ * window, increment its td_window_cycles (and td_mem_cycles when mem_bound_cycle,
+ * td_fu0_cycles when fu0_cycle). Both flags are the SAME cycle's classification under the two
+ * competing memory-bound proxies, so the two per-load fractions stay directly comparable. */
+void lsq_tag_inflight_loads(Flag mem_bound_cycle, Flag fu0_cycle);
 
 #ifdef __cplusplus
 }

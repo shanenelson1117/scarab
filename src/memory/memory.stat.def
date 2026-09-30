@@ -2739,6 +2739,49 @@ DEF_STAT(  MLC_FEBOUND_FRAC_95                , DIST   , NO_RATIO  )
 DEF_STAT(  MLC_MEMBOUND_FRAC_NONE                 , COUNT  , NO_RATIO  )
 DEF_STAT(  MLC_FEBOUND_FRAC_NONE                  , COUNT  , NO_RATIO  )
 
+/* MLC_FU0_FRAC_*: the FU-BASED proxy's per-load fraction, td_fu0_cycles / td_window_cycles --
+   the share of a load's window on which NO functional unit was doing non-memory work while a
+   load was in flight (exec->fus_busy == 0 && loads > 0, the same condition MEMPROXY_FU0_LOADS
+   counts per cycle).
+
+   THE POINT IS THE PAIRING WITH MLC_MEMBOUND_FRAC_*. Same buckets (0.05 wide, named by lower
+   edge in percent, indexed MLC_FU0_FRAC_0 + MIN2(frac*20, 19)), same denominator
+   (td_window_cycles), same emission site, same gate, same mb_have_frac population, same fill.
+   So the two chains are comparable BUCKET FOR BUCKET and any difference in shape is the two
+   memory-bound proxies disagreeing about the same loads -- not two different sets of loads.
+   Per-cycle the proxies disagree on ~18% of cycles in both directions; this is what that looks
+   like per load, which is the form the marking threshold actually consumes.
+
+   NO _NONE COUNTER of its own: the population is identical to the membound chain's, so
+   MLC_MEMBOUND_FRAC_NONE already counts the fills with no load fraction. Data side only -- an
+   MRT_IFETCH fill has no load window.
+
+   CAVEAT, inherited from the membound chain: this is the PARTIAL window at fill time, since the
+   load is still waiting on the very fill being classified. MLC_FILL_WINDOW_CYCLES_* is the
+   denominator's distribution at that instant.
+
+   WINDOW: ROI-gated with the rest of the membound block, so _count == _total_count. */
+DEF_STAT(  MLC_FU0_FRAC_0                        , DIST , NO_RATIO  )
+DEF_STAT(  MLC_FU0_FRAC_5                        , COUNT, NO_RATIO  )
+DEF_STAT(  MLC_FU0_FRAC_10                       , COUNT, NO_RATIO  )
+DEF_STAT(  MLC_FU0_FRAC_15                       , COUNT, NO_RATIO  )
+DEF_STAT(  MLC_FU0_FRAC_20                       , COUNT, NO_RATIO  )
+DEF_STAT(  MLC_FU0_FRAC_25                       , COUNT, NO_RATIO  )
+DEF_STAT(  MLC_FU0_FRAC_30                       , COUNT, NO_RATIO  )
+DEF_STAT(  MLC_FU0_FRAC_35                       , COUNT, NO_RATIO  )
+DEF_STAT(  MLC_FU0_FRAC_40                       , COUNT, NO_RATIO  )
+DEF_STAT(  MLC_FU0_FRAC_45                       , COUNT, NO_RATIO  )
+DEF_STAT(  MLC_FU0_FRAC_50                       , COUNT, NO_RATIO  )
+DEF_STAT(  MLC_FU0_FRAC_55                       , COUNT, NO_RATIO  )
+DEF_STAT(  MLC_FU0_FRAC_60                       , COUNT, NO_RATIO  )
+DEF_STAT(  MLC_FU0_FRAC_65                       , COUNT, NO_RATIO  )
+DEF_STAT(  MLC_FU0_FRAC_70                       , COUNT, NO_RATIO  )
+DEF_STAT(  MLC_FU0_FRAC_75                       , COUNT, NO_RATIO  )
+DEF_STAT(  MLC_FU0_FRAC_80                       , COUNT, NO_RATIO  )
+DEF_STAT(  MLC_FU0_FRAC_85                       , COUNT, NO_RATIO  )
+DEF_STAT(  MLC_FU0_FRAC_90                       , COUNT, NO_RATIO  )
+DEF_STAT(  MLC_FU0_FRAC_95                       , DIST , NO_RATIO  )
+
 /* --td_load_window_stats: distribution of td_window_cycles -- the DENOMINATOR of every membound
    fraction. Counters only; the per-load CSVs stay on --td_load_track_enable alone.
 
