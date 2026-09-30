@@ -602,6 +602,82 @@ DEF_STAT(  FU_UNAVAILABLE,     RATIO,  NODE_CYCLE     )
 DEF_STAT(  FU_MEM_UNAVAILABLE, RATIO,  NODE_CYCLE     )
 DEF_STAT(  FU_OTHER_UNAVAILABLE, RATIO,  NODE_CYCLE     )
 DEF_STAT(  FU_REPLAY,          RATIO,  NODE_CYCLE     )
+
+/* Per-cycle FUNCTIONAL-UNIT OCCUPANCY DISTRIBUTION. The counters above are sums -- one event per
+   busy FU per cycle -- so they give the MEAN number of FUs busy and nothing about its shape.
+   These give the shape: bucket k counts cycles on which exactly k units were counted, so
+   "steadily 2 of 10 busy" and "alternating 0 and 4" are finally distinguishable. Emitted once
+   per cycle from update_exec_stage, off the same two counts topdown_exec_update consumes.
+
+   TWO CHAINS, because that loop computes two different notions of busy and they are not the
+   same number. Their DIFFERENCE is the memory-held population:
+
+   FUS_BUSY_DIST_*     from exec->fus_busy: units with an op somewhere in their pipeline
+                       (idle_cycle > cycle_count) EXCLUDING those the memory system has stalled
+                       (held_by_mem). This is "units doing real non-memory work" -- the count
+                       whose own field comment reads "does not include mem stalls".
+   FUS_UNAVAIL_DIST_*  from fu_busy_num: units that cannot accept a new op this cycle
+                       (avail_cycle > cycle_count), memory-held ones included. This is the count
+                       TOPDOWN_EXEC_STALLS_CYCLES thresholds against --topdown_fu_exec_few.
+
+   WHY BOTH MATTER HERE. FUS_BUSY_DIST_0 is cycles where NO unit was doing non-memory work, which
+   is a far more direct "the machine is not executing" signal than the backend_stall proxy in
+   topdown_idq_update -- that one infers a stall from back-pressure at the IDQ->rename boundary
+   and so also fires on register-file exhaustion in update_map_stage, which has nothing to do
+   with memory. Read FUS_BUSY_DIST_0 against TOPDOWN_MEM_LOAD_STALLS_CYCLES to see how far apart
+   the two proxies actually are.
+
+   The chain is indexed as <CHAIN>_0 + MIN2(count, 20) and the last bucket SATURATES. NUM_FUS is
+   derived at runtime from --fu_types (num_tokens in param_parser.c) and is NOT asserted to be
+   <= 20 anywhere, so the clamp is load-bearing -- note the neighbouring FU_BUSY_0 + ii chain has
+   no such clamp and would run past FU_BUSY_19 on a topology with more than 20 ports.
+
+   WINDOW: ungated, like every FU counter above. _count is target-only, _total_count spans
+   warmup; divide by NODE_CYCLE (also ungated) and never by Periodic_*. */
+
+DEF_STAT(  FUS_BUSY_DIST_0             , DIST , NO_RATIO  )
+DEF_STAT(  FUS_BUSY_DIST_1             , COUNT, NO_RATIO  )
+DEF_STAT(  FUS_BUSY_DIST_2             , COUNT, NO_RATIO  )
+DEF_STAT(  FUS_BUSY_DIST_3             , COUNT, NO_RATIO  )
+DEF_STAT(  FUS_BUSY_DIST_4             , COUNT, NO_RATIO  )
+DEF_STAT(  FUS_BUSY_DIST_5             , COUNT, NO_RATIO  )
+DEF_STAT(  FUS_BUSY_DIST_6             , COUNT, NO_RATIO  )
+DEF_STAT(  FUS_BUSY_DIST_7             , COUNT, NO_RATIO  )
+DEF_STAT(  FUS_BUSY_DIST_8             , COUNT, NO_RATIO  )
+DEF_STAT(  FUS_BUSY_DIST_9             , COUNT, NO_RATIO  )
+DEF_STAT(  FUS_BUSY_DIST_10            , COUNT, NO_RATIO  )
+DEF_STAT(  FUS_BUSY_DIST_11            , COUNT, NO_RATIO  )
+DEF_STAT(  FUS_BUSY_DIST_12            , COUNT, NO_RATIO  )
+DEF_STAT(  FUS_BUSY_DIST_13            , COUNT, NO_RATIO  )
+DEF_STAT(  FUS_BUSY_DIST_14            , COUNT, NO_RATIO  )
+DEF_STAT(  FUS_BUSY_DIST_15            , COUNT, NO_RATIO  )
+DEF_STAT(  FUS_BUSY_DIST_16            , COUNT, NO_RATIO  )
+DEF_STAT(  FUS_BUSY_DIST_17            , COUNT, NO_RATIO  )
+DEF_STAT(  FUS_BUSY_DIST_18            , COUNT, NO_RATIO  )
+DEF_STAT(  FUS_BUSY_DIST_19            , COUNT, NO_RATIO  )
+DEF_STAT(  FUS_BUSY_DIST_20MORE        , DIST , NO_RATIO  )
+
+DEF_STAT(  FUS_UNAVAIL_DIST_0          , DIST , NO_RATIO  )
+DEF_STAT(  FUS_UNAVAIL_DIST_1          , COUNT, NO_RATIO  )
+DEF_STAT(  FUS_UNAVAIL_DIST_2          , COUNT, NO_RATIO  )
+DEF_STAT(  FUS_UNAVAIL_DIST_3          , COUNT, NO_RATIO  )
+DEF_STAT(  FUS_UNAVAIL_DIST_4          , COUNT, NO_RATIO  )
+DEF_STAT(  FUS_UNAVAIL_DIST_5          , COUNT, NO_RATIO  )
+DEF_STAT(  FUS_UNAVAIL_DIST_6          , COUNT, NO_RATIO  )
+DEF_STAT(  FUS_UNAVAIL_DIST_7          , COUNT, NO_RATIO  )
+DEF_STAT(  FUS_UNAVAIL_DIST_8          , COUNT, NO_RATIO  )
+DEF_STAT(  FUS_UNAVAIL_DIST_9          , COUNT, NO_RATIO  )
+DEF_STAT(  FUS_UNAVAIL_DIST_10         , COUNT, NO_RATIO  )
+DEF_STAT(  FUS_UNAVAIL_DIST_11         , COUNT, NO_RATIO  )
+DEF_STAT(  FUS_UNAVAIL_DIST_12         , COUNT, NO_RATIO  )
+DEF_STAT(  FUS_UNAVAIL_DIST_13         , COUNT, NO_RATIO  )
+DEF_STAT(  FUS_UNAVAIL_DIST_14         , COUNT, NO_RATIO  )
+DEF_STAT(  FUS_UNAVAIL_DIST_15         , COUNT, NO_RATIO  )
+DEF_STAT(  FUS_UNAVAIL_DIST_16         , COUNT, NO_RATIO  )
+DEF_STAT(  FUS_UNAVAIL_DIST_17         , COUNT, NO_RATIO  )
+DEF_STAT(  FUS_UNAVAIL_DIST_18         , COUNT, NO_RATIO  )
+DEF_STAT(  FUS_UNAVAIL_DIST_19         , COUNT, NO_RATIO  )
+DEF_STAT(  FUS_UNAVAIL_DIST_20MORE     , DIST , NO_RATIO  )
 DEF_STAT(  FU_STARVED,         RATIO,  NODE_CYCLE     )
 DEF_STAT(  CHIP_UTILIZATION,   RATIO,  NODE_CYCLE     )
 DEF_STAT(  CYCLES_UNDER_MEM_REQ,                       COUNT,  NO_RATIO       )

@@ -122,6 +122,35 @@ DEF_PARAM(core_63_cycle_time, CORE_63_CYCLE_TIME, uns, uns, 312500, )
 DEF_PARAM(topdown_fu_exec_few, TOPDOWN_FU_EXEC_FEW, uns, uns, 0, )
 DEF_PARAM(td_load_track_enable, TD_LOAD_TRACK_ENABLE, Flag, Flag, FALSE, )
 DEF_PARAM(td_load_dir, TD_LOAD_DIR, char*, string, ".", )
+
+/* --td_load_window_stats: distribution of td_window_cycles -- the DENOMINATOR every membound
+   fraction is divided by. Counters only; this does NOT write the per-load CSVs, which stay on
+   --td_load_track_enable alone.
+ *
+ * WHY THE DENOMINATOR NEEDS MEASURING. Every consumer of the signal reports
+ * td_mem_cycles / td_window_cycles and discards the window, so nothing has ever recorded how
+ * long a window actually is. That matters because a ratio of small integers is coarse: a load
+ * with a 3-cycle window can only report 0, 1/3, 2/3 or 1, and 2/3 = 0.667 lands in
+ * MLC_MEMBOUND_FRAC_65. The measured fraction distribution has a 5x step into exactly that
+ * bucket (3.4% -> 17.0% on the google traces), and WITHOUT THE WINDOW LENGTHS THERE IS NO WAY
+ * TO TELL a real mode from small-denominator quantization. These chains settle it: if the mass
+ * in the low window buckets is large, the fraction histogram's modes are an artifact.
+ *
+ * TWO CHAINS, because two different windows are in play and they are not the same number:
+ *   LOAD_WINDOW_CYCLES_*      at RETIREMENT, one per retired load with a window. The FINAL
+ *                             window -- how long load windows really are.
+ *   MLC_FILL_WINDOW_CYCLES_*  at the MLC FILL, one per eligible fill. The PARTIAL window as it
+ *                             stood when the line arrived, which is the denominator the
+ *                             membound classification and MLC_MEMBOUND_FRAC_* actually used.
+ *                             The load is still waiting on that very fill, so this is cut short
+ *                             by construction; comparing the two chains is what quantifies by
+ *                             how much.
+ *
+ * SELF-OPENING. A nonzero setting joins the window-tagging gate in topdown_idq_update, exactly
+ * as MEMBOUND_STATS and MLP_LIN_DATA_LAMBDA do. Without that td_window_cycles would stay 0 on a
+ * run that asked only for this, both chains would be empty, and the result would read as "every
+ * window is zero-length" rather than as a missing knob. */
+DEF_PARAM(td_load_window_stats, TD_LOAD_WINDOW_STATS, Flag, Flag, FALSE, )
 /* Per-load membound window shape. Both knobs act ONLY inside lsq_tag_inflight_loads, i.e. they
    change which loads get td_window_cycles/td_mem_cycles credited on a given cycle. They do NOT
    change how a cycle is classified memory-bound (that stays the global backend-stall AND

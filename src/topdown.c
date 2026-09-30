@@ -142,8 +142,14 @@ void topdown_idq_update(uns proc_id, int count_available, int count_issued, int 
   /* MLP_LIN_DATA_LAMBDA joins this list for the same reason MLP_LIN_INSTR_LAMBDA joins the
      front-end gate below: REPL_MLP's data-side boundness term needs the per-load window, and
      should not depend on --membound_stats being remembered separately. */
+  /* TD_LOAD_WINDOW_STATS joins this list for the same reason MEMBOUND_STATS and
+     MLP_LIN_DATA_LAMBDA do: it measures td_window_cycles itself, so a run that asks only for the
+     window distribution must still open the gate that accumulates it. Otherwise every window is
+     0, both chains come back empty, and the output reads as "all windows are zero-length"
+     instead of as a knob that was never turned on. */
   if (TD_LOAD_TRACK_ENABLE || TD_LOAD_EVICT_TRACK || TD_LOAD_RRIP_MARK || TD_COMBINED_ON_MLC ||
-      TD_COMBINED_ON_L1 || MEMBOUND_STATS || MARKED_LOAD_RECORD || MLP_LIN_DATA_LAMBDA != 0.0) {
+      TD_COMBINED_ON_L1 || MEMBOUND_STATS || MARKED_LOAD_RECORD || MLP_LIN_DATA_LAMBDA != 0.0 ||
+      TD_LOAD_WINDOW_STATS) {
     Flag backend_stall = (count_issued == 0 && idq_stage_get_stage_data()->op_count > 0);
     Flag mem_bound_cycle = backend_stall && (lsq_get_in_flight_load_num() > 0);
     lsq_tag_inflight_loads(mem_bound_cycle);
@@ -375,6 +381,12 @@ void topdown_load_retire(uns proc_id, Op* op) {
 
   const Flag have_window = (op->td_window_cycles != 0);
   if (have_window) {
+    /* --td_load_window_stats: the FINAL window, now that this load has retired. Emitted HERE and
+       not inside topdown_load_record, which is gated on --td_load_track_enable and writes the
+       per-load CSVs -- the window distribution must be obtainable without paying for those. */
+    if (TD_LOAD_WINDOW_STATS)
+      STAT_EVENT(proc_id, LOAD_WINDOW_CYCLES_1 + td_window_bucket(op->td_window_cycles));
+
     // in-sim eviction tracking: distinct fills into set(l) between exceeding reuses of line l
     if (TD_LOAD_EVICT_TRACK)
       td_load_evict_note_access(op);
@@ -443,6 +455,20 @@ void topdown_load_retire(uns proc_id, Op* op) {
  * returns is recorded, on- or off-path, mirroring the policy's path-agnostic RRPV write.
  * Every load is logged unconditionally; threshold filtering happens downstream at replay.
  */
+/* --td_load_window_stats: see topdown.h. Walks at most TD_WINDOW_BUCKETS-1 times, so it is
+   cheaper than a log and cannot disagree with the lower-edge names in memory.stat.def the way a
+   closed form derived separately could. A zero window never reaches here -- both call sites
+   test td_window_cycles != 0 first, because a zero window means the load was never tagged. */
+uns td_window_bucket(Counter cycles) {
+  uns     b = 0;
+  Counter edge = 1;
+  while (b < TD_WINDOW_BUCKETS - 1 && cycles > edge) {
+    edge <<= 1;
+    b++;
+  }
+  return b;
+}
+
 void topdown_load_record(uns proc_id, Op* op) {
   if (!TD_LOAD_TRACK_ENABLE)
     return;

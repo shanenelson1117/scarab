@@ -49,6 +49,16 @@ void topdown_load_retire(uns proc_id, Op* op);
  * returns / done_cycle is reached), to match where the marked-RRIP policy writes the RRPV.
  * Path-agnostic: any load that returns is recorded, on- or off-path. */
 void topdown_load_record(uns proc_id, Op* op);
+
+/* --td_load_window_stats: bucket a td_window_cycles value for the LOAD_WINDOW_CYCLES_* and
+ * MLC_FILL_WINDOW_CYCLES_* chains. Log2-spaced: bucket 0 is exactly 1 cycle, bucket k is
+ * [2^(k-1)+1, 2^k], and the last saturates -- matching the lower-edge names in memory.stat.def.
+ *
+ * ONE definition shared by both call sites (topdown.c at retire, memory.c at the MLC fill) on
+ * purpose: the two chains use the same bucket names, so a second copy of this arithmetic could
+ * drift and silently make them incomparable -- which is the whole point of having both. */
+#define TD_WINDOW_BUCKETS 14
+uns td_window_bucket(Counter cycles);
 void topdown_done(uns proc_id);
 /* --marked_load_record: write the per-core retired-load membound bitmap. Called once at the end
    of simulation; a no-op unless recording. See the block comment in topdown.c for the format

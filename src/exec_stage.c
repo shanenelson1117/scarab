@@ -367,6 +367,18 @@ void update_exec_stage(Stage_Data* src_sd) {
     }
   }
 
+  /* Per-cycle FU occupancy distribution. Emitted HERE, after the loop above has finalised both
+     counts and before topdown_exec_update consumes fu_busy_num, so the histogram and
+     TOPDOWN_EXEC_STALLS_CYCLES are computed from the identical values on the identical cycles.
+     Each chain gets exactly one event per cycle, so summing a chain gives the cycle count these
+     were observed over -- which is what makes the buckets readable as a fraction of cycles.
+
+     MIN2 is load-bearing: NUM_FUS comes from --fu_types at runtime and nothing asserts it is
+     <= 20, so an unclamped index would walk off the end of the chain and corrupt whatever stat
+     follows it. (The FU_BUSY_0 + ii chain earlier in this function has no such clamp.) */
+  STAT_EVENT(exec->proc_id, FUS_BUSY_DIST_0 + MIN2(exec->fus_busy, 20));
+  STAT_EVENT(exec->proc_id, FUS_UNAVAIL_DIST_0 + MIN2(fu_busy_num, (Counter)20));
+
   topdown_exec_update(exec->proc_id, fu_busy_num);
   memview_fus_busy(exec->proc_id, exec->fus_busy);
 }

@@ -424,11 +424,17 @@ static inline void reuse_dist_count_evict(uns8 proc_id, Cache* cache, Flag is_ml
    is off, so this costs nothing in an unrelated run. Returns the classification so the caller
    can also count the miss and its merges. */
 static inline void membound_classify_fill(Mem_Req* req, Flag* is_membound, Flag* is_fe_bound,
-                                          double* bound_frac, Flag* have_frac) {
+                                          double* bound_frac, Flag* have_frac, Counter* out_window) {
   *is_membound = FALSE;
   *is_fe_bound = FALSE;
   *bound_frac = 0.0;
   *have_frac = FALSE;
+  /* --td_load_window_stats: the DENOMINATOR this fraction was divided by, handed back so the
+     caller can histogram it. Data side only -- the front-end branch below measures a different
+     window (the icache miss's), which is not what the load chains count. 0 means "no window",
+     which is exactly the !*have_frac case. */
+  if (out_window)
+    *out_window = 0;
   /* REPL_MLP's boundness term reads membound_fill / fe_bound_fill / bound_frac, all of which
      are written from here. Gating this on --membound_stats alone would mean forgetting that
      knob turns the policy's second term off SILENTLY -- no error, just a sweep where every
@@ -457,9 +463,14 @@ static inline void membound_classify_fill(Mem_Req* req, Flag* is_membound, Flag*
        load. Merges append with sl_list_add_tail, so that is normally the load whose miss
        created this request -- i.e. "the first miss". Note the walk skips stale/freed op slots,
        so if the original op is gone this falls through to a merged one. */
-    if (td_mlc_req_load_frac(req, &frac, &frac_pc, NULL)) {
+    Op* frac_op = NULL;
+    if (td_mlc_req_load_frac(req, &frac, &frac_pc, &frac_op)) {
       *bound_frac = frac;
       *have_frac = TRUE;
+      /* The window AS IT STANDS NOW, mid-flight: this load is still waiting on the very fill
+         being classified, so it is shorter than the window the same load reports at retire. */
+      if (out_window && frac_op)
+        *out_window = frac_op->td_window_cycles;
       if (frac > (double)TD_LOAD_REPLAY_THRESH)
         *is_membound = TRUE;
     }
@@ -5707,7 +5718,8 @@ Flag l1_fill_line(Mem_Req* req) {
     Flag   mb_fill = FALSE, fe_fill = FALSE;
     double bound_frac = 0.0;
     Flag   mb_have_frac = FALSE;
-    membound_classify_fill(req, &mb_fill, &fe_fill, &bound_frac, &mb_have_frac);
+    Counter mb_window = 0;
+    membound_classify_fill(req, &mb_fill, &fe_fill, &bound_frac, &mb_have_frac, &mb_window);
     /* Stage the bit even during warmup: a line filled before the ROI that is REUSED inside it
        must still be recognisable as membound, or the hit counter would miss it. Only the
        counting below is scoped to the ROI. */
@@ -6198,7 +6210,8 @@ Flag mlc_fill_line(Mem_Req* req) {
     Flag   mb_fill = FALSE, fe_fill = FALSE;
     double bound_frac = 0.0;
     Flag   mb_have_frac = FALSE;
-    membound_classify_fill(req, &mb_fill, &fe_fill, &bound_frac, &mb_have_frac);
+    Counter mb_window = 0;
+    membound_classify_fill(req, &mb_fill, &fe_fill, &bound_frac, &mb_have_frac, &mb_window);
     /* Stage the bit even during warmup: a line filled before the ROI that is REUSED inside it
        must still be recognisable as membound, or the hit counter would miss it. Only the
        counting below is scoped to the ROI. */
@@ -6234,6 +6247,13 @@ Flag mlc_fill_line(Mem_Req* req) {
         STAT_EVENT(req->proc_id,
                    req->type == MRT_IFETCH ? MLC_FEBOUND_FRAC_NONE : MLC_MEMBOUND_FRAC_NONE);
       }
+
+      /* --td_load_window_stats: the window THIS fraction was divided by. Emitted beside the
+         fraction histogram and over exactly the same population (mb_have_frac, data side), so
+         the two are directly comparable bucket for bucket -- that pairing is what says whether
+         a mode in MLC_MEMBOUND_FRAC_* is real or is small-denominator quantization. */
+      if (TD_LOAD_WINDOW_STATS && mb_have_frac && mb_window && req->type != MRT_IFETCH)
+        STAT_EVENT(req->proc_id, MLC_FILL_WINDOW_CYCLES_1 + td_window_bucket(mb_window));
 
       if (mb_fill) {
         STAT_EVENT(req->proc_id, MLC_MEMBOUND_FILL);

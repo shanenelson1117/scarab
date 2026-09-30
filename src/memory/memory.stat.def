@@ -2739,6 +2739,64 @@ DEF_STAT(  MLC_FEBOUND_FRAC_95                , DIST   , NO_RATIO  )
 DEF_STAT(  MLC_MEMBOUND_FRAC_NONE                 , COUNT  , NO_RATIO  )
 DEF_STAT(  MLC_FEBOUND_FRAC_NONE                  , COUNT  , NO_RATIO  )
 
+/* --td_load_window_stats: distribution of td_window_cycles -- the DENOMINATOR of every membound
+   fraction. Counters only; the per-load CSVs stay on --td_load_track_enable alone.
+
+   Bucket 0 is exactly 1 cycle, bucket k is [2^(k-1)+1, 2^k], last saturates. Named by LOWER
+   EDGE, indexed as <CHAIN>_1 + td_window_bucket(cycles) (one shared definition in topdown.c, so
+   the two chains cannot drift apart), contiguous and bracketed by their two DIST entries.
+
+   LOAD_WINDOW_CYCLES_*      at RETIREMENT, one per retired load with a window -- the FINAL
+                             window. On-path only, since retirement is where it is emitted.
+   MLC_FILL_WINDOW_CYCLES_*  at the MLC FILL, one per eligible data-side fill -- the PARTIAL
+                             window, i.e. the denominator MLC_MEMBOUND_FRAC_* and the membound
+                             classification actually used. The load is still waiting on that very
+                             fill, so this is cut short by construction.
+
+   WHY BOTH. Read MLC_FILL_WINDOW_CYCLES_* against MLC_MEMBOUND_FRAC_* bucket for bucket: they
+   cover the same population, so if the fill-time windows are mostly short then the fraction
+   chain's modes are small-integer artifacts (a 3-cycle window can only yield 0, 1/3, 2/3 or 1,
+   and 2/3 lands in MLC_MEMBOUND_FRAC_65 -- where the measured distribution has a 5x step).
+   Read LOAD_WINDOW_CYCLES_* against MLC_FILL_WINDOW_CYCLES_* for how much window the fill-time
+   classification is missing, which is the same quantity RRIP_FIXUP_PROMOTE/DEMOTE/SAME measures
+   in outcome terms.
+
+   POPULATIONS DIFFER, so do not divide one chain by the other: the first is per retired load,
+   the second per fill, and one load can cause several fills while many retired loads cause none.
+
+   WINDOW: both are ungated DEF_STAT counters, so _count is target-only and _total_count spans
+   warmup. Use _count, and never pair it with Cumulative_*. */
+
+DEF_STAT(  LOAD_WINDOW_CYCLES_1                  , DIST  , NO_RATIO  )
+DEF_STAT(  LOAD_WINDOW_CYCLES_2                  , COUNT , NO_RATIO  )
+DEF_STAT(  LOAD_WINDOW_CYCLES_3                  , COUNT , NO_RATIO  )
+DEF_STAT(  LOAD_WINDOW_CYCLES_5                  , COUNT , NO_RATIO  )
+DEF_STAT(  LOAD_WINDOW_CYCLES_9                  , COUNT , NO_RATIO  )
+DEF_STAT(  LOAD_WINDOW_CYCLES_17                 , COUNT , NO_RATIO  )
+DEF_STAT(  LOAD_WINDOW_CYCLES_33                 , COUNT , NO_RATIO  )
+DEF_STAT(  LOAD_WINDOW_CYCLES_65                 , COUNT , NO_RATIO  )
+DEF_STAT(  LOAD_WINDOW_CYCLES_129                , COUNT , NO_RATIO  )
+DEF_STAT(  LOAD_WINDOW_CYCLES_257                , COUNT , NO_RATIO  )
+DEF_STAT(  LOAD_WINDOW_CYCLES_513                , COUNT , NO_RATIO  )
+DEF_STAT(  LOAD_WINDOW_CYCLES_1025               , COUNT , NO_RATIO  )
+DEF_STAT(  LOAD_WINDOW_CYCLES_2049               , COUNT , NO_RATIO  )
+DEF_STAT(  LOAD_WINDOW_CYCLES_4097MORE           , DIST  , NO_RATIO  )
+
+DEF_STAT(  MLC_FILL_WINDOW_CYCLES_1              , DIST  , NO_RATIO  )
+DEF_STAT(  MLC_FILL_WINDOW_CYCLES_2              , COUNT , NO_RATIO  )
+DEF_STAT(  MLC_FILL_WINDOW_CYCLES_3              , COUNT , NO_RATIO  )
+DEF_STAT(  MLC_FILL_WINDOW_CYCLES_5              , COUNT , NO_RATIO  )
+DEF_STAT(  MLC_FILL_WINDOW_CYCLES_9              , COUNT , NO_RATIO  )
+DEF_STAT(  MLC_FILL_WINDOW_CYCLES_17             , COUNT , NO_RATIO  )
+DEF_STAT(  MLC_FILL_WINDOW_CYCLES_33             , COUNT , NO_RATIO  )
+DEF_STAT(  MLC_FILL_WINDOW_CYCLES_65             , COUNT , NO_RATIO  )
+DEF_STAT(  MLC_FILL_WINDOW_CYCLES_129            , COUNT , NO_RATIO  )
+DEF_STAT(  MLC_FILL_WINDOW_CYCLES_257            , COUNT , NO_RATIO  )
+DEF_STAT(  MLC_FILL_WINDOW_CYCLES_513            , COUNT , NO_RATIO  )
+DEF_STAT(  MLC_FILL_WINDOW_CYCLES_1025           , COUNT , NO_RATIO  )
+DEF_STAT(  MLC_FILL_WINDOW_CYCLES_2049           , COUNT , NO_RATIO  )
+DEF_STAT(  MLC_FILL_WINDOW_CYCLES_4097MORE       , DIST  , NO_RATIO  )
+
 
 // BATCH SCHEDULING
 DEF_STAT(  TOTAL_BATCH_FORMED                                , COUNT  , NO_RATIO  )
