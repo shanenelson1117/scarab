@@ -4314,6 +4314,13 @@ DEF_STAT(  L1_PRIO_NUM_LEVELS                        , COUNT , NO_RATIO         
    SET-WIDE, NOT SPLIT BY PRIORITY LEVEL. Cross-splitting these by level would be 10 x 24 x 17
    chains per cache; the per-level view of contents is *_PRIO_OCCUP_Ln above.
 
+   POLICY-INDEPENDENT, unlike every *_PRIO_* chain above. These read only the traffic class stamped
+   on each line at its fill, which both the strategy and non-strategy insert paths record, so they
+   are populated under REPL_TRUE_LRU, SRRIP, Mockingjay, marked-RRIP -- anything. --load_prio_stats 1
+   alone is enough; they need neither --mlp_cost_stats nor --mlc_cache_repl_policy 9. An LRU run
+   therefore yields these chains fully populated while every *_PRIO_* chain is zero, which is a valid
+   configuration -- the baseline for a REPL_MLP comparison -- and not a missing hookup.
+
    SIX DISJOINT CLASSES, which partition Mem_Req_Type:
 
      COMP_IFETCH   IFETCH                                  demand instruction fetch

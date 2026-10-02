@@ -508,8 +508,14 @@ static inline void load_prio_dump_levels(uns8 proc_id, Cache* cache, Flag is_mlc
 static inline void load_prio_snapshot_set(uns8 proc_id, Cache* cache, Addr addr, Flag is_mlc) {
   if (!LOAD_PRIO_STATS || !early_evict_in_roi())
     return;
-  if (!cache_load_prio_num_levels(cache))
-    return;  // untracked
+  /* The two halves have DIFFERENT enable conditions and are gated separately below:
+       composition -- policy-independent, needs only cache_load_prio_tracked
+       occupancy    -- keyed on priority levels, so REPL_MLP only
+     Returning early on the level count here (as this once did) silently emptied the composition
+     chains on every LRU / SRRIP / Mockingjay run, which are exactly the baselines those chains
+     exist to supply. */
+  if (!cache_load_prio_tracked(cache))
+    return;
 
   uns comp[LOAD_PRIO_NUM_TC];
   cache_load_prio_set_composition(cache, addr, comp);
@@ -560,6 +566,11 @@ static inline void load_prio_snapshot_set(uns8 proc_id, Cache* cache, Addr addr,
   }
 #undef LOAD_PRIO_N_COMP_CHAINS
 
+  /* Occupancy by priority level -- REPL_MLP only, so it is gated on the level count rather than on
+     the tracking flag above. On an LRU baseline this is skipped and the composition chains stand
+     alone, which is the intended behaviour and not a missing hookup. */
+  if (!cache_load_prio_num_levels(cache))
+    return;
   uns occ[LOAD_PRIO_MAX_LEVELS];
   cache_load_prio_set_occupancy(cache, addr, occ);
   const int occ_base = is_mlc ? MLC_PRIO_OCCUP_L0 : L1_PRIO_OCCUP_L0;

@@ -495,6 +495,10 @@ double cache_load_prio_boost(Cache* cache, uns level) {
   return cache->prio_boost[level];
 }
 
+Flag cache_load_prio_tracked(Cache* cache) {
+  return cache->load_prio_track;
+}
+
 double cache_last_hit_mlp_cost(Cache* cache) {
   return cache->last_hit_mlp_cost;
 }
@@ -759,7 +763,10 @@ Flag cache_last_evict_prio(Cache* cache, uns8* level, Counter* residency_misses,
    honest answer: an empty way holds nothing. */
 void cache_load_prio_set_composition(Cache* cache, Addr addr, uns* counts) {
   memset(counts, 0, LOAD_PRIO_NUM_TC * sizeof(uns));
-  if (!cache->set_miss_ctr)
+  /* load_prio_track, NOT set_miss_ctr: this walk reads only fill_traffic, which every policy's
+     insert path stamps, so gating it on the REPL_MLP-only miss clock would make the composition
+     chains empty on exactly the LRU baseline they exist to be compared against. */
+  if (!cache->load_prio_track)
     return;
   Addr      tag = 0, line_addr = 0;
   const uns set = cache_index(cache, addr, &tag, &line_addr);
@@ -972,6 +979,11 @@ void init_cache(Cache* cache, const char* name, uns cache_size, uns assoc, uns l
      allocated below, only on the REPL_MLP path; leaving it NULL here is what makes every
      load_prio_* entry point inert on a strategy-policy cache, which never reaches that code. */
   cache->set_miss_ctr = NULL;
+  /* The policy-independent half of the enable, set here (ahead of the strategy branch) precisely so
+     that SRRIP / Mockingjay / marked-RRIP caches get it too -- their fills stamp fill_traffic via
+     general_action_repl, so their composition is just as measurable as an LRU cache's. The priority
+     half (set_miss_ctr, prio_num_levels) is allocated further down, REPL_MLP only. */
+  cache->load_prio_track = LOAD_PRIO_STATS ? TRUE : FALSE;
   cache->prio_num_levels = 0;
   memset(cache->prio_boost, 0, sizeof(cache->prio_boost));
   cache->last_hit_prio_valid = FALSE;

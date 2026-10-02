@@ -482,10 +482,22 @@ DEF_PARAM(reuse_dist_stats, REUSE_DIST_STATS, Flag, Flag, FALSE, )
 
 /* --load_prio_stats: per-PRIORITY-LEVEL load tracker for the MLC and the LLC.
  *
- * REPL_MLP ONLY. The priority axis is that policy's own value function, so the knob does nothing
- * on any other replacement policy: set --mlc_cache_repl_policy 9 and/or --l1_cache_repl_policy 9
- * or every chain below stays at zero. A cache not running REPL_MLP leaves set_miss_ctr NULL,
- * which is the enable test on every hot path, so an unrelated run pays one null check per access.
+ * TWO HALVES, WITH DIFFERENT POLICY REQUIREMENTS. Read this before concluding a chain is broken:
+ *
+ *   - The SET-COMPOSITION chains (*_COMP_*) are POLICY-INDEPENDENT. They read only the traffic class
+ *     stamped on each line at its fill, which every insert path records, so they are populated under
+ *     REPL_TRUE_LRU, SRRIP, Mockingjay, marked-RRIP -- anything. --load_prio_stats 1 alone is enough,
+ *     and they need neither --mlp_cost_stats nor a particular repl policy. That is deliberate: the
+ *     baseline a priority-aware policy gets compared against needs the same composition numbers.
+ *
+ *   - The PRIORITY chains (*_PRIO_*) are REPL_MLP ONLY, because a level is an index into that
+ *     policy's own value function and means nothing elsewhere. Set --mlc_cache_repl_policy 9 and/or
+ *     --l1_cache_repl_policy 9, and --mlp_cost_stats 1, or they stay at zero. A cache not running
+ *     REPL_MLP leaves set_miss_ctr NULL, which is the enable test on those hot paths, so an
+ *     unrelated run pays one null check per access.
+ *
+ * So an LRU run with --load_prio_stats 1 gives you the full composition picture and no priority
+ * breakdown, which is a valid and useful configuration rather than a half-broken one.
  *
  * WHAT A PRIORITY LEVEL IS. The level is the line's BOOST -- the non-recency part of the REPL_MLP
  * value function, i.e. how far the policy displaces the line from where its recency alone would

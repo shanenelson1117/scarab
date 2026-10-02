@@ -474,6 +474,21 @@ typedef struct Cache_struct {
      and either knob works without the other. */
   Counter* set_miss_ctr;
 
+  /* --load_prio_stats: TRUE when the knob is on, on EVERY replacement policy. This is the enable
+     test for the part of the accounting that does not depend on the policy at all -- the
+     set-composition walk, which reads only Cache_Entry.fill_traffic, and fill_traffic is stamped
+     from the Mem_Req type by consume_fill_bound on both the strategy and non-strategy insert paths.
+     Composition is therefore available under REPL_TRUE_LRU, SRRIP, Mockingjay and the rest, which
+     is the point: the baseline a priority-aware policy is compared against needs the same
+     composition numbers.
+
+     DELIBERATELY NOT set_miss_ctr. That pointer gates the PRIORITY half -- levels, the miss clock,
+     and everything keyed on a level -- and is allocated only for REPL_MLP, because a level is an
+     index into that policy's own value function and means nothing elsewhere. Using one flag for
+     both is what previously made the policy-independent composition chains silently empty on an LRU
+     run. Keep them separate. */
+  Flag load_prio_track;
+
   /* --load_prio_stats: the distinct values the REPL_MLP boost can take, ascending, with
      prio_num_levels of them valid. Built ONCE at init from the 8 x 3 (costq, bound-class) grid --
      see Cache_Entry.prio_level for the expression -- and a line's prio_level is an index into it.
@@ -681,10 +696,17 @@ Flag cache_last_evict_reuse(Cache* cache, Flag* reused, Flag* membound, Flag* fe
 void cache_set_next_fill_traffic(uns8 traffic);
 
 /* How many priority levels this cache's boost can take, and what boost level `level` stands for.
- * 0 levels means the cache is not tracked. The boost is in LRU stack positions, so the value is
- * directly comparable against associativity. Pure. */
+ * 0 levels means this cache has NO priority axis -- it is not running REPL_MLP -- which is not the
+ * same as it being untracked: see cache_load_prio_tracked. The boost is in LRU stack positions, so
+ * the value is directly comparable against associativity. Pure. */
 uns    cache_load_prio_num_levels(Cache* cache);
 double cache_load_prio_boost(Cache* cache, uns level);
+
+/* TRUE when --load_prio_stats is on, whatever the replacement policy. Gates the POLICY-INDEPENDENT
+ * accounting -- the set-composition histograms. A cache can be tracked (this TRUE) while having no
+ * priority axis (cache_load_prio_num_levels 0), which is exactly an LRU or SRRIP baseline run:
+ * composition is measured, priority is not. Callers must test the two separately. */
+Flag cache_load_prio_tracked(Cache* cache);
 
 /* The priority level of the line the most recent cache_access on `cache` HIT, and that hit's
  * reuse distance in MISSES TO THE SET measured from the line's previous access (its fill, or its
@@ -722,15 +744,19 @@ Flag cache_last_evict_prio(Cache* cache, uns8* level, Counter* residency_misses,
  * fill is arriving into.
  *
  * cache_load_prio_set_composition fills `counts[LOAD_PRIO_NUM_TC]` with the number of resident
- * lines of each traffic class. The four histogrammed classes need not sum to assoc -- invalid
- * ways and LOAD_PRIO_TC_OTHER lines are the difference.
+ * lines of each traffic class. POLICY-INDEPENDENT: it reads only fill_traffic, so it works under
+ * REPL_TRUE_LRU, SRRIP, Mockingjay and the rest, and no-ops only when --load_prio_stats is off.
+ * The six disjoint classes sum to the set's valid ways; LOAD_PRIO_TC_OTHER lines and invalid ways
+ * are the shortfall.
  *
  * cache_load_prio_set_occupancy fills `counts[LOAD_PRIO_MAX_LEVELS]` with the number of resident
- * lines at each priority level. Summed over fills this is what the cache HOLDS rather than what
- * it admits, which is the view the per-fill event chains cannot give: a level can take a small
- * share of fills and still occupy most of the cache, or the reverse.
+ * lines at each priority level. REPL_MLP ONLY -- it no-ops where there is no priority axis, since a
+ * level is an index into that policy's value function. Summed over fills this is what the cache
+ * HOLDS rather than what it admits, which is the view the per-fill event chains cannot give: a level
+ * can take a small share of fills and still occupy most of the cache, or the reverse.
  *
- * Both are pure, and both no-op (leaving `counts` zeroed) on an untracked cache. */
+ * Both are pure, and both leave `counts` zeroed when they no-op. Note the two have DIFFERENT enable
+ * conditions, so a caller must gate each on its own test rather than on one shared check. */
 void cache_load_prio_set_composition(Cache* cache, Addr addr, uns* counts);
 void cache_load_prio_set_occupancy(Cache* cache, Addr addr, uns* counts);
 
