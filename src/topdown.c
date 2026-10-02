@@ -211,6 +211,24 @@ void topdown_idq_update(uns proc_id, int count_available, int count_issued, int 
           STAT_EVENT(proc_id, MEMPROXY_FU0_WAIT_LOADS);
       }
 
+      /* FU0 + "the issue window is full", in both senses -- they test different structures and
+         saturate at different times (186 RS entries vs a 352-entry ROB here), so a cycle can be
+         one, the other, both or neither. SUB-COUNTS of FUS_BUSY_DIST_0, not part of either
+         partition, so neither may be added into the sum-to-NODE_CYCLE checks.
+
+         ROB_FULL is the classic memory-bound signature: a long-latency load blocks retirement,
+         the ROB backs up behind it and dispatch stalls. RS_FULL is scheduler saturation, which
+         can happen with the ROB far from full. */
+      if (fu_idle) {
+        if (is_node_table_full()) {
+          STAT_EVENT(proc_id, MEMPROXY_FU0_ROB_FULL);
+          if (loads)
+            STAT_EVENT(proc_id, MEMPROXY_FU0_ROB_FULL_LOADS);
+        }
+        if (node_issue_window_full())
+          STAT_EVENT(proc_id, MEMPROXY_FU0_RS_FULL);
+      }
+
       /* Where the two proxies land; these four also partition NODE_CYCLE. */
       if (mem_bound_cycle == fu_proxy) {
         STAT_EVENT(proc_id, mem_bound_cycle ? MEMPROXY_AGREE_BOUND : MEMPROXY_AGREE_NOT);

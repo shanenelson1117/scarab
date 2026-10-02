@@ -91,6 +91,20 @@ Flag is_node_stage_stalled(void);
  * Exact, by the rdy_count invariant above; O(NUM_RS), no list walk. */
 Flag node_ops_waiting_on_operands(void);
 
+/* --memproxy_stats: "the issue window is full", in the two senses Scarab distinguishes. They are
+ * NOT the same predicate and give different numbers, so both are exported and named for what
+ * they test rather than for the colloquial phrase.
+ *
+ *   is_node_table_full()        the REORDER BUFFER is at NODE_TABLE_SIZE. This is the classic
+ *                               memory-bound signature: a long-latency load blocks retirement,
+ *                               the ROB backs up behind it, and dispatch stalls. Already defined
+ *                               in node_stage.c; exported here so topdown.c can read it.
+ *   node_issue_window_full()    every RESERVATION STATION is at capacity, i.e. the SCHEDULING
+ *                               window cannot accept another op. An RS with size 0 is infinite
+ *                               and makes this permanently FALSE. */
+Flag is_node_table_full(void);
+Flag node_issue_window_full(void);
+
 /**************************************************************************************/
 
 #endif /* #ifndef __NODE_STAGE_H__ */

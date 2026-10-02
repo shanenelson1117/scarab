@@ -405,6 +405,214 @@ static inline void reuse_dist_count_evict(uns8 proc_id, Cache* cache, Flag is_ml
     STAT_EVENT(proc_id, noreuse);
 }
 
+/* --load_prio_stats --------------------------------------------------------------------------
+ *
+ * Priority-bucketed load tracker for the MLC and the LLC. cache_lib measures and publishes; this
+ * is the counting half, which is where it has to be because only memory.c knows which cache it is
+ * holding and therefore which stat chain to charge -- the same split as --reuse_dist_stats above.
+ *
+ * Everything here shares early_evict_in_roi(), so the chains are TARGET-ONLY and sit on the
+ * Periodic_* window, like --early_evict_stats and --reuse_dist_stats. They must not move window
+ * when --membound_stats_roi does.
+ *
+ * REPL_MLP only; cache_lib leaves every tracked cache's set_miss_ctr NULL otherwise, so each
+ * reader below returns FALSE and these all fall through on an unrelated run. The LOAD_PRIO_STATS
+ * test is kept anyway so the ROI call and the reader call are both skipped outright. */
+
+/* Which traffic class a fill belongs to, for the set-composition histograms. The six classes are
+ * disjoint and partition Mem_Req_Type; see Load_Prio_Traffic in cache_lib.h for why prefetch is
+ * split from demand and writeback from store, and why the coarser ALL_* views have to be emitted by
+ * the set walk rather than derived later.
+ *
+ * MRT_MIN_PRIORITY and any type added later fall through to OTHER, which is counted in no histogram
+ * rather than folded into a real class. */
+static inline uns8 load_prio_traffic_of(Mem_Req_Type type) {
+  switch (type) {
+    case MRT_IFETCH:
+      return LOAD_PRIO_TC_IFETCH;
+    case MRT_IPRF:
+    case MRT_UOCPRF:
+    case MRT_FDIPPRFON:
+    case MRT_FDIPPRFOFF:
+      return LOAD_PRIO_TC_IPREF;
+    case MRT_DFETCH:
+      return LOAD_PRIO_TC_LOAD;
+    case MRT_DPRF:
+      return LOAD_PRIO_TC_DPREF;
+    case MRT_DSTORE:
+      return LOAD_PRIO_TC_STORE;
+    case MRT_WB:
+    case MRT_WB_NODIRTY:
+      return LOAD_PRIO_TC_WB;
+    default:
+      return LOAD_PRIO_TC_OTHER;
+  }
+}
+
+/* Stage the fill's traffic class for the cache_insert that follows. Staged unconditionally of the
+   ROI, for the same reason cache_set_next_fill_bound is: a line filled during warmup and still
+   resident inside the target window must carry a real class, or the composition walks would see
+   it as unclassified. Only the counting is ROI-scoped. */
+static inline void load_prio_stage_fill(Mem_Req* req) {
+  if (!LOAD_PRIO_STATS)
+    return;
+  cache_set_next_fill_traffic(load_prio_traffic_of(req->type));
+}
+
+/* Write out what each priority level MEANT in this run: the boost value x1000, and the level
+   count. Idempotent and cheap, so it is called from the fill path rather than wired into a dump
+   hook -- SET_STAT-style overwrite semantics are not available here, so it is guarded to fire
+   exactly once per (proc, cache).
+
+   This is not optional bookkeeping. The level numbering depends on the lambdas (see
+   --load_prio_stats), so without these two chains a collected_stats CSV cannot say what PRIO_L3
+   stood for, and two runs from a lambda sweep look comparable when they are not. */
+static inline void load_prio_dump_levels(uns8 proc_id, Cache* cache, Flag is_mlc) {
+  static Flag done[2][MAX_NUM_PROCS];
+  if (done[is_mlc ? 1 : 0][proc_id])
+    return;
+  /* ROI-gated like every other counter here, and that is load-bearing rather than tidy: under
+     --warmup, reset_stats zeroes these chains at the warmup boundary, so a table written at the
+     first fill of the run would be wiped before the target window and read as all zeros. Gating
+     makes the write land at the first fill INSIDE the window. The `done` latch is therefore only
+     set once we are in the ROI, so the first in-window fill is not skipped. */
+  if (!LOAD_PRIO_STATS || !early_evict_in_roi())
+    return;
+  const uns n = cache_load_prio_num_levels(cache);
+  if (!n)
+    return;  // untracked; nothing to describe, and nothing to latch
+  done[is_mlc ? 1 : 0][proc_id] = TRUE;
+
+  const int base = is_mlc ? MLC_PRIO_BOOST_X1000_L0 : L1_PRIO_BOOST_X1000_L0;
+  for (uns k = 0; k < n; k++) {
+    /* x1000 and rounded because stats are integer counters: a boost of 2.5 LRU stack positions
+       reads as 2500. Three decimals is far more than the lambdas carry in practice.
+       The naive +0.5 round is safe because the boost cannot be negative -- load_prio_levels_init
+       asserts non-negative lambdas, precisely so this unsigned Counter cannot wrap. */
+    const double b = cache_load_prio_boost(cache, k);
+    INC_STAT_EVENT(proc_id, base + k, (Counter)(b * 1000.0 + 0.5));
+  }
+  INC_STAT_EVENT(proc_id, is_mlc ? MLC_PRIO_NUM_LEVELS : L1_PRIO_NUM_LEVELS, n);
+}
+
+/* Snapshot what the set the fill is arriving into currently HOLDS, by traffic class and by
+   priority level. MUST be called BEFORE the cache_insert, which is the whole point: afterwards the
+   arriving line has already displaced its victim and the set no longer describes what the fill
+   found.
+
+   The occupancy walk is what gives a view of cache CONTENTS rather than of admissions. The
+   per-fill event chains cannot answer it -- a level can take a small share of fills and still
+   occupy most of the cache, or the reverse -- so this adds, once per fill, the number of resident
+   lines at each level. Summed over a run and divided by the total it is each level's share of
+   capacity. */
+static inline void load_prio_snapshot_set(uns8 proc_id, Cache* cache, Addr addr, Flag is_mlc) {
+  if (!LOAD_PRIO_STATS || !early_evict_in_roi())
+    return;
+  if (!cache_load_prio_num_levels(cache))
+    return;  // untracked
+
+  uns comp[LOAD_PRIO_NUM_TC];
+  cache_load_prio_set_composition(cache, addr, comp);
+  /* Ten histograms per fill: the six disjoint classes, plus four coarser views.
+     The ALL_* views are summed HERE, while the walk's per-way classes are still available, because a
+     histogram of counts cannot be combined after the fact -- COMP_IFETCH_3 and COMP_IPREF_2 are
+     separate events and say nothing about a set holding 5 instruction lines. A plot script cannot
+     reconstruct them, so the binary has to emit them.
+     The six disjoint counts sum to the set's VALID ways (OTHER lines are the only shortfall, and
+     invalid ways are counted nowhere); the four ALL_* views deliberately overlap them. */
+  const uns n_instr = comp[LOAD_PRIO_TC_IFETCH] + comp[LOAD_PRIO_TC_IPREF];
+  const uns n_pref = comp[LOAD_PRIO_TC_IPREF] + comp[LOAD_PRIO_TC_DPREF];
+  /* DEMAND reads only -- prefetch is excluded deliberately. A prefetch is speculative, not a read
+     the program issued, and ALL_PREF already accounts for it. So ALL_READ is NOT the complement of
+     the write classes: ALL_READ + STORE + WB falls short of the set's valid ways by exactly the
+     prefetched lines. */
+  const uns n_read = comp[LOAD_PRIO_TC_IFETCH] + comp[LOAD_PRIO_TC_LOAD];
+  /* Data lines that NO demand load brought in. ALL_DATA_NONLOAD + COMP_LOAD is the whole data side,
+     which is why there is no separate ALL_DATA chain. */
+  const uns n_data_nonload = comp[LOAD_PRIO_TC_DPREF] + comp[LOAD_PRIO_TC_STORE] + comp[LOAD_PRIO_TC_WB];
+
+#define LOAD_PRIO_N_COMP_CHAINS 10
+  const int comp_base[LOAD_PRIO_N_COMP_CHAINS] = {
+      is_mlc ? MLC_COMP_IFETCH_0 : L1_COMP_IFETCH_0,
+      is_mlc ? MLC_COMP_IPREF_0 : L1_COMP_IPREF_0,
+      is_mlc ? MLC_COMP_LOAD_0 : L1_COMP_LOAD_0,
+      is_mlc ? MLC_COMP_DPREF_0 : L1_COMP_DPREF_0,
+      is_mlc ? MLC_COMP_STORE_0 : L1_COMP_STORE_0,
+      is_mlc ? MLC_COMP_WB_0 : L1_COMP_WB_0,
+      is_mlc ? MLC_COMP_ALL_INSTR_0 : L1_COMP_ALL_INSTR_0,
+      is_mlc ? MLC_COMP_ALL_PREF_0 : L1_COMP_ALL_PREF_0,
+      is_mlc ? MLC_COMP_ALL_READ_0 : L1_COMP_ALL_READ_0,
+      is_mlc ? MLC_COMP_ALL_DATA_NONLOAD_0 : L1_COMP_ALL_DATA_NONLOAD_0};
+  const uns comp_val[LOAD_PRIO_N_COMP_CHAINS] = {comp[LOAD_PRIO_TC_IFETCH], comp[LOAD_PRIO_TC_IPREF],
+                                                 comp[LOAD_PRIO_TC_LOAD],   comp[LOAD_PRIO_TC_DPREF],
+                                                 comp[LOAD_PRIO_TC_STORE],  comp[LOAD_PRIO_TC_WB],
+                                                 n_instr,                   n_pref,
+                                                 n_read,                    n_data_nonload};
+  for (uns c = 0; c < LOAD_PRIO_N_COMP_CHAINS; c++) {
+    /* Clamped to the chain length: the chains are sized for 16-way (0..16), which both tracked
+       caches are on every PARAMS file in the tree. A wider cache saturates the top bucket rather
+       than writing past the end of the chain. The ALL_* views need this most -- they are sums, so
+       they reach assoc whenever the set is full. */
+    uns k = comp_val[c];
+    if (k > LOAD_PRIO_COMP_MAX_WAYS)
+      k = LOAD_PRIO_COMP_MAX_WAYS;
+    STAT_EVENT(proc_id, comp_base[c] + k);
+  }
+#undef LOAD_PRIO_N_COMP_CHAINS
+
+  uns occ[LOAD_PRIO_MAX_LEVELS];
+  cache_load_prio_set_occupancy(cache, addr, occ);
+  const int occ_base = is_mlc ? MLC_PRIO_OCCUP_L0 : L1_PRIO_OCCUP_L0;
+  for (uns k = 0; k < LOAD_PRIO_MAX_LEVELS; k++) {
+    if (occ[k])
+      INC_STAT_EVENT(proc_id, occ_base + k, occ[k]);
+  }
+}
+
+/* Count the fill the most recent insert performed, and the line it displaced. Call immediately
+   AFTER the insert, beside the *_EARLY_EVICT read, which is the same validity window.
+
+   The arriving line and its victim are counted on independent levels, which is the measurement:
+   FILL_L says what is being admitted at level L, EVICT_L / RESIDENCY_MISSES_L / NOREUSE_L say what
+   level L lines got for it. */
+static inline void load_prio_count_fill(uns8 proc_id, Cache* cache, Flag is_mlc) {
+  if (!LOAD_PRIO_STATS || !early_evict_in_roi())
+    return;
+
+  uns8 fill_level = 0;
+  if (cache_last_fill_prio(cache, &fill_level))
+    STAT_EVENT(proc_id, (is_mlc ? MLC_PRIO_FILL_L0 : L1_PRIO_FILL_L0) + fill_level);
+
+  uns8    ev_level = 0;
+  Counter residency = 0, reuses = 0;
+  if (!cache_last_evict_prio(cache, &ev_level, &residency, &reuses))
+    return;  // the insert took a free way, so nothing was evicted
+  STAT_EVENT(proc_id, (is_mlc ? MLC_PRIO_EVICT_L0 : L1_PRIO_EVICT_L0) + ev_level);
+  INC_STAT_EVENT(proc_id, (is_mlc ? MLC_PRIO_RESIDENCY_MISSES_L0 : L1_PRIO_RESIDENCY_MISSES_L0) + ev_level, residency);
+  /* The half the reuse-distance sum cannot contain: a line evicted having never been hit
+     contributes no distance, so without this the distances are a sample of the survivors only. */
+  if (!reuses)
+    STAT_EVENT(proc_id, (is_mlc ? MLC_PRIO_NOREUSE_L0 : L1_PRIO_NOREUSE_L0) + ev_level);
+}
+
+/* Count the hit the most recent cache_access produced, and its reuse distance in MISSES to the
+   set. Call immediately after that access, beside the *_MEMBOUND_HIT counters and
+   reuse_dist_count_hit -- and for the same access population those count, since a counter fired on
+   a different population cannot be divided by them. */
+static inline void load_prio_count_hit(uns8 proc_id, Cache* cache, Flag is_mlc) {
+  uns8    level = 0;
+  Counter reuse_misses = 0;
+  if (!LOAD_PRIO_STATS || !early_evict_in_roi())
+    return;
+  if (!cache_last_hit_prio(cache, &level, &reuse_misses))
+    return;  // a miss, or a probe, or an untracked cache
+  STAT_EVENT(proc_id, (is_mlc ? MLC_PRIO_HIT_L0 : L1_PRIO_HIT_L0) + level);
+  /* Summed rather than histogrammed: dividing by PRIO_HIT_L<n> gives an exact mean, where a
+     log2 bucket chain would only give a midpoint estimate. The bucket shape that --reuse_dist_stats
+     needs is for locating mass relative to assoc; here the per-level mean is the comparison. */
+  INC_STAT_EVENT(proc_id, (is_mlc ? MLC_PRIO_REUSE_MISSES_L0 : L1_PRIO_REUSE_MISSES_L0) + level, reuse_misses);
+}
+
 /* --membound_stats: classify a fill by the signal of the access that caused it, and stage the
    result for the cache_insert that follows.
 
@@ -2439,6 +2647,9 @@ Flag mem_process_l1_hit_access(Mem_Req* req, Mem_Queue_Entry* l1_queue_entry, Ad
        happened at all. Same guard and same population as the block above for exactly the reason
        that one documents -- placed here and not at the cache_access, which is re-run on retry. */
     reuse_dist_count_hit(req->proc_id, &L1(req->proc_id)->cache, FALSE);
+    /* --load_prio_stats: the same reuse, charged to the hit line's priority level and measured in
+       MISSES to the set rather than accesses. Same guard and same population as the two above. */
+    load_prio_count_hit(req->proc_id, &L1(req->proc_id)->cache, FALSE);
     if (0 && DEBUG_EXC_INSERTS) {
       printf("addr:%s hit in L1 type:%s\n", hexstr64s(req->addr), Mem_Req_Type_str(req->type));
     }
@@ -2556,6 +2767,8 @@ Flag mem_process_mlc_hit_access(Mem_Req* req, Mem_Queue_Entry* mlc_queue_entry, 
       }
       /* --reuse_dist_stats: see the matching call on the L1 hit path. */
       reuse_dist_count_hit(req->proc_id, &MLC(req->proc_id)->cache, TRUE);
+      /* --load_prio_stats: see the matching call on the L1 hit path. */
+      load_prio_count_hit(req->proc_id, &MLC(req->proc_id)->cache, TRUE);
       if (0 && DEBUG_EXC_INSERTS) {
         printf("addr:%s hit in MLC type:%s\n", hexstr64s(req->addr), Mem_Req_Type_str(req->type));
       }
@@ -5787,6 +6000,8 @@ Flag l1_fill_line(Mem_Req* req) {
     cache_set_next_fill_store(req->type == MRT_DSTORE || req->type == MRT_WB);
     /* --mlp_lin_offpath_lambda: oracle wrong-path, matching L1_Data.fetched_by_offpath. */
     cache_set_next_fill_offpath(req->off_path);
+    /* --load_prio_stats: the traffic class, for the set-composition histograms. */
+    load_prio_stage_fill(req);
     if (MEMBOUND_STATS && membound_in_roi()) {
       if (mb_fill) {
         STAT_EVENT(req->proc_id, L1_MEMBOUND_FILL);
@@ -5806,6 +6021,12 @@ Flag l1_fill_line(Mem_Req* req) {
 
   // REPL_MOCKINGJAY: hand the fill its PC / traffic class (consumed by the insert below).
   mockingjay_stage_access(&L1(req->proc_id)->cache, req);
+
+  /* --load_prio_stats: snapshot the set BEFORE the insert below -- afterwards the arriving line
+     has displaced its victim and the set no longer describes what this fill found. Also the one
+     place the level table is described, which has to happen once a cache exists. */
+  load_prio_dump_levels(req->proc_id, &L1(req->proc_id)->cache, FALSE);
+  load_prio_snapshot_set(req->proc_id, &L1(req->proc_id)->cache, req->addr, FALSE);
 
   /* The insert below silently drops this line from the one-line stream buffer if the buffer
      holds it (it must not be resident in both). That is safe only while the dropped occupant
@@ -5870,6 +6091,9 @@ Flag l1_fill_line(Mem_Req* req) {
   /* --reuse_dist_stats: same victim, same window, its own knob -- did it ever pay off? Outside
      the block above so the two stats stay independently enableable. */
   reuse_dist_count_evict(req->proc_id, &L1(req->proc_id)->cache, FALSE);
+  /* --load_prio_stats: the fill just made and the line it displaced, on their own levels. Same
+     validity window as the two reads above -- before any further insert on this cache. */
+  load_prio_count_fill(req->proc_id, &L1(req->proc_id)->cache, FALSE);
 
   /* --td_load_rrip_fixup: record where this fill landed, for the correction at window close. */
   td_rrip_fixup_record(l1_fixup_op, TD_RRIP_FIXUP_L1, line_addr, l1_fix_depth, l1_fix_thresh, l1_fix_basic);
@@ -6283,6 +6507,8 @@ Flag mlc_fill_line(Mem_Req* req) {
     cache_set_next_fill_store(req->type == MRT_DSTORE || req->type == MRT_WB);
     /* --mlp_lin_offpath_lambda: oracle wrong-path, matching L1_Data.fetched_by_offpath. */
     cache_set_next_fill_offpath(req->off_path);
+    /* --load_prio_stats: the traffic class, for the set-composition histograms. */
+    load_prio_stage_fill(req);
     if (MEMBOUND_STATS && membound_in_roi()) {
       /* Raw-fraction histogram, MLC ONLY. It lives here and not in membound_classify_fill
          because that helper is shared with l1_fill_line, so histogramming inside it made these
@@ -6342,6 +6568,11 @@ Flag mlc_fill_line(Mem_Req* req) {
   // REPL_MOCKINGJAY: hand the fill its PC / traffic class (consumed by the insert below).
   mockingjay_stage_access(&MLC(req->proc_id)->cache, req);
 
+  /* --load_prio_stats: see the matching calls in l1_fill_line -- the set must be snapshotted
+     before the insert below displaces anything. */
+  load_prio_dump_levels(req->proc_id, &MLC(req->proc_id)->cache, TRUE);
+  load_prio_snapshot_set(req->proc_id, &MLC(req->proc_id)->cache, req->addr, TRUE);
+
   /* See the identical check in l1_fill_line: the insert below drops a matching stream-buffer
      occupant, which is only safe while that occupant is clean. */
   if (MLC(req->proc_id)->cache.sb_enabled) {
@@ -6386,6 +6617,8 @@ Flag mlc_fill_line(Mem_Req* req) {
   }
   /* --reuse_dist_stats: see the matching call in the L1 fill. */
   reuse_dist_count_evict(req->proc_id, &MLC(req->proc_id)->cache, TRUE);
+  /* --load_prio_stats: see the matching call in the L1 fill. */
+  load_prio_count_fill(req->proc_id, &MLC(req->proc_id)->cache, TRUE);
 
   /* --td_load_rrip_fixup: the line is in now, so its fill_cycle is this cycle. `line_addr` is
      the one the insert above reported for THIS cache, which is what the correction must look
@@ -6704,6 +6937,17 @@ L1_Data* l1_pref_cache_access(Mem_Req* req) {
     return pref_data;
 
   if (pref_data) {
+    /* --load_prio_stats: this promotion is a real LLC fill, so stage its class and snapshot the
+       set before the insert, exactly as l1_fill_line does.
+
+       KNOWN GAP, shared with --reuse_dist_stats: this path fills WITHOUT a preceding cache_access
+       on the LLC, so the set's miss clock has not ticked for it. Residency and reuse distance on
+       these sets are therefore slightly understated. Not corrected, because ticking at the fill as
+       well would double-count every ordinary miss, which arrives through cache_access. */
+    load_prio_stage_fill(req);
+    load_prio_dump_levels(req->proc_id, &L1(req->proc_id)->cache, FALSE);
+    load_prio_snapshot_set(req->proc_id, &L1(req->proc_id)->cache, req->addr, FALSE);
+
     data = cache_insert(&L1(req->proc_id)->cache, req->proc_id, req->addr, &line_addr, &repl_line_addr);
 
     /* --early_evict_stats: promoting a line out of the prefetch cache is a real LLC fill and
@@ -6721,6 +6965,8 @@ L1_Data* l1_pref_cache_access(Mem_Req* req) {
        the same footing as the ordinary path -- keeping *_REUSE_EVICT_* and L1_EVICT over the
        same population. */
     reuse_dist_count_evict(req->proc_id, &L1(req->proc_id)->cache, FALSE);
+    /* --load_prio_stats: same population, same reason. */
+    load_prio_count_fill(req->proc_id, &L1(req->proc_id)->cache, FALSE);
 
     STAT_EVENT(req->proc_id, L1_DATA_EVICT);
     STAT_EVENT(req->proc_id, L1_PREF_MOVE_L1);

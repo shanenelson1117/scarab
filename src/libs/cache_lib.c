@@ -107,6 +107,10 @@ static double g_next_fill_mlp_cost = 0.0;
 static Flag   g_next_fill_prefetch = FALSE;
 static Flag   g_next_fill_store = FALSE;
 static Flag   g_next_fill_offpath = FALSE;
+/* --load_prio_stats: the traffic class of the next fill. Defaults to LOAD_PRIO_TC_OTHER rather
+ * than to INSTR so that a caller which never stages one is visible as unclassified in the
+ * composition histograms instead of inflating a real class. */
+static uns8   g_next_fill_traffic = LOAD_PRIO_TC_OTHER;
 
 void cache_set_next_fill_bound(Flag membound, Flag fe_bound) {
   g_next_fill_membound = membound;
@@ -159,6 +163,10 @@ void cache_set_next_fill_offpath(Flag is_offpath) {
   g_next_fill_offpath = is_offpath;
 }
 
+void cache_set_next_fill_traffic(uns8 traffic) {
+  g_next_fill_traffic = traffic;
+}
+
 void cache_save_fill_stage(Cache_Fill_Stage* out) {
   out->membound = g_next_fill_membound;
   out->fe_bound = g_next_fill_fe_bound;
@@ -167,6 +175,7 @@ void cache_save_fill_stage(Cache_Fill_Stage* out) {
   out->prefetch = g_next_fill_prefetch;
   out->store = g_next_fill_store;
   out->offpath = g_next_fill_offpath;
+  out->traffic = g_next_fill_traffic;
 }
 
 void cache_restore_fill_stage(const Cache_Fill_Stage* in) {
@@ -177,10 +186,21 @@ void cache_restore_fill_stage(const Cache_Fill_Stage* in) {
   g_next_fill_prefetch = in->prefetch;
   g_next_fill_store = in->store;
   g_next_fill_offpath = in->offpath;
+  g_next_fill_traffic = in->traffic;
 }
 
 void cache_clear_fill_stage(void) {
-  Cache_Fill_Stage z = {FALSE, FALSE, 0.0, 0.0, FALSE, FALSE, FALSE};
+  /* Designated initialisers, not positional: this struct has eight fields now and a positional
+     list silently shifts every value when one is inserted. The cleared traffic class is OTHER,
+     not 0 -- 0 is IFETCH, which would attribute an unstaged fill to real instruction traffic. */
+  Cache_Fill_Stage z = {.membound = FALSE,
+                        .fe_bound = FALSE,
+                        .bound_frac = 0.0,
+                        .mlp_cost = 0.0,
+                        .prefetch = FALSE,
+                        .store = FALSE,
+                        .offpath = FALSE,
+                        .traffic = LOAD_PRIO_TC_OTHER};
   cache_restore_fill_stage(&z);
 }
 
@@ -226,6 +246,7 @@ static inline void consume_fill_bound(Cache_Entry* line) {
   line->fill_was_prefetch = g_next_fill_prefetch;
   line->was_written = g_next_fill_store;
   line->offpath_unproven = g_next_fill_offpath;
+  line->fill_traffic = g_next_fill_traffic;  // --load_prio_stats
   g_next_fill_membound = FALSE;
   g_next_fill_fe_bound = FALSE;
   g_next_fill_bound_frac = 0.0;
@@ -233,6 +254,9 @@ static inline void consume_fill_bound(Cache_Entry* line) {
   g_next_fill_prefetch = FALSE;
   g_next_fill_store = FALSE;
   g_next_fill_offpath = FALSE;
+  /* OTHER, not 0: 0 is LOAD_PRIO_TC_IFETCH, so clearing to it would charge every unstaged fill to
+     real instruction traffic. Same reasoning as cache_clear_fill_stage. */
+  g_next_fill_traffic = LOAD_PRIO_TC_OTHER;
 }
 
 /* REPL_MLP: quantize an MLP-based cost in cycles to a 3-bit level, 0..7.
@@ -350,6 +374,127 @@ static inline double mlp_lin_bound_term(const Cache* cache, const Cache_Entry* e
   return 0.0;
 }
 
+/* The STICKY part of the REPL_MLP boost: the two terms that are fully determined at fill and
+ * never rewritten afterwards. Factored out of the REPL_MLP victim search so --load_prio_stats
+ * cannot drift from the policy it is measuring -- there is one expression, and both callers read
+ * it. The victim search adds the three mutable penalties on top; see find_repl_entry.
+ *
+ * Both terms are already weighted, so the result is in LRU STACK POSITIONS and is directly
+ * comparable against associativity: a boost of 4 means this line sits four positions further from
+ * eviction than its recency alone would put it. */
+static inline double mlp_lin_prio_boost(const Cache* cache, const Cache_Entry* entry) {
+  return lin_lam_mlp(cache) * (double)mlp_lin_costq(entry->mlp_cost) + mlp_lin_bound_term(cache, entry);
+}
+
+/**************************************************************************************/
+/* --load_prio_stats: priority levels.
+ *
+ * mlp_lin_prio_boost is a sum of two terms, each drawn from a small finite set -- costq is 0..7
+ * and the bound term is one of {0, lin_lam_data, lin_lam_instr} -- so the boost takes at most 24
+ * distinct values, all known once the lambdas are. The level is an index into those values sorted
+ * ascending, so level 0 is always the least protected and the top level the most.
+ *
+ * Built once per cache at init. The two lambdas CAN collide -- with --mlp_lin_lambda 1 and
+ * --mlp_lin_data_lambda 2, costq 2 with no bound mark scores the same 2.0 as costq 0 with one --
+ * and colliding combinations deliberately share a level, because the policy cannot tell them
+ * apart either: equal boost means equal protection. The consequence for reading results is that
+ * the level count and the meaning of a given level SHIFT when any lambda changes, so levels are
+ * comparable only within one lambda setting. Read prio_boost[] (exposed as
+ * cache_load_prio_boost) to know what a level stands for in a given run, and never compare
+ * PRIO_L3 across a lambda sweep without checking it. */
+static void load_prio_levels_init(Cache* cache) {
+  cache->prio_num_levels = 0;
+  memset(cache->prio_boost, 0, sizeof(cache->prio_boost));
+  if (!cache->set_miss_ctr)
+    return;  /* not tracked; set_miss_ctr is the single enable test */
+
+  /* The three bound-term values, in the order mlp_lin_bound_term can return them. A line is
+     membound, FE-bound, or neither, and those are mutually exclusive, so this enumerates the
+     term's whole range -- including the sub-threshold case, which returns 0.0 and so is already
+     covered by the `neither` entry. */
+  const double bound_vals[3] = {0.0, lin_lam_data(cache), lin_lam_instr(cache)};
+  const double lam = lin_lam_mlp(cache);
+
+  /* Non-negative lambdas are required, not merely expected. Two reasons, and the second is the
+     one that would bite silently: a negative lambda inverts the policy's meaning (a "boost" that
+     penalises an expensive line), and the *_PRIO_BOOST_X1000 chain is an unsigned Counter, so a
+     negative boost would be emitted as a value near 2^64 rather than as a negative number.
+     Fail at init instead. */
+  ASSERTM(0, lam >= 0.0 && bound_vals[1] >= 0.0 && bound_vals[2] >= 0.0,
+          "--load_prio_stats requires non-negative lambdas; got --mlp_lin_lambda %f "
+          "--mlp_lin_data_lambda %f --mlp_lin_instr_lambda %f\n",
+          lam, bound_vals[1], bound_vals[2]);
+
+  double vals[LOAD_PRIO_MAX_LEVELS];
+  uns    n = 0;
+  for (uns q = 0; q < 8; q++) {
+    for (uns b = 0; b < 3; b++) {
+      const double v = lam * (double)q + bound_vals[b];
+      /* Dedupe on exact equality. Exact is right rather than fragile: both callers build the
+         value through the identical expression on the identical inputs, so a value that should
+         match does match bit for bit. An epsilon compare would instead merge two levels the
+         policy genuinely orders. */
+      Flag seen = FALSE;
+      for (uns k = 0; k < n; k++) {
+        if (vals[k] == v) {
+          seen = TRUE;
+          break;
+        }
+      }
+      if (!seen) {
+        ASSERT(0, n < LOAD_PRIO_MAX_LEVELS);
+        vals[n++] = v;
+      }
+    }
+  }
+
+  /* Insertion sort ascending. n <= 24 and this runs once per cache at init. */
+  for (uns i = 1; i < n; i++) {
+    const double v = vals[i];
+    int          j = (int)i - 1;
+    while (j >= 0 && vals[j] > v) {
+      vals[j + 1] = vals[j];
+      j--;
+    }
+    vals[j + 1] = v;
+  }
+
+  memcpy(cache->prio_boost, vals, n * sizeof(double));
+  cache->prio_num_levels = n;
+}
+
+/* The level a boost value belongs to. Exact match against the table, which is sound for the same
+ * reason the dedupe above is: the value was produced by the same expression from the same
+ * lambdas. A miss would mean the table and the live lambdas have diverged, which is a bug rather
+ * than a data point, so it asserts instead of clamping. */
+static inline uns8 load_prio_level_of(const Cache* cache, double boost) {
+  /* The table is built from the GLOBAL --mlp_lin_* params. That is only valid while no tracked
+     cache is SBAR-owned, which holds because ps_enabled() requires REPL_MLP_PAPER on the MLC and
+     tracking requires REPL_MLP. Assert it rather than trust it: if SBAR ever becomes reachable
+     from REPL_MLP, every level stamped after the first lambda rewrite would be silently wrong. */
+  ASSERTM(0, !cache->lin_lambda_override,
+          "--load_prio_stats: cache '%s' has per-cache (SBAR) lambdas, but the priority level "
+          "table was built from the global --mlp_lin_* params and would be stale\n",
+          cache->name);
+  for (uns k = 0; k < cache->prio_num_levels; k++) {
+    if (cache->prio_boost[k] == boost)
+      return (uns8)k;
+  }
+  ASSERTM(0, FALSE, "--load_prio_stats: boost %f is not in cache '%s' level table (%u levels)\n", boost, cache->name,
+          cache->prio_num_levels);
+  return 0;
+}
+
+uns cache_load_prio_num_levels(Cache* cache) {
+  return cache->prio_num_levels;
+}
+
+double cache_load_prio_boost(Cache* cache, uns level) {
+  if (level >= cache->prio_num_levels)
+    return 0.0;
+  return cache->prio_boost[level];
+}
+
 double cache_last_hit_mlp_cost(Cache* cache) {
   return cache->last_hit_mlp_cost;
 }
@@ -440,6 +585,69 @@ static inline void stamp_reuse_dist(Cache* cache, Cache_Entry* line, uns set) {
   line->reuse_seen = FALSE;
 }
 
+/* --load_prio_stats ---------------------------------------------------------------------------
+ *
+ * The same publish-then-count split as --reuse_dist_stats above, on its own clock. set_miss_ctr[]
+ * being NULL is the enable test on every hot path, so an untracked run pays one null check.
+ *
+ * The clock counts MISSES to the set, not accesses. A miss is the event that allocates and
+ * therefore the event that can displace a resident line, so a residency of N misses means the line
+ * survived N allocation opportunities and is directly comparable against associativity. Hits do
+ * not tick: they cost the resident lines nothing. --reuse_dist_stats measures the other unit on
+ * set_access_ctr[]; the two are independent and must not be divided into one another. */
+
+/* One MISS to `set`. Called from cache_access only once the lookup has failed, and only for a
+ * replacement-updating access -- a probe (update_repl==FALSE) is not an allocation opportunity and
+ * must not move this clock, exactly as it must not move the access clock. */
+static inline void load_prio_miss_tick(Cache* cache, uns set) {
+  if (!cache->set_miss_ctr)
+    return;
+  cache->set_miss_ctr[set]++;
+}
+
+/* A hit on `line` in `set`. Publishes the line's sticky level and the distance since its previous
+ * access in misses to the set, then restarts its miss clock -- restarting is what makes this reuse
+ * distance rather than residency, matching reuse_dist_on_hit.
+ *
+ * The distance can legitimately be 0: no miss to the set intervened, so nothing could have
+ * displaced the line. That is the common case for a tight reuse and is not a degenerate value --
+ * contrast reuse_dist_on_hit, whose minimum is 1 because there the access itself is counted. */
+static inline void load_prio_on_hit(Cache* cache, Cache_Entry* line, uns set) {
+  if (!cache->set_miss_ctr)
+    return;
+  const Counter now = cache->set_miss_ctr[set];
+  /* now >= last_access_miss_count always holds -- the stamp was taken at an earlier point on this
+     same monotonic per-set counter. Guarded anyway because Counter is unsigned and the alternative
+     to a guard is a 2^64 outlier in the histogram. */
+  cache->last_hit_reuse_misses = (now > line->last_access_miss_count) ? now - line->last_access_miss_count : 0;
+  cache->last_hit_prio_level = line->prio_level;
+  cache->last_hit_prio_valid = TRUE;
+  line->last_access_miss_count = now;
+  line->reuse_count++;
+}
+
+/* A fill of `line` into `set`. Stamps the sticky priority level and starts both clocks.
+ *
+ * MUST run after consume_fill_bound, which is what writes the mlp_cost / bound_frac /
+ * membound_fill / fe_bound_fill this reads. Computing the boost from the LINE rather than from the
+ * staging globals is deliberate: the line is what the policy will later evict by, so the two can
+ * never disagree.
+ *
+ * reuse_count restarts at 0 and the miss stamps at the set's current miss count, whatever the line
+ * that previously occupied this way had accumulated. */
+static inline void stamp_load_prio(Cache* cache, Cache_Entry* line, uns set) {
+  if (!cache->set_miss_ctr) {
+    cache->last_fill_prio_valid = FALSE;
+    return;
+  }
+  line->prio_level = load_prio_level_of(cache, mlp_lin_prio_boost(cache, line));
+  line->fill_miss_count = cache->set_miss_ctr[set];
+  line->last_access_miss_count = cache->set_miss_ctr[set];
+  line->reuse_count = 0;
+  cache->last_fill_prio_level = line->prio_level;
+  cache->last_fill_prio_valid = TRUE;
+}
+
 static inline void record_evict_age(Cache* cache, Cache_Entry* victim) {
   /* --reuse_dist_stats: the victim's reuse outcome and marked class, published on the same hook
      and in the same "still readable" window as the residency below. A victim with reuse_seen
@@ -453,6 +661,28 @@ static inline void record_evict_age(Cache* cache, Cache_Entry* victim) {
     cache->last_evict_reused = FALSE;
     cache->last_evict_membound = FALSE;
     cache->last_evict_fe_bound = FALSE;
+  }
+
+  /* --load_prio_stats: the victim's sticky level, its residency in MISSES to its set, and how
+     many times it was actually reused. Published on the same hook and in the same "still
+     readable" window as the two above.
+
+     The set is derived from the victim's own `base` rather than passed in, because this function
+     is called from three places and general_action_repl is not given `set` (see the note at the
+     stamp_reuse_dist call on the strategy path). Deriving it costs one index computation per
+     eviction and only on a tracked cache -- and it cannot pick the wrong set, since base IS the
+     victim's line address. */
+  if (cache->set_miss_ctr && victim && victim->valid) {
+    Addr       vtag = 0, vline = 0;
+    const uns  vset = cache_index(cache, victim->base, &vtag, &vline);
+    const Counter now = cache->set_miss_ctr[vset];
+    cache->last_evict_prio_level = victim->prio_level;
+    cache->last_evict_residency_misses = (now > victim->fill_miss_count) ? now - victim->fill_miss_count : 0;
+    cache->last_evict_reuse_count = victim->reuse_count;
+  } else {
+    cache->last_evict_prio_level = 0;
+    cache->last_evict_residency_misses = 0;
+    cache->last_evict_reuse_count = 0;
   }
 
   if (victim && victim->valid) {
@@ -493,6 +723,72 @@ Flag cache_last_evict_reuse(Cache* cache, Flag* reused, Flag* membound, Flag* fe
   *membound = cache->last_evict_membound;
   *fe_bound = cache->last_evict_fe_bound;
   return TRUE;
+}
+
+Flag cache_last_hit_prio(Cache* cache, uns8* level, Counter* reuse_misses) {
+  if (!cache->last_hit_prio_valid)
+    return FALSE;
+  *level = cache->last_hit_prio_level;
+  *reuse_misses = cache->last_hit_reuse_misses;
+  return TRUE;
+}
+
+Flag cache_last_fill_prio(Cache* cache, uns8* level) {
+  if (!cache->last_fill_prio_valid)
+    return FALSE;
+  *level = cache->last_fill_prio_level;
+  return TRUE;
+}
+
+/* Gated on last_evict_valid, like cache_last_evict_age and cache_last_evict_reuse, so a fill that
+   took a free way reports no eviction. The set_miss_ctr test is separate: on an untracked cache
+   last_evict_valid is still maintained (--early_evict_stats owns it), but the priority fields
+   under it are not, so returning TRUE here would hand the caller a level of 0 for every
+   eviction. */
+Flag cache_last_evict_prio(Cache* cache, uns8* level, Counter* residency_misses, Counter* reuse_count) {
+  if (!cache->set_miss_ctr || !cache->last_evict_valid)
+    return FALSE;
+  *level = cache->last_evict_prio_level;
+  *residency_misses = cache->last_evict_residency_misses;
+  *reuse_count = cache->last_evict_reuse_count;
+  return TRUE;
+}
+
+/* Both walks below index the set from `addr` and read only valid ways. Invalid ways are counted in
+   NEITHER output, so on a set that is not yet full the totals fall short of assoc -- which is the
+   honest answer: an empty way holds nothing. */
+void cache_load_prio_set_composition(Cache* cache, Addr addr, uns* counts) {
+  memset(counts, 0, LOAD_PRIO_NUM_TC * sizeof(uns));
+  if (!cache->set_miss_ctr)
+    return;
+  Addr      tag = 0, line_addr = 0;
+  const uns set = cache_index(cache, addr, &tag, &line_addr);
+  for (uns ii = 0; ii < cache->assoc; ii++) {
+    const Cache_Entry* e = &cache->entries[set][ii];
+    if (!e->valid)
+      continue;
+    /* Clamped rather than trusted: fill_traffic is a uns8 fed from a caller-staged value, and an
+       out-of-range class would write past the end of `counts`. */
+    if (e->fill_traffic < LOAD_PRIO_NUM_TC)
+      counts[e->fill_traffic]++;
+    else
+      counts[LOAD_PRIO_TC_OTHER]++;
+  }
+}
+
+void cache_load_prio_set_occupancy(Cache* cache, Addr addr, uns* counts) {
+  memset(counts, 0, LOAD_PRIO_MAX_LEVELS * sizeof(uns));
+  if (!cache->set_miss_ctr)
+    return;
+  Addr      tag = 0, line_addr = 0;
+  const uns set = cache_index(cache, addr, &tag, &line_addr);
+  for (uns ii = 0; ii < cache->assoc; ii++) {
+    const Cache_Entry* e = &cache->entries[set][ii];
+    if (!e->valid)
+      continue;
+    if (e->prio_level < cache->prio_num_levels)
+      counts[e->prio_level]++;
+  }
 }
 
 /**************************************************************************************/
@@ -670,6 +966,22 @@ void init_cache(Cache* cache, const char* name, uns cache_size, uns assoc, uns l
   cache->last_evict_reused = FALSE;
   cache->last_evict_membound = FALSE;
   cache->last_evict_fe_bound = FALSE;
+  /* --load_prio_stats: cleared for EVERY cache, ahead of the strategy branch, for the same reason
+     the fields above are -- Cache structs are malloc'd, so an untracked cache must read as
+     untracked rather than as garbage. set_miss_ctr is the enable test on every hot path and is
+     allocated below, only on the REPL_MLP path; leaving it NULL here is what makes every
+     load_prio_* entry point inert on a strategy-policy cache, which never reaches that code. */
+  cache->set_miss_ctr = NULL;
+  cache->prio_num_levels = 0;
+  memset(cache->prio_boost, 0, sizeof(cache->prio_boost));
+  cache->last_hit_prio_valid = FALSE;
+  cache->last_hit_prio_level = 0;
+  cache->last_hit_reuse_misses = 0;
+  cache->last_fill_prio_valid = FALSE;
+  cache->last_fill_prio_level = 0;
+  cache->last_evict_prio_level = 0;
+  cache->last_evict_residency_misses = 0;
+  cache->last_evict_reuse_count = 0;
   memset(&cache->sb, 0, sizeof(cache->sb));
 
   if (repl_policy >= REPL_VOID) {
@@ -692,6 +1004,17 @@ void init_cache(Cache* cache, const char* name, uns cache_size, uns assoc, uns l
   cache->set_mask = N_BIT_MASK(LOG2(num_sets));       /* use after shifting */
   cache->tag_mask = ~cache->set_mask;                 /* use after shifting */
   cache->offset_mask = N_BIT_MASK(cache->shift_bits); /* use before shifting */
+
+  /* --load_prio_stats: per-set MISS counters, plus the priority level table they gate.
+     REPL_MLP only -- the levels are indices into that policy's own boost, and on any other policy
+     mlp_cost / bound_frac are either unpopulated or never acted on, so a level would be a number
+     with no meaning. Allocated here rather than in the common block above because the test needs
+     cache->repl_policy, and load_prio_levels_init needs cache->name for its assert message; both
+     are set just above. Left NULL otherwise, which is the enable test everywhere else. */
+  if (LOAD_PRIO_STATS && repl_policy == REPL_MLP) {
+    cache->set_miss_ctr = (Counter*)calloc(num_sets, sizeof(Counter));
+    load_prio_levels_init(cache);
+  }
 
   /* allocate memory for NMRU replacement counters  */
   cache->repl_ctrs = (uns*)calloc(num_sets, sizeof(uns));
@@ -719,6 +1042,16 @@ void init_cache(Cache* cache, const char* name, uns cache_size, uns assoc, uns l
       cache->entries[ii][jj].fill_cycle = 0;  // --early_evict_stats
       cache->entries[ii][jj].last_access_count = 0;  // --reuse_dist_stats
       cache->entries[ii][jj].reuse_seen = FALSE;     // --reuse_dist_stats
+      /* --load_prio_stats. fill_traffic is OTHER, not 0: 0 is LOAD_PRIO_TC_IFETCH, and a way that
+         has never been filled must not read as holding an instruction line. Set on every cache
+         whether or not the knob is on -- these are plain stores on lines being initialised
+         anyway, and a line left holding garbage would be walked by the set-composition helpers
+         if the knob were ever enabled against a malloc'd Cache. */
+      cache->entries[ii][jj].prio_level = 0;
+      cache->entries[ii][jj].fill_traffic = LOAD_PRIO_TC_OTHER;
+      cache->entries[ii][jj].fill_miss_count = 0;
+      cache->entries[ii][jj].last_access_miss_count = 0;
+      cache->entries[ii][jj].reuse_count = 0;
       if (data_size) {
         cache->entries[ii][jj].data = (void*)malloc(data_size);
         memset(cache->entries[ii][jj].data, 0, data_size);
@@ -801,6 +1134,7 @@ void* cache_access(Cache* cache, Addr addr, Addr* line_addr, Flag update_repl) {
   cache->last_hit_bound_frac = 0.0;
   cache->last_hit_fe_bound = FALSE;
   cache->last_hit_reuse_valid = FALSE;
+  cache->last_hit_prio_valid = FALSE;  // --load_prio_stats
 
   /* --reuse_dist_stats: count this access against the set BEFORE the lookup, so the distance a
      hit reports includes the hit itself and the minimum distance is 1. Ticked here rather than
@@ -809,6 +1143,11 @@ void* cache_access(Cache* cache, Addr addr, Addr* line_addr, Flag update_repl) {
      purposes and must not move the clock. */
   if (update_repl)
     reuse_dist_tick(cache, set);
+
+  /* --load_prio_stats does NOT tick here. Its clock counts misses, which is not known until the
+     lookup below has failed, so the tick sits on the miss path at the bottom of this function.
+     That also means the miss clock, unlike the access clock, is NOT advanced past a hit before
+     load_prio_on_hit reads it -- which is why the minimum reuse distance there is 0 and not 1. */
 
   if (cache->repl_policy >= REPL_VOID) {
     void* strategy_data = cache_access_strategy(cache, addr, line_addr, update_repl);
@@ -852,6 +1191,7 @@ void* cache_access(Cache* cache, Addr addr, Addr* line_addr, Flag update_repl) {
         }
         cache->num_demand_access++;
         reuse_dist_on_hit(cache, line, set);  // --reuse_dist_stats
+        load_prio_on_hit(cache, line, set);   // --load_prio_stats
         update_repl_policy(cache, line, set, ii, FALSE);
         DEBUG(0, "(%s, %d) [0x%x, 0x%x]: in access\n\n", cache->name, cache->repl_policy, cache->num_sets,
               cache->assoc);
@@ -875,6 +1215,16 @@ void* cache_access(Cache* cache, Addr addr, Addr* line_addr, Flag update_repl) {
     DEBUG(0, "Checking shadow cache '%s' at (set %u), base 0x%s\n", cache->name, set, hexstr64s(addr));
     return access_shadow_lines(cache, set, tag);
   }
+
+  /* --load_prio_stats: a genuine miss in the data array -- tick the set's miss clock.
+     Placed on this path rather than beside reuse_dist_tick at the top because the clock counts
+     misses, which is only known here. A probe (update_repl==FALSE) is not an allocation
+     opportunity and must not move it, exactly as it must not move the access clock.
+     The REPL_IDEAL / REPL_SHADOW_IDEAL returns above are deliberately NOT ticked: those policies
+     may still serve the access from their side structures, so it is not yet known to be a miss.
+     Neither is tracked (the tracker is REPL_MLP only), so this costs them nothing. */
+  if (update_repl)
+    load_prio_miss_tick(cache, set);
 
   DEBUG(0, "Didn't find line in set %u in cache '%s' base 0x%s\n", set, cache->name, hexstr64s(addr));
   return NULL;
@@ -951,6 +1301,10 @@ void* cache_insert_replpos(Cache* cache, uns8 proc_id, Addr addr, Addr* line_add
   consume_fill_bound(new_line);    // --membound_stats: non-strategy path (incl. REPL_TRUE_LRU)
   stamp_fill_cycle(new_line);      // --early_evict_stats: start this line's residency clock
   stamp_reuse_dist(cache, new_line, set);  // --reuse_dist_stats: start its reuse clock
+  /* --load_prio_stats: AFTER consume_fill_bound, which writes the mlp_cost / bound_frac /
+     membound_fill / fe_bound_fill that the boost is computed from. Stamping earlier would read
+     the PREVIOUS line's classification and level every fill against the wrong line. */
+  stamp_load_prio(cache, new_line, set);
 
   switch (insert_repl_policy) {
     case INSERT_REPL_DEFAULT:
@@ -1069,6 +1423,17 @@ void cache_invalidate(Cache* cache, Addr addr, Addr* line_addr) {
          than load-bearing -- but an invalidated line is never counted at an eviction (it is not
          valid, so record_evict_age publishes nothing), and leaving reuse_seen set would make it
          look reused if that ever changed. */
+      /* --load_prio_stats: same hygiene, and here it IS load-bearing for one reader. The
+         set-composition and occupancy walks skip invalid ways, so a stale level cannot reach
+         them -- but fill_traffic must go back to OTHER rather than stay at a real class, because
+         cache_invalidate is called at the top of every cache_insert_replpos (the "do not insert
+         twice" check) and a way that is about to be refilled should carry no inherited class if
+         the staging for that fill is ever empty. */
+      line->prio_level = 0;
+      line->fill_traffic = LOAD_PRIO_TC_OTHER;
+      line->fill_miss_count = 0;
+      line->last_access_miss_count = 0;
+      line->reuse_count = 0;
       line->last_access_count = 0;
       line->reuse_seen = FALSE;
     }
@@ -1169,9 +1534,14 @@ Cache_Entry* find_repl_entry(Cache* cache, uns8 proc_id, uns set, uns* way) {
             rank++;
         }
         /* The prefetch term SUBTRACTS: eviction takes the minimum value, so a penalty pushes a
-           line down the ordering exactly as the boundness bonus pushes one up. */
-        double val = (double)rank + lin_lam_mlp(cache) * (double)mlp_lin_costq(entry->mlp_cost) +
-                     mlp_lin_bound_term(cache, entry) -
+           line down the ordering exactly as the boundness bonus pushes one up.
+
+           The first two terms are mlp_lin_prio_boost -- the STICKY part, shared with
+           --load_prio_stats so the tracker's priority axis is the policy's own by construction
+           rather than by a copied expression. The three penalties stay here because they are
+           mutable (was_written is set by cache_mark_written, offpath_unproven cleared by
+           cache_clear_offpath) and so cannot belong to a level stamped once at fill. */
+        double val = (double)rank + mlp_lin_prio_boost(cache, entry) -
                      (entry->fill_was_prefetch ? (double)MLP_LIN_PREF_LAMBDA : 0.0) -
                      (entry->was_written ? (double)MLP_LIN_STORE_LAMBDA : 0.0) -
                      (entry->offpath_unproven ? (double)MLP_LIN_OFFPATH_LAMBDA : 0.0);
@@ -1798,6 +2168,16 @@ void reset_cache(Cache* cache) {
   cache->sb.valid = FALSE;
   cache->sb.tag = 0;
   cache->sb.base = 0;
+
+  /* --load_prio_stats: same hygiene, and the trap here is quieter than a resurrected line. The
+     per-set miss clocks are monotonic and lines are stamped against them, so a reset that left
+     them running would make the first residency measured after it the whole pre-reset count --
+     a single enormous outlier in RESIDENCY_MISSES rather than an obvious failure. Zeroed here so
+     wiring reset_cache up later cannot introduce that silently. The access clock that
+     --reuse_dist_stats keeps has the identical exposure and is deliberately left alone: that is
+     pre-existing behaviour, and changing it is not this knob's business. */
+  if (cache->set_miss_ctr)
+    memset(cache->set_miss_ctr, 0, cache->num_sets * sizeof(Counter));
 }
 
 /**************************************************************************************/
@@ -2108,6 +2488,14 @@ void general_action_init(Cache* cache, const char* name, uns cache_size, uns ass
       cache->entries[ii][jj].fill_cycle = 0;  // --early_evict_stats
       cache->entries[ii][jj].last_access_count = 0;  // --reuse_dist_stats
       cache->entries[ii][jj].reuse_seen = FALSE;     // --reuse_dist_stats
+      /* --load_prio_stats: never tracked on this path (the tracker is REPL_MLP only, which is
+         below REPL_VOID and so never reaches init_cache_strategy), but initialised for the same
+         hygiene reason as the fields above -- the struct should be fully defined regardless. */
+      cache->entries[ii][jj].prio_level = 0;
+      cache->entries[ii][jj].fill_traffic = LOAD_PRIO_TC_OTHER;
+      cache->entries[ii][jj].fill_miss_count = 0;
+      cache->entries[ii][jj].last_access_miss_count = 0;
+      cache->entries[ii][jj].reuse_count = 0;
       if (data_size) {
         cache->entries[ii][jj].data = (void*)malloc(data_size);
         memset(cache->entries[ii][jj].data, 0, data_size);

@@ -707,6 +707,19 @@ DEF_STAT(  FUS_UNAVAIL_DIST_20MORE     , DIST , NO_RATIO  )
                              term), WAIT_LOADS is a subset of FU0_LOADS. Neither may be added
                              into the sum-to-NODE_CYCLE checks.
 
+     MEMPROXY_FU0_ROB_FULL   no FU executing AND the REORDER BUFFER is at NODE_TABLE_SIZE. The
+                             classic memory-bound signature: a long-latency load blocks
+                             retirement, the ROB backs up behind it, dispatch stalls.
+                             _LOADS adds >=1 load in flight.
+     MEMPROXY_FU0_RS_FULL    no FU executing AND every RESERVATION STATION is at capacity, i.e.
+                             the SCHEDULING window cannot accept another op. A DIFFERENT
+                             structure from the ROB -- 186 RS entries against a 352-entry ROB on
+                             this config -- so the two saturate at different times and a cycle
+                             can be one, the other, both or neither. An infinite RS (size 0)
+                             makes this permanently FALSE.
+                             All three are SUB-COUNTS of FUS_BUSY_DIST_0, not part of either
+                             partition; do not add them into the sum-to-NODE_CYCLE checks.
+
      MEMPROXY_FU0_LOAD1      SUB-COUNT of MEMPROXY_FU0_LOADS: nothing executing and EXACTLY ONE
                              load outstanding, i.e. MLP 1 -- the isolated miss, where the machine
                              pays the miss's full latency with nothing to overlap it. NOT a fifth
@@ -731,6 +744,9 @@ DEF_STAT(  MEMPROXY_FU0_LOADS               , COUNT, NO_RATIO  )
 DEF_STAT(  MEMPROXY_FU0_LOAD1               , COUNT, NO_RATIO  )
 DEF_STAT(  MEMPROXY_FU0_WAIT                 , COUNT, NO_RATIO  )
 DEF_STAT(  MEMPROXY_FU0_WAIT_LOADS           , COUNT, NO_RATIO  )
+DEF_STAT(  MEMPROXY_FU0_ROB_FULL             , COUNT, NO_RATIO  )
+DEF_STAT(  MEMPROXY_FU0_ROB_FULL_LOADS       , COUNT, NO_RATIO  )
+DEF_STAT(  MEMPROXY_FU0_RS_FULL              , COUNT, NO_RATIO  )
 DEF_STAT(  MEMPROXY_FU0_NOLOADS             , COUNT, NO_RATIO  )
 DEF_STAT(  MEMPROXY_FUBUSY_LOADS            , COUNT, NO_RATIO  )
 DEF_STAT(  MEMPROXY_FUBUSY_NOLOADS          , COUNT, NO_RATIO  )

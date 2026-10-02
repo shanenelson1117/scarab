@@ -480,6 +480,161 @@ DEF_PARAM(early_evict_lat_mult, EARLY_EVICT_LAT_MULT, uns, uns, 2, )
  * sit on the Periodic_* window. Divide by Periodic_Instructions, never by Cumulative_*. */
 DEF_PARAM(reuse_dist_stats, REUSE_DIST_STATS, Flag, Flag, FALSE, )
 
+/* --load_prio_stats: per-PRIORITY-LEVEL load tracker for the MLC and the LLC.
+ *
+ * REPL_MLP ONLY. The priority axis is that policy's own value function, so the knob does nothing
+ * on any other replacement policy: set --mlc_cache_repl_policy 9 and/or --l1_cache_repl_policy 9
+ * or every chain below stays at zero. A cache not running REPL_MLP leaves set_miss_ctr NULL,
+ * which is the enable test on every hot path, so an unrelated run pays one null check per access.
+ *
+ * WHAT A PRIORITY LEVEL IS. The level is the line's BOOST -- the non-recency part of the REPL_MLP
+ * value function, i.e. how far the policy displaces the line from where its recency alone would
+ * put it:
+ *
+ *     boost = --mlp_lin_lambda * mlp_lin_costq(mlp_cost) + mlp_lin_bound_term(line)
+ *
+ * Both terms are already weighted, so the boost is in LRU STACK POSITIONS and is directly
+ * comparable against associativity: a boost of 4 at the 16-way MLC is a quarter of the stack.
+ * The expression is shared with find_repl_entry (mlp_lin_prio_boost), not copied, so the tracker
+ * cannot drift from the policy it measures.
+ *
+ * ONLY THOSE TWO TERMS. find_repl_entry's boost also SUBTRACTS --mlp_lin_pref_lambda,
+ * --mlp_lin_store_lambda and --mlp_lin_offpath_lambda. Those are deliberately excluded, and that
+ * is what makes a level sticky at all: was_written is set long after the fill by
+ * cache_mark_written (a writeback hitting a resident line) and offpath_unproven is cleared by
+ * cache_clear_offpath (an on-path hit vindicating a wrong-path fill), so a level built from them
+ * would silently stop describing the line it was stamped on. The two terms kept are both fully
+ * determined at fill and never rewritten. If you are sweeping those three penalties, note that
+ * the tracker will not see them -- two runs differing only in --mlp_lin_store_lambda produce
+ * identical levels.
+ *
+ * STICKY AT FILL. A line's level is stamped once, at its fill, and every event in its life --
+ * every hit, and its eviction -- is charged to that level. So a chain reads "lines that ARRIVED
+ * at priority L behaved like this", which is the attribution that makes the per-level hit rate
+ * and mean reuse count well defined. The alternative, recomputing live at each event, would let
+ * one line contribute to several levels and turn every per-level total into events-not-lines.
+ *
+ * LEVELS ARE NOT COMPARABLE ACROSS A LAMBDA SWEEP. costq is 0..7 and the bound term is one of
+ * {0, --mlp_lin_data_lambda, --mlp_lin_instr_lambda}, so the boost takes at most 24 distinct
+ * values; the level is the index of the line's boost in that set sorted ASCENDING, so level 0 is
+ * always the least protected. But both the NUMBER of levels and the boost a given level stands
+ * for depend on the lambdas: with --mlp_lin_data_lambda 0 (the default) the bound term vanishes
+ * and there are exactly 8 levels, one per costq. Worse, lambdas can COLLIDE -- at
+ * --mlp_lin_lambda 1 --mlp_lin_data_lambda 2, a costq-2 line with no bound mark scores the same
+ * 2.0 as a costq-0 line with one, and the two share a level. That is correct (equal boost is
+ * equal protection, and the policy cannot tell them apart either) but it means PRIO_L3 in one run
+ * is not PRIO_L3 in another. Read *_PRIO_NUM_LEVELS and *_PRIO_BOOST_L<n> to recover what each
+ * level meant in a given run before comparing anything across runs.
+ *
+ * THE UNIT IS MISSES TO THE SET, for both residency and reuse distance. A miss is the event that
+ * allocates and therefore the event that can displace a resident line; a hit costs the resident
+ * lines nothing. So a residency of N misses says the line survived N allocation opportunities,
+ * and a reuse distance of N says N allocation opportunities passed between two uses. Both are
+ * directly comparable against ASSOCIATIVITY -- a reuse within fewer misses than the set has ways
+ * was never at risk, so only the mass at or above assoc is what a priority-aware policy can
+ * actually convert.
+ *
+ * NOT THE SAME UNIT AS --reuse_dist_stats, which measures ACCESSES to the set on its own
+ * independent per-set counter. Both knobs work with or without the other, but a distance from one
+ * must never be divided into or compared against a distance from the other. The two also differ
+ * at the bottom of the range: --reuse_dist_stats has a minimum of 1 because it counts the access
+ * itself, while here the minimum is 0 -- no miss intervened, so nothing could have displaced the
+ * line.
+ *
+ * WHAT THE CHAINS ARE. Per level: FILL, HIT, EVICT, NOREUSE, and the two sums
+ * RESIDENCY_MISSES / REUSE_MISSES. Derive the four metrics as
+ *
+ *   hit rate         = HIT / (HIT + FILL)
+ *   mean reuses/line = HIT / FILL
+ *   mean residency   = RESIDENCY_MISSES / EVICT      (in misses to the set)
+ *   mean reuse dist  = REUSE_MISSES / HIT            (in misses to the set)
+ *
+ * The hit-rate denominator is HIT + FILL and not an access count, because every access that
+ * touches a level-L line is either the miss that filled it or a later hit on it -- there is no
+ * third kind, and a miss on a line that is not resident has no level to charge.
+ *
+ * READ *_NOREUSE BEFORE THE REUSE-DISTANCE SUM, for the same reason --reuse_dist_stats says so:
+ * REUSE_MISSES can only contain lines that WERE reused, so alone it is a biased sample. A policy
+ * that protects a level can raise that level's mean reuse distance purely by keeping hopeless
+ * lines resident longer, and that moves NOREUSE and nothing else. The pair is the measurement.
+ *
+ * WHAT THE CACHE HOLDS, vs what it admits. Two separate set walks run at every fill, before the
+ * arriving line has displaced anything:
+ *   - *_PRIO_OCCUP_L<n> adds, per fill, the number of resident lines at each level. Summed over a
+ *     run this is OCCUPANCY -- what the cache actually contains -- which the per-fill event chains
+ *     cannot give: a level can take a small share of fills and still hold most of the cache, or
+ *     the reverse. Divide a level's OCCUP by the total over all levels for its share of capacity.
+ *   - *_COMP_<class>_<k> histogram how many of the set's ways held each traffic class, k running
+ *     0..16 (= MLC and LLC associativity). Set-wide, NOT split by level.
+ *
+ * TRAFFIC CLASSES. Six DISJOINT classes that partition Mem_Req_Type, so their counts over a set
+ * sum to its valid ways:
+ *
+ *     COMP_IFETCH  IFETCH                               demand instruction fetch
+ *     COMP_IPREF   IPRF, UOCPRF, FDIPPRFON, FDIPPRFOFF  instruction prefetch
+ *     COMP_LOAD    DFETCH                               demand data load
+ *     COMP_DPREF   DPRF                                 data prefetch
+ *     COMP_STORE   DSTORE                               demand store
+ *     COMP_WB      WB, WB_NODIRTY                       writeback from the level above
+ *
+ * plus four COARSER views that overlap the six and each other:
+ *
+ *     COMP_ALL_INSTR         = IFETCH + IPREF        every instruction line
+ *     COMP_ALL_PREF          = IPREF  + DPREF        every prefetched line
+ *     COMP_ALL_READ          = IFETCH + LOAD         every DEMAND read
+ *     COMP_ALL_DATA_NONLOAD  = DPREF + STORE + WB    data no demand load brought in
+ *
+ * ALL_READ IS DEMAND ONLY -- prefetch is excluded on purpose, since a prefetch is speculative
+ * rather than a read the program issued and ALL_PREF already accounts for it. It is therefore NOT
+ * a read/write split: ALL_READ + COMP_STORE + COMP_WB falls short of the set's valid ways by
+ * exactly COMP_ALL_PREF. ALL_DATA_NONLOAD + COMP_LOAD is the whole data side, which is why there is
+ * no COMP_ALL_DATA chain.
+ *
+ * THE ALL_* VIEWS ARE NOT DERIVABLE from the six, which is why they are chains of their own. These
+ * are histograms of per-fill occupancy counts, and histograms do not add -- COMP_IFETCH_3 and
+ * COMP_IPREF_2 are separate events about separate fills and say nothing about a set holding 5
+ * instruction lines. Summing the two CSV columns gives a meaningless number; use COMP_ALL_INSTR.
+ * Adding a fifth view means adding a chain and a sum in load_prio_snapshot_set; it cannot be done
+ * in a plot script.
+ *
+ * ON PARAMS.google expect COMP_DPREF to be ZERO, COMP_ALL_PREF to equal COMP_IPREF, and
+ * COMP_ALL_DATA_NONLOAD to be COMP_STORE + COMP_WB: the data prefetchers are off
+ * (--pref_framework_on 0, --pref_stream_on 0), so every prefetch is an FDIP instruction prefetch.
+ * Prefetch occupancy is still fully visible, which it was not when instruction prefetch was folded
+ * into the instruction class.
+ *
+ * The six counts fall short of the set's valid ways only for lines of an unmapped type
+ * (MRT_MIN_PRIORITY), which are walked but histogrammed nowhere; invalid ways hold nothing and are
+ * counted nowhere, so a set that is not yet full falls short of 16.
+ *
+ * WHAT COUNTS AS A MISS. The per-set clock ticks once per REPLACEMENT-UPDATING cache_access that
+ * fails to find its line, so a distance is the number of accesses that could actually have
+ * evicted the line. Three consequences, the first two shared with --reuse_dist_stats:
+ *   - Probes (update_repl==FALSE) do not tick. Neither do prefetch accesses under
+ *     --prefetch_update_lru_mlc 0 / --prefetch_update_lru_l1 0; both default TRUE and
+ *     PARAMS.google does not override them, so on the stock config every miss counts. Turning
+ *     either off narrows this clock as well as the LRU stack, which is consistent but worth
+ *     knowing when comparing across those runs.
+ *   - The prefetch-cache promotion path into the LLC fills without a preceding cache_access on
+ *     the LLC, so it stamps a line without having ticked that set's miss clock. That slightly
+ *     understates residency and reuse distance on those sets. Not corrected, because ticking at
+ *     the fill as well would double-count every ordinary miss, which arrives via cache_access.
+ *   - REPL_IDEAL and REPL_SHADOW_IDEAL may still serve an access from a side structure after the
+ *     array lookup fails, so those two do not tick either. Neither is ever tracked (the tracker
+ *     is REPL_MLP only), so this costs nothing in practice.
+ *
+ * NOT COVERED: --marked_rrip_stream_buf, for the same reason --reuse_dist_stats is not. A hit
+ * served from the one-line victim buffer holds a line that is in no set, so there is no set clock
+ * to measure it against. The buffer requires REPL_MARKED_RRIP, which is never tracked here, so it
+ * cannot interact with this knob at all.
+ *
+ * WINDOW: TARGET-ONLY. Every counter is gated on early_evict_in_roi(), the same gate as
+ * --early_evict_stats and --reuse_dist_stats, so under --full_warmup they start at the warmup
+ * boundary and sit on the Periodic_* window. Divide by Periodic_Instructions, NEVER by
+ * Cumulative_*, which spans warmup as well. The per-line stamping is deliberately NOT gated --
+ * a line filled during warmup and hit inside the target window must still carry a level. */
+DEF_PARAM(load_prio_stats, LOAD_PRIO_STATS, Flag, Flag, FALSE, )
+
 /* --mlp_cost_stats: accumulate the MLP-based cost of every demand MLC miss, per
  * "A Case for MLP-Aware Cache Replacement" (Qureshi et al., ISCA'06), Algorithm 1.
  *

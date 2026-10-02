@@ -204,8 +204,111 @@ typedef struct Cache_Entry_struct {
   Counter last_access_count;
   Flag reuse_seen;
 
+  /* --load_prio_stats: the line's PRIORITY LEVEL, stamped at fill and STICKY for its lifetime.
+     An index into Cache.prio_boost[], which holds the distinct values of the REPL_MLP boost
+
+         boost = lin_lam_mlp * mlp_lin_costq(mlp_cost) + mlp_lin_bound_term(line)
+
+     sorted ascending. Only those TWO terms: the pref / store / offpath penalties in
+     find_repl_entry are deliberately NOT included, which is what makes this level sticky at all.
+     was_written is set later by cache_mark_written() and offpath_unproven is cleared later by
+     cache_clear_offpath(), so a level built from them would silently drift from the value stamped
+     here; the two terms kept are both fully determined at fill and never rewritten.
+
+     Computed from the line AFTER consume_fill_bound has written mlp_cost / bound_frac /
+     membound_fill / fe_bound_fill onto it, so it reads exactly the state the policy will later
+     evict by -- the boost is not recomputed from the staging globals, which would diverge the
+     moment a staging field is added and the copy here is forgotten.
+
+     Meaningful ONLY on a cache running REPL_MLP; prio_boost[] is left unbuilt (prio_num_levels
+     0) on every other policy and this field stays 0. See --load_prio_stats. */
+  uns8 prio_level;
+
+  /* --load_prio_stats: which traffic class the fill that installed this line belonged to, one of
+     Load_Prio_Traffic. Staged by the caller (only memory.c knows the Mem_Req type) and consumed
+     at fill like the bound flags, so it is fill history and never rewritten.
+
+     A field of its own rather than derived from the existing bits, because none of them answer
+     it: membound_fill / fe_bound_fill are the MARKED classes and are both FALSE for an
+     unclassified line of either kind, fill_was_prefetch does not distinguish an instruction
+     prefetch from a data one, and was_written is mutable. */
+  uns8 fill_traffic;
+
+  /* --load_prio_stats: the value of Cache.set_miss_ctr[set] at this line's FILL, and at its LAST
+     ACCESS, respectively. Subtracting the first from the set's current miss count at eviction
+     gives the line's RESIDENCY in misses to its set; subtracting the second at a hit gives its
+     REUSE DISTANCE in misses to its set.
+
+     MISSES, not accesses -- which is what makes these different from last_access_count above and
+     why both counters exist. A miss to the set is the event that can actually displace a line
+     (every miss allocates, barring a bypass), so a residency of N misses at a 16-way set says the
+     line survived N allocation opportunities. Hits to the set do not tick: they cost the line
+     nothing. --reuse_dist_stats measures the other unit, accesses, and the two must not be mixed.
+
+     reuse_count is the number of hits this line has taken since its fill. The existing
+     reuse_seen Flag answers only "ever", which cannot separate a line hit once from one hit forty
+     times -- and the per-level mean reuse count is the whole point of the chain here. */
+  Counter fill_miss_count;
+  Counter last_access_miss_count;
+  Counter reuse_count;
+
   Flag outcome;       /* for replacement policy */
 } Cache_Entry;
+
+/* --load_prio_stats: the traffic class of a fill, for the set-composition histograms.
+ *
+ * These six classes are DISJOINT and together they PARTITION Mem_Req_Type, so the per-class counts
+ * over a set sum to its valid ways. That is the point: a line carries exactly one class, so the
+ * stored classes have to partition, and any COARSER view (all instructions, all prefetch, all
+ * data) has to be computed by the set walk while it still has every way's class in hand.
+ *
+ * It cannot be recovered afterwards. The chains are histograms of per-fill occupancy counts, and
+ * histograms do not add: COMP_IFETCH_3 and COMP_IPREF_2 are separate events and say nothing about a
+ * set holding 5 instruction lines of either kind. Hence the four ALL_* chains in memory.stat.def --
+ * ALL_INSTR, ALL_PREF, ALL_READ and ALL_DATA_NONLOAD -- which the walk emits alongside these; see
+ * load_prio_snapshot_set. ALL_READ is DEMAND reads only (IFETCH + LOAD), so it is not the
+ * complement of the write classes.
+ *
+ * INSTRUCTION PREFETCH IS ITS OWN CLASS, split from demand IFETCH, and data prefetch likewise from
+ * DFETCH. Merging prefetch into its demand class was the earlier design and it made prefetch
+ * occupancy unobservable on PARAMS.google: the data prefetchers are off there
+ * (--pref_framework_on 0, --pref_stream_on 0), so every prefetch is an FDIP instruction prefetch
+ * and a data-prefetch-only chain reads zero while the real prefetch traffic hides among the
+ * instruction lines.
+ *
+ * WRITEBACK IS ITS OWN CLASS, split from demand DSTORE. Both carry write traffic, but a writeback
+ * is an eviction arriving from the level above rather than a program store, and they have no reason
+ * to share a bucket. Cache_Entry.was_written still spans both, because the REPL_MLP store penalty
+ * is about write traffic as such; this is about provenance.
+ *
+ * OTHER exists so the enum is total (MRT_MIN_PRIORITY, and any type added later) rather than
+ * silently folding an unmapped type into a real class. It is walked but not histogrammed, so a set
+ * whose six counts fall short of its valid ways holds OTHER lines. */
+typedef enum Load_Prio_Traffic_enum {
+  LOAD_PRIO_TC_IFETCH, /* IFETCH -- demand instruction fetch */
+  LOAD_PRIO_TC_IPREF,  /* IPRF, UOCPRF, FDIPPRFON, FDIPPRFOFF -- instruction prefetch */
+  LOAD_PRIO_TC_LOAD,   /* DFETCH -- demand data load */
+  LOAD_PRIO_TC_DPREF,  /* DPRF -- data prefetch */
+  LOAD_PRIO_TC_STORE,  /* DSTORE -- demand store */
+  LOAD_PRIO_TC_WB,     /* WB, WB_NODIRTY -- writeback from the level above */
+  LOAD_PRIO_TC_OTHER,  /* anything unmapped; walked but not histogrammed */
+  LOAD_PRIO_NUM_TC
+} Load_Prio_Traffic;
+
+/* --load_prio_stats: the most levels the boost can take. mlp_lin_costq returns 0..7 (8 values)
+ * and mlp_lin_bound_term returns one of {0, lin_lam_data, lin_lam_instr} (3 values), so the sum
+ * takes at most 8*3 = 24 distinct values. Fewer in practice: with the default
+ * --mlp_lin_data_lambda 0 / --mlp_lin_instr_lambda 0 the bound term is always 0 and there are
+ * exactly 8. The stat chains are sized for the maximum and only the first prio_num_levels of
+ * them are ever charged. */
+#define LOAD_PRIO_MAX_LEVELS 24
+
+/* --load_prio_stats: the highest way count the set-composition chains can name, so those chains
+ * are LOAD_PRIO_COMP_MAX_WAYS + 1 entries long (0..16 inclusive). 16 is the associativity of both
+ * tracked caches -- --mlc_assoc and --l1_assoc are 16 on every PARAMS file in the tree. A cache
+ * configured wider still works: the counting side clamps, so the top bucket saturates rather than
+ * the chain being overrun. */
+#define LOAD_PRIO_COMP_MAX_WAYS 16
 
 // DO NOT CHANGE THIS ORDER
 typedef enum Cache_Insert_Repl_enum {
@@ -358,6 +461,55 @@ typedef struct Cache_struct {
   Flag last_evict_reused;   /* the victim had been hit at least once since its fill */
   Flag last_evict_membound; /* the victim was filled by a membound access */
   Flag last_evict_fe_bound; /* ... or by an FE-bound one (mutually exclusive with membound) */
+
+  /* --load_prio_stats: one monotonic MISS counter per set, incremented once per
+     replacement-updating cache_access that indexes the set and does NOT find its line. NULL
+     unless the knob is on AND this cache runs REPL_MLP, and that NULL doubles as the enable test
+     on every hot path here, exactly as set_access_ctr does for --reuse_dist_stats.
+
+     Deliberately a SECOND counter rather than a reuse of set_access_ctr, which counts hits and
+     misses alike. The unit here is allocation pressure: a miss is what displaces a line, a hit
+     costs the resident lines nothing, so residency and reuse distance measured in misses say
+     directly how many allocation opportunities a line survived. The two counters are independent
+     and either knob works without the other. */
+  Counter* set_miss_ctr;
+
+  /* --load_prio_stats: the distinct values the REPL_MLP boost can take, ascending, with
+     prio_num_levels of them valid. Built ONCE at init from the 8 x 3 (costq, bound-class) grid --
+     see Cache_Entry.prio_level for the expression -- and a line's prio_level is an index into it.
+
+     Built from the GLOBAL --mlp_lin_* params, not from the per-cache lin_lambda_* override, and
+     that is safe rather than lucky: cache_set_lin_lambdas is only ever called by the SBAR
+     selector, and ps_enabled() requires MLC_CACHE_REPL_POLICY == REPL_MLP_PAPER, so no cache
+     running REPL_MLP can be SBAR-owned. load_prio_level_of asserts lin_lambda_override is FALSE
+     so that a future change making SBAR reachable from REPL_MLP fails loudly here instead of
+     silently stamping levels against a stale table.
+
+     prio_num_levels == 0 means "not tracked" and is the state on every non-REPL_MLP cache. */
+  double prio_boost[LOAD_PRIO_MAX_LEVELS];
+  uns    prio_num_levels;
+
+  /* --load_prio_stats: published by the most recent cache_access, for the caller to count. Same
+     publish-then-count split as last_hit_membound -- cache_lib keeps no stats and memory.c knows
+     which cache it is holding and therefore which chain to charge. Cleared at the top of every
+     access, so a reader sees the access it belongs to and never a stale value. */
+  Flag    last_hit_prio_valid;  /* the last access was a hit on a tracked cache */
+  uns8    last_hit_prio_level;  /* that line's sticky priority level */
+  Counter last_hit_reuse_misses; /* its reuse distance, in MISSES to the set; >= 0 */
+
+  /* --load_prio_stats: the level stamped on the line the most recent INSERT allocated. Separate
+     from last_hit_* because a fill is not a hit, and separate from last_evict_* because the
+     arriving line and the line it displaced are at independent levels -- the whole question the
+     tracker asks is which levels displace which. Written by stamp_load_prio on every tracked
+     fill, so a reader immediately after a cache_insert always sees that insert. */
+  Flag    last_fill_prio_valid;
+  uns8    last_fill_prio_level;
+
+  /* --load_prio_stats: published by the most recent insert, describing the line it evicted.
+     last_evict_valid (above) says whether there WAS a victim; these describe it. */
+  uns8    last_evict_prio_level;      /* the victim's sticky priority level */
+  Counter last_evict_residency_misses; /* its residency, in MISSES to the set */
+  Counter last_evict_reuse_count;      /* how many times it was hit before being evicted */
 } Cache;
 
 /**************************************************************************************/
@@ -461,6 +613,7 @@ typedef struct Cache_Fill_Stage_struct {
   Flag   prefetch;
   Flag   store;
   Flag   offpath;
+  uns8   traffic; /* --load_prio_stats: a Load_Prio_Traffic */
 } Cache_Fill_Stage;
 
 void cache_save_fill_stage(Cache_Fill_Stage* out);
@@ -511,6 +664,75 @@ Flag cache_last_reuse_dist(Cache* cache, Counter* dist);
  * hopeless ones alive longer, which shows up here as a rising *_NOREUSE and nowhere else.
  * Same validity window as cache_last_evict_age. */
 Flag cache_last_evict_reuse(Cache* cache, Flag* reused, Flag* membound, Flag* fe_bound);
+
+/**************************************************************************************/
+/* --load_prio_stats: priority-bucketed load tracker. See --load_prio_stats in
+ * memory.param.def for what the levels mean and why the unit is misses to the set.
+ *
+ * Every entry point below is inert on a cache that is not tracked (knob off, or a policy other
+ * than REPL_MLP): the readers return FALSE / 0 and the writers do nothing. Callers therefore need
+ * no policy test of their own. */
+
+/* Stage the traffic class of the NEXT fill into any cache, one-shot, in the same style as
+ * cache_set_next_fill_bound. Only the caller knows the Mem_Req type, so only the caller can
+ * classify. Consumed and cleared by the next cache_insert, so a fill that never happens (a
+ * bypass, or an early FAILURE return) cannot leak its class onto an unrelated later fill.
+ * Never called = LOAD_PRIO_TC_OTHER, which is not histogrammed. */
+void cache_set_next_fill_traffic(uns8 traffic);
+
+/* How many priority levels this cache's boost can take, and what boost level `level` stands for.
+ * 0 levels means the cache is not tracked. The boost is in LRU stack positions, so the value is
+ * directly comparable against associativity. Pure. */
+uns    cache_load_prio_num_levels(Cache* cache);
+double cache_load_prio_boost(Cache* cache, uns level);
+
+/* The priority level of the line the most recent cache_access on `cache` HIT, and that hit's
+ * reuse distance in MISSES TO THE SET measured from the line's previous access (its fill, or its
+ * last hit). 0 means no miss to the set intervened -- the line was reused before anything could
+ * displace it.
+ *
+ * Returns FALSE, leaving both out-params untouched, when the last access was a miss, was a probe
+ * (update_repl==FALSE), or when the cache is not tracked. Valid only immediately after the
+ * cache_access it describes.
+ *
+ * Compare the distance against ASSOCIATIVITY: a line reused within fewer misses than the set has
+ * ways was never at risk, so only the mass at or above assoc is what a priority-aware policy can
+ * actually convert. */
+Flag cache_last_hit_prio(Cache* cache, uns8* level, Counter* reuse_misses);
+
+/* The priority level stamped on the line the most recent INSERT on `cache` allocated. Returns
+ * FALSE on an untracked cache. Valid only immediately after the cache_insert it describes. */
+Flag cache_last_fill_prio(Cache* cache, uns8* level);
+
+/* Describe the line the most recent INSERT on `cache` evicted: its priority level, its residency
+ * in MISSES to the set, and how many times it was hit before being evicted (0 = never reused).
+ *
+ * Returns FALSE when that insert evicted nothing (it took a free way). Same validity window as
+ * cache_last_evict_age -- call it immediately after the insert, before any other insert on this
+ * cache.
+ *
+ * READ THIS ALONGSIDE the hit chain, not instead of it: the reuse-distance histogram can only
+ * contain lines that WERE reused, so on its own it is a biased sample. A policy that protects a
+ * level can raise that level's mean reuse distance purely by keeping hopeless lines resident
+ * longer, which shows up as a rising count of reuse_count==0 evictions here and nowhere else. */
+Flag cache_last_evict_prio(Cache* cache, uns8* level, Counter* residency_misses, Counter* reuse_count);
+
+/* Walk the set `addr` maps to and report what it currently holds. Both are meant to be called at
+ * a FILL, before the inserting line has displaced anything, so what they describe is the set the
+ * fill is arriving into.
+ *
+ * cache_load_prio_set_composition fills `counts[LOAD_PRIO_NUM_TC]` with the number of resident
+ * lines of each traffic class. The four histogrammed classes need not sum to assoc -- invalid
+ * ways and LOAD_PRIO_TC_OTHER lines are the difference.
+ *
+ * cache_load_prio_set_occupancy fills `counts[LOAD_PRIO_MAX_LEVELS]` with the number of resident
+ * lines at each priority level. Summed over fills this is what the cache HOLDS rather than what
+ * it admits, which is the view the per-fill event chains cannot give: a level can take a small
+ * share of fills and still occupy most of the cache, or the reverse.
+ *
+ * Both are pure, and both no-op (leaving `counts` zeroed) on an untracked cache. */
+void cache_load_prio_set_composition(Cache* cache, Addr addr, uns* counts);
+void cache_load_prio_set_occupancy(Cache* cache, Addr addr, uns* counts);
 
 /* --td_load_rrip_fixup: rewrite a resident line's RRPV after the fact.
  *

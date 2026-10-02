@@ -684,6 +684,22 @@ void node_retire() {
  *
  * O(NUM_RS) -- a handful of counters -- rather than walking rdy_head, which is why rdy_count is
  * maintained at the in_rdy_list transitions instead of being recomputed here. */
+/* TRUE when every reservation station is at capacity -- the SCHEDULING window cannot accept
+ * another op. Distinct from is_node_table_full(), which tests the reorder buffer: on this config
+ * the RSs total 186 entries against a 352-entry ROB, so they saturate at different times and a
+ * cycle can be one, the other, both or neither.
+ *
+ * A size of 0 means an infinite RS, which can never be full and therefore makes this FALSE for
+ * the whole machine -- deliberately, since "the window is full" is meaningless then. */
+Flag node_issue_window_full(void) {
+  for (uns rs_id = 0; rs_id < NUM_RS; ++rs_id) {
+    Reservation_Station* rs = &node->rs[rs_id];
+    if (!rs->size || rs->rs_op_count < rs->size)
+      return FALSE;
+  }
+  return TRUE;
+}
+
 Flag node_ops_waiting_on_operands(void) {
   int32 rs_total = 0;
   for (uns rs_id = 0; rs_id < NUM_RS; ++rs_id)
