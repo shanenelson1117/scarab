@@ -320,6 +320,43 @@ DEF_PARAM(mlp_lin_offpath_lambda, MLP_LIN_OFFPATH_LAMBDA, float, float, 0.0, )
    between the proxies suggests. Expect small policy deltas and size the sweep accordingly. */
 DEF_PARAM(mlp_lin_bound_signal, MLP_LIN_BOUND_SIGNAL, uns, uns, 0, )
 
+/* --mlp_lin_instr_no_commit: tighten the per-cycle condition behind REPL_MLP's INSTRUCTION-side
+   boundness fraction. The instruction-side analogue of --mlp_lin_bound_signal: it swaps the
+   NUMERATOR of the fraction the policy consumes and changes nothing else.
+
+     0 (DEFAULT)  fe_bound / window      -- the issue queue is empty (idq_sd.op_count == 0,
+                  i.e. the front end delivered nothing to rename). Identical to every run made
+                  before this knob existed, so 0 reproduces them.
+     1            fe_commit / window     -- the issue queue is empty AND retirement committed
+                  nothing this cycle. Same window, so the two fractions share a denominator and
+                  fe_commit <= fe_bound always holds.
+
+   WHY. An empty issue queue says fetch starved; it does NOT say the machine stalled. With a
+   352-entry ROB the back end can retire work fetched long before the current icache miss, and
+   those cycles cost nothing in IPC. Counting them inflates the fraction of exactly the misses
+   that were successfully overlapped -- the ones a capacity-limited L2 should be LEAST eager to
+   protect -- so at 1 the fraction counts only cycles where the awaited miss actually stopped
+   retirement. Cycle-level, hence a numerator and not a second threshold: a fill's mark would
+   otherwise still be derived from cycles the machine was making progress through.
+
+   COMMITTED MEANS ANY UOP. node_retired_this_cycle() is true if node_retire committed at least
+   one op, not one eom instruction, so a cycle draining the tail uops of a multi-uop instruction
+   counts as progress and is excluded from the numerator. Strictly stronger than the
+   architectural reading, and it is the reading that matches "the machine made no progress".
+
+   WHAT IT DOES NOT TOUCH. (a) The DATA side -- an instruction fill has no load window, so this
+   and --mlp_lin_bound_signal are disjoint by construction, exactly as that knob's note says.
+   (b) The FE-bound MEASUREMENT chains: *bound_frac keeps the fe_bound numerator whatever this
+   is set to, so MLC_FEBOUND_* and the reuse-distance histograms stay comparable across a sweep.
+   (c) td_fe_rrip_mark / td_fe_rrip_on_mlc / td_combined_*, which keep reading fe_bound/window:
+   the two numerators are accumulated side by side over one window in Icache_Stage, so no other
+   policy's signal moves. The MARK (Cache_Entry.fe_bound_fill) does follow the selected
+   fraction, mirroring the data side, where the mark likewise comes from the selected signal.
+
+   NEEDS --mlp_lin_instr_lambda to do anything: with that at 0 the boundness term is off and
+   this only relabels a mark nothing weighs. Applies to REPL_MLP (policy 9) only. */
+DEF_PARAM(mlp_lin_instr_no_commit, MLP_LIN_INSTR_NO_COMMIT, Flag, Flag, FALSE, )
+
 DEF_PARAM(mlp_lin_data_thresh, MLP_LIN_DATA_THRESH, float, float, 0.5, )
 DEF_PARAM(mlp_lin_instr_thresh, MLP_LIN_INSTR_THRESH, float, float, 0.7, )
 
@@ -498,6 +535,37 @@ DEF_PARAM(reuse_dist_stats, REUSE_DIST_STATS, Flag, Flag, FALSE, )
  *
  * So an LRU run with --load_prio_stats 1 gives you the full composition picture and no priority
  * breakdown, which is a valid and useful configuration rather than a half-broken one.
+ *
+ * L1_PRIO_* (THE LLC) IS WEAKER THAN MLC_PRIO_*, and the reasons are pre-existing properties of
+ * REPL_MLP rather than of this instrumentation. --l1_cache_repl_policy 9 does select REPL_MLP on the
+ * LLC and the levels are computed exactly as on the MLC, but:
+ *
+ *   - LLC LINES CARRY AN MLC-DENOMINATED COST. req->mlp_cost accumulates over the MLC-miss window,
+ *     and the LLC fill stages it unchanged, so costq on an LLC line answers "what did the miss that
+ *     fetched me cost at the MLC", not "what does an LLC miss on me cost". Nothing measures the
+ *     latter.
+ *   - THE COSTQ EDGES WERE CALIBRATED ON MLC DEMAND MISSES (MLC_MLP_COST_*, 34.8M samples on the
+ *     google traces). Bucketing LLC lines with them is a calibration mismatch, so the LLC level
+ *     histogram may bunch into fewer levels than the MLC's. Re-cut with --mlp_cost_edges from an
+ *     LLC-side cost histogram if the LLC is the object of study.
+ *   - THE TWO MUTABLE PENALTIES ARE NEVER UPDATED ON THE LLC. cache_mark_written and
+ *     cache_clear_offpath are called for the MLC only, so on the LLC was_written and
+ *     offpath_unproven keep their fill-time values for the line's whole life. This does NOT affect
+ *     the levels here, which exclude both terms by construction -- but it does mean REPL_MLP is a
+ *     different policy on the LLC than on the MLC, so do not read an MLC-vs-LLC difference in these
+ *     chains as a property of cache level alone.
+ *
+ * ALSO: FOUR KNOBS SILENTLY OVERRIDE THE REPL POLICY to REPL_MARKED_RRIP, ignoring
+ * --mlc_cache_repl_policy / --l1_cache_repl_policy entirely. All default FALSE:
+ *
+ *     MLC  (--td_load_rrip_mark AND --td_load_rrip_on_mlc), or --td_fe_rrip_on_mlc,
+ *          or --td_combined_on_mlc
+ *     LLC  --td_combined_on_l1
+ *
+ * With any of them set, that cache's *_PRIO_* chains go silent while its *_COMP_* chains keep
+ * working -- which looks exactly like a broken priority hookup and is not one. Check these before
+ * debugging anything else. Note the MLC condition is a CONJUNCTION for the first pair:
+ * --td_load_rrip_mark alone does not override the MLC unless --td_load_rrip_on_mlc is also set.
  *
  * WHAT A PRIORITY LEVEL IS. The level is the line's BOOST -- the non-recency part of the REPL_MLP
  * value function, i.e. how far the policy displaces the line from where its recency alone would

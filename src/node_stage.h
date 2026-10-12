@@ -69,6 +69,13 @@ typedef struct Node_Stage_struct {
   Flag mem_blocked;      // are we out of mem req buffers for this core
   uns mem_block_length;  // length of the current memory block
   uns ret_stall_length;  // length of the current retirement stall
+
+  /* The most recent node_retire() pass: the cycle it ran, and how many ops it retired in that
+     pass. Both are written at the TOP of node_retire -- before its node-table-empty early
+     return -- so a stamp equal to cycle_count always means "retirement ran this cycle and
+     last_ret_count is its final answer". Read through node_retired_this_cycle(). */
+  Counter last_ret_cycle;
+  uns     last_ret_count;
 } Node_Stage;
 
 /**************************************************************************************/
@@ -104,6 +111,22 @@ Flag node_ops_waiting_on_operands(void);
  *                               and makes this permanently FALSE. */
 Flag is_node_table_full(void);
 Flag node_issue_window_full(void);
+
+/* TRUE when retirement COMMITTED at least one op this cycle.
+ *
+ * Counts UOPS, not eom instructions: any retired op is forward progress at the ROB head, so a
+ * cycle that drains only the non-final uops of a multi-uop instruction is NOT a no-commit cycle.
+ * That makes this strictly stronger than "no x86 instruction committed". Every retired op is
+ * on-path -- node_retire asserts !op->off_path -- so there is no path qualifier to apply.
+ *
+ * Reads the cycle STAMP and not the count alone: node_retire is reached only through
+ * update_node_stage, which a core can skip in a given cycle (frequency domain not ready, core
+ * finished), and without the stamp such a cycle would report the previous pass's count forever.
+ *
+ * Answers for the CURRENT cycle only, and only for callers that run AFTER update_node_stage in
+ * the back-to-front stage order of cmp_cores() -- update_idq_stage and update_icache_stage do.
+ * A caller ahead of the node stage would read last cycle's retirement. */
+Flag node_retired_this_cycle(void);
 
 /**************************************************************************************/
 

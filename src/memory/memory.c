@@ -688,10 +688,29 @@ static inline void membound_classify_fill(Mem_Req* req, Flag* is_membound, Flag*
       *bound_frac = fe_frac;
       *have_frac = TRUE;
       /* Instruction fills have no load window, so --mlp_lin_bound_signal does not apply here;
-         the FE fraction is the policy's value on this path whatever the knob says. */
+         the FE fraction is the policy's value on this path whatever the knob says.
+
+         --mlp_lin_instr_no_commit is the instruction-side selector that DOES apply: it swaps
+         this numerator for the commit-gated one (empty issue queue AND nothing committed) over
+         the same window. Reported separately from *bound_frac above -- which keeps the fe_bound
+         numerator -- so the FEBOUND measurement chains stay comparable across a sweep over it,
+         exactly as the data branch keeps *bound_frac on MEMBOUND under --mlp_lin_bound_signal.
+         Both reporters gate identically, so a TRUE above guarantees a TRUE here. */
+      double policy_frac = fe_frac;
+      if (MLP_LIN_INSTR_NO_COMMIT) {
+        Flag have_commit = icache_fe_commit_frac_for_line(req->proc_id, req->addr, &policy_frac);
+        ASSERT(req->proc_id, have_commit);
+        ASSERT(req->proc_id, policy_frac <= fe_frac);
+      }
       if (out_policy_frac)
-        *out_policy_frac = fe_frac;
-      if (fe_frac > (double)TD_FE_RRIP_THRESH)
+        *out_policy_frac = policy_frac;
+      /* The MARK comes from the SELECTED fraction, against the unchanged --td_fe_rrip_thresh
+         gate, for the same reason the data branch derives it from policy_frac: the line is
+         later weighed on entry->bound_frac, which carries the selected value, so a mark read
+         off the other numerator could protect a line whose policy fraction is below threshold
+         (and mlp_lin_bound_term's --mlp_lin_instr_thresh re-test would then silently be the
+         only gate doing work). */
+      if (policy_frac > (double)TD_FE_RRIP_THRESH)
         *is_fe_bound = TRUE;
     }
   } else {

@@ -100,9 +100,15 @@ typedef struct Icache_Stage_struct {
   uint64_t wait_for_miss_start; /* time when cache miss was observed */
   /* td_fe_rrip_mark: for the current on-path demand icache miss, cycles it has been
      outstanding (window) and the front-end-bound subset (fe_bound / window sets its L1I
-     insert RRPV at fill). Reset when a new demand miss is issued. */
+     insert RRPV at fill). Reset when a new demand miss is issued.
+
+     fe_miss_commit_cycles is a SUBSET of fe_miss_bound_cycles: the front-end-bound cycles in
+     which retirement also committed nothing (--mlp_lin_instr_no_commit). Accumulated over the
+     same window, so commit/window and bound/window share a denominator and are directly
+     comparable; see icache_fe_commit_frac_for_line. */
   Counter fe_miss_window_cycles;
   Counter fe_miss_bound_cycles;
+  Counter fe_miss_commit_cycles;
   Flag icache_miss_fulfilled;
   Flag icache_stage_resteer_signaled;
   Flag fetch_barrier_pending;
@@ -169,11 +175,16 @@ Flag in_icache(Addr addr);  // For branch stat collection
 
 /* td_fe_rrip_mark: called once per cycle (from topdown) to accumulate the current on-path
  * demand icache miss's outstanding window and its front-end-bound subset. */
-void icache_tag_inflight_miss(uns8 proc_id, Flag fe_bound_cycle);
+void icache_tag_inflight_miss(uns8 proc_id, Flag fe_bound_cycle, Flag fe_commit_cycle);
 
 /* td_fe_rrip_on_mlc: FE-bound fraction of the demand icache miss the L1I is blocked on, if it
  * matches line_addr (used at the L2 fill to prioritize an instruction line). */
 Flag icache_fe_frac_for_line(uns8 proc_id, Addr line_addr, double* out_frac);
+
+/* --mlp_lin_instr_no_commit: the same report, over the commit-gated numerator. Same gating,
+   same window, same TRUE/FALSE conditions as icache_fe_frac_for_line -- only the numerator
+   differs -- so the two are interchangeable at a call site and comparable arm to arm. */
+Flag icache_fe_commit_frac_for_line(uns8 proc_id, Addr line_addr, double* out_frac);
 
 /**************************************************************************************/
 

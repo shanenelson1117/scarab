@@ -510,9 +510,16 @@ Flag mem_req_on_icache_miss() {
       // FE policy targets the L1I or the L2). Reset on- and off-path: off-path misses now carry
       // their own window so the L1I marked-RRIP insert can derive an RRPV for them too. (The
       // L2/MLC variant keeps its own on-path gate in icache_fe_frac_for_line, so it is unaffected.)
-      if (TD_FE_RRIP_MARK || TD_FE_RRIP_ON_MLC || TD_COMBINED_ON_MLC || TD_COMBINED_ON_L1) {
+      /* MLP_LIN_INSTR_LAMBDA belongs in this gate for the same reason it opens the accumulation
+         gate in topdown.c: without it a policy-9 run with only --mlp_lin_instr_lambda set never
+         resets, so the window spans EVERY demand miss of the run and the "fraction" each
+         instruction fill is marked from is a running global average rather than this miss's
+         stall. The counters are per-miss state, so the reset must follow the accumulation. */
+      if (TD_FE_RRIP_MARK || TD_FE_RRIP_ON_MLC || TD_COMBINED_ON_MLC || TD_COMBINED_ON_L1 ||
+          MLP_LIN_INSTR_LAMBDA != 0.0) {
         ic->fe_miss_window_cycles = 0;
         ic->fe_miss_bound_cycles = 0;
+        ic->fe_miss_commit_cycles = 0;
       }
 
       if (ONE_MORE_CACHE_LINE_ENABLE) {
@@ -1057,33 +1064,57 @@ static inline void icache_process_ops(Stage_Data* cur_data, Flag fetched_from_uo
 }
 
 /* td_fe_rrip_mark: accumulate the current demand icache miss's outstanding window and its
- * front-end-bound subset (fe_bound_cycle). Called once per cycle from topdown_idq_update.
+ * front-end-bound subset (fe_bound_cycle), plus the commit-gated sub-subset (fe_commit_cycle,
+ * for --mlp_lin_instr_no_commit). Called once per cycle from topdown_idq_update.
  * Credits the demand miss fetch is currently blocked on (in-order fetch), on- or off-path: the
  * L1I fill sets the line's RRPV whether the awaited miss is on- or off-path, matching the
  * path-agnostic L1D marked-RRIP policy. (The L2/MLC variant keeps its own on-path gate in
  * icache_fe_frac_for_line, so accumulating off-path here stays MLC-neutral.) */
-void icache_tag_inflight_miss(uns8 proc_id, Flag fe_bound_cycle) {
+void icache_tag_inflight_miss(uns8 proc_id, Flag fe_bound_cycle, Flag fe_commit_cycle) {
   Icache_Stage* ics = &cmp_model.icache_stage[proc_id];
   if (ics->state != ICACHE_WAIT_FOR_MISS)
     return;  // not blocked on a demand icache miss
   ics->fe_miss_window_cycles++;
   if (fe_bound_cycle)
     ics->fe_miss_bound_cycles++;
+  /* The commit-gated subset (--mlp_lin_instr_no_commit). The caller already ANDs it with
+     fe_bound_cycle; assert that rather than re-derive it, so the subset relation the two
+     fractions are read under is enforced at the one place both are written. */
+  ASSERT(proc_id, !fe_commit_cycle || fe_bound_cycle);
+  if (fe_commit_cycle)
+    ics->fe_miss_commit_cycles++;
 }
 
-/* td_fe_rrip_on_mlc: report the front-end-bound fraction of the demand icache miss the L1I is
- * currently blocked on, if it matches `line_addr` (used at the L2 fill to set an instruction
- * line's RRPV). Returns TRUE (and sets *out_frac) only for the awaited on-path demand line. */
-Flag icache_fe_frac_for_line(uns8 proc_id, Addr line_addr, double* out_frac) {
+/* The shared body of the two reporters below. `use_commit` picks the NUMERATOR and nothing
+ * else -- the gating, the window and the TRUE/FALSE decision are identical -- so a caller that
+ * switches numerators on a knob cannot accidentally also change which fills report a fraction
+ * at all. */
+static inline Flag icache_fe_frac_for_line_sel(uns8 proc_id, Addr line_addr, Flag use_commit, double* out_frac) {
   if (out_frac)
     *out_frac = 0.0;
   Icache_Stage* ics = &cmp_model.icache_stage[proc_id];
   if (ics->off_path || ics->state != ICACHE_WAIT_FOR_MISS || ics->line_addr != line_addr ||
       ics->fe_miss_window_cycles == 0)
     return FALSE;
-  if (out_frac)
-    *out_frac = (double)ics->fe_miss_bound_cycles / (double)ics->fe_miss_window_cycles;
+  if (out_frac) {
+    Counter num = use_commit ? ics->fe_miss_commit_cycles : ics->fe_miss_bound_cycles;
+    *out_frac = (double)num / (double)ics->fe_miss_window_cycles;
+  }
   return TRUE;
+}
+
+/* td_fe_rrip_on_mlc: report the front-end-bound fraction of the demand icache miss the L1I is
+ * currently blocked on, if it matches `line_addr` (used at the L2 fill to set an instruction
+ * line's RRPV). Returns TRUE (and sets *out_frac) only for the awaited on-path demand line. */
+Flag icache_fe_frac_for_line(uns8 proc_id, Addr line_addr, double* out_frac) {
+  return icache_fe_frac_for_line_sel(proc_id, line_addr, FALSE, out_frac);
+}
+
+/* --mlp_lin_instr_no_commit: the same report over the commit-gated numerator -- front-end-bound
+ * cycles in which retirement also committed nothing. REPL_MLP's instruction term is the only
+ * consumer; every other FE-bound policy keeps reading the function above. */
+Flag icache_fe_commit_frac_for_line(uns8 proc_id, Addr line_addr, double* out_frac) {
+  return icache_fe_frac_for_line_sel(proc_id, line_addr, TRUE, out_frac);
 }
 
 /**************************************************************************************/

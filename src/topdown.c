@@ -252,7 +252,24 @@ void topdown_idq_update(uns proc_id, int count_available, int count_issued, int 
       MLP_LIN_INSTR_LAMBDA != 0.0) {
     Flag backend_stall = (count_issued == 0 && idq_stage_get_stage_data()->op_count > 0);
     Flag fe_bound_cycle = !backend_stall && (count_available == 0);
-    icache_tag_inflight_miss(proc_id, fe_bound_cycle);
+    /* --mlp_lin_instr_no_commit: the STRICTER front-end-bound cycle, accumulated alongside the
+       one above (never instead of it, so the td_fe_rrip_* / td_combined_* consumers keep the
+       signal they were measured with, and only REPL_MLP's instruction term can opt in).
+
+       An empty issue queue AND no commit. count_available IS the issue queue occupancy
+       (idq_sd.op_count, the ops available to rename next cycle), so the first term is already
+       the condition above -- note !backend_stall is redundant there, since backend_stall
+       requires op_count > 0 and count_available is that same count. What the AND adds is the
+       back end: the machine may still be retiring work it fetched earlier out of the ROB, and
+       those cycles cost nothing in IPC however starved fetch is. Gating on them keeps the
+       fraction on cycles where the awaited icache miss actually stopped the machine.
+
+       node_retired_this_cycle() is final for this cycle: update_node_stage runs before the IDQ
+       stage in the back-to-front order of cmp_cores(), the same ordering the FU-proxy sample
+       above relies on. */
+    ASSERT(proc_id, node->proc_id == proc_id);
+    Flag fe_commit_cycle = fe_bound_cycle && !node_retired_this_cycle();
+    icache_tag_inflight_miss(proc_id, fe_bound_cycle, fe_commit_cycle);
   }
 
   // dynamic combined-L2 (depth or threshold): recompute the top-down Frontend-vs-Memory-Bound

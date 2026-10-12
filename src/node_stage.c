@@ -156,6 +156,11 @@ void reset_node_stage() {
   node->mem_blocked = FALSE;
   node->mem_block_length = 0;
   node->ret_stall_length = 0;
+  /* Cleared explicitly like everything else here rather than relying on the allocation being
+     zeroed. A count of 0 makes node_retired_this_cycle() FALSE whatever the stamp says, so the
+     pair is safe to read before the first node_retire() of a run. */
+  node->last_ret_cycle = 0;
+  node->last_ret_count = 0;
 
   node->node_precommit = NULL;
   node->prev_op_fusable = FALSE;
@@ -516,6 +521,12 @@ void node_retire() {
   uns ret_count = 0;
   Op* op = NULL;
 
+  /* Stamp the pass BEFORE the early return below, so a cycle in which retirement ran but
+     committed nothing is recorded as 0 commits rather than inheriting the last pass's count.
+     The final count is written once, after the loop. */
+  node->last_ret_cycle = cycle_count;
+  node->last_ret_count = 0;
+
   // If node table is empty, then there is nothing to retire
   if (is_node_table_empty()) {
     DEBUG(node->proc_id, "Node retire skipped: node table empty\n");
@@ -662,6 +673,10 @@ void node_retire() {
 
   STAT_EVENT(node->proc_id, ROW_SIZE_0 + ret_count);
 
+  /* What this pass committed, for node_retired_this_cycle(). Written here rather than
+     incrementally so it cannot disagree with the ret_count the stat above reports. */
+  node->last_ret_count = ret_count;
+
   // op should be pointing to first op that was not retired because of the above for-loop
   node->node_head = op;
   if (node->node_head)
@@ -698,6 +713,11 @@ Flag node_issue_window_full(void) {
       return FALSE;
   }
   return TRUE;
+}
+
+/* See node_stage.h for what this counts and when it is valid. */
+Flag node_retired_this_cycle(void) {
+  return node->last_ret_cycle == cycle_count && node->last_ret_count > 0;
 }
 
 Flag node_ops_waiting_on_operands(void) {
