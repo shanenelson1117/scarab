@@ -682,13 +682,50 @@ static inline void membound_classify_fill(Mem_Req* req, Flag* is_membound, Flag*
      downstream can tell an unmarked line from an unclassified one. */
   if (!MEMBOUND_STATS && !REUSE_DIST_STATS && MLP_LIN_DATA_LAMBDA == 0.0 && MLP_LIN_INSTR_LAMBDA == 0.0)
     return;
-  if (req->type == MRT_IFETCH) {
+  /* IS THIS FILL AN INSTRUCTION FILL? A demand fetch says so by its type. --mlp_lin_instr_
+     include_pref_merge adds the other way a line the front end is stalled on arrives: an
+     instruction PREFETCH that a demand fetch merged into, i.e. a LATE prefetch.
+
+     req->types is the bitmask of every Mem_Req_Type coalesced into this request, so the
+     MRT_IFETCH bit is the direct statement "a demand instruction fetch is waiting on this
+     request". It is the right test here and the alternatives are not:
+
+       req->type        is NOT promoted to MRT_IFETCH on this merge. The promotion (and
+                        req->demand_match_prefetch, and the *_PREF_LATE stats) all live in the
+                        `if (op)` arm of mem_adjust_matching_request, and the icache issues its
+                        demand fetch with op == NULL -- new_mem_req(MRT_IFETCH, ..., NULL,
+                        instr_fill_line, ...). So for ifetch merges the request keeps its
+                        MRT_IPRF / MRT_FDIPPRFON / MRT_FDIPPRFOFF type to the fill, which is
+                        why these fills reach the DATA branch below today and score nothing.
+       req->demand_icache_emitted_cycle  records who CREATED the request, not who merged into
+                        it; it stays 0 on a prefetch-created request.
+
+     mem_req_set_types runs OUTSIDE that `if (op)` arm, and nothing ever clears a bit
+     (mem_req_clr_types has no callers outside mem_req.c), so the bit is set by the merge and
+     still set at fill. icache_stage.c reads req->types the same way at its own fill.
+
+     The prefetch-type test keeps this to the intended population: per the match table in
+     mem_search_queue only the instruction prefetch types can take an MRT_IFETCH merge, so a
+     data prefetch cannot reach here, and a WRITEBACK that a demand fetch matched (the
+     --allow_type_matches path) is deliberately excluded -- it is not a prefetch fill and its
+     line was already resident. */
+  Flag instr_fill = (req->type == MRT_IFETCH);
+  if (!instr_fill && MLP_LIN_INSTR_INCLUDE_PREF_MERGE && mem_req_type_is_prefetch(req->type) &&
+      mem_req_is_type(req, MRT_IFETCH))
+    instr_fill = TRUE;
+
+  if (instr_fill) {
     /* Instruction fills have no load window, so --mlp_lin_bound_signal does not apply here. The
        instruction side has its own two selectors, both read inside this one reporter:
        --mlp_lin_instr_no_commit picks the numerator (empty issue queue, or that AND nothing
        committed) and --mlp_lin_instr_include_offpath picks the path gate (on-path demand fetch
        only, or any awaited demand miss). Policy 9 is the only consumer: td_fe_rrip_on_mlc and
        td_combined_* call icache_fe_frac_for_line, which keeps the old gate and numerator. */
+    /* Keyed on the line address, which resolves for a merged prefetch exactly as it does for a
+       demand fetch: FDIP requests the address cache_access handed back for the icache line
+       (fdip.cc), the same ICACHE_LINE_SIZE-granular value the icache stores in ic->line_addr
+       and matches on. A prefetch nothing is waiting on returns FALSE here and falls through
+       unmarked, so the knob above widens eligibility and this call still decides. */
     double fe_frac = 0.0, policy_frac = 0.0;
     if (icache_fe_frac_for_line_mlp(req->proc_id, req->addr, &fe_frac, &policy_frac)) {
       /* The MEASUREMENT numerator, always fe_bound/window, so a sweep over

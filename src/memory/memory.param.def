@@ -397,6 +397,58 @@ DEF_PARAM(mlp_lin_instr_no_commit, MLP_LIN_INSTR_NO_COMMIT, Flag, Flag, FALSE, )
    the reason above: it inserts the line the awaited miss returned, as hardware does.) */
 DEF_PARAM(mlp_lin_instr_include_offpath, MLP_LIN_INSTR_INCLUDE_OFFPATH, Flag, Flag, FALSE, )
 
+/* --mlp_lin_instr_include_pref_merge: let a LATE instruction prefetch earn REPL_MLP's
+   instruction-side priority -- an FDIP prefetch still in flight when the demand fetch for the
+   same line arrives and merges into it.
+
+     0 (DEFAULT)  only a fill whose req->type is MRT_IFETCH is classified as an instruction
+                  fill. A prefetch-created request keeps its prefetch type through an ifetch
+                  merge, so such a fill takes the DATA branch, finds no demanding load, and
+                  scores no fraction, no mark and no bonus. Reproduces earlier runs.
+     1            a prefetch-typed fill with the MRT_IFETCH bit in req->types is classified as
+                  an instruction fill as well, and is then marked on the same evidence and
+                  against the same threshold as a demand fetch: the stall of the icache miss
+                  the front end is blocked on.
+
+   WHY IT MATTERS MORE HERE THAN THE NAME SUGGESTS. On PARAMS.google, instruction lines reach
+   the L2 almost entirely as FDIP prefetch and demand ifetch is only 1.5% of MLC misses, so at 0
+   the instruction-side term is scoped to that 1.5% -- and the fills it is MOST meant to protect
+   are exactly the ones it cannot see. A merged prefetch is by construction a prefetch that
+   arrived too late to hide anything: fetch is in-order, so the front end is stopped on that
+   line right now. It is the MLC_PREF_LATE / L1_PREF_LATE population.
+
+   ELIGIBILITY IS NOT A MARK. Classification only lets the fill ask; the icache's awaited-miss
+   window still has to answer, so a TIMELY prefetch -- filled before any demand fetch wanted it,
+   which is the common case and the one that cost nothing -- reports nothing and stays unmarked.
+   Nothing here marks a line because it was prefetched; the signal is still a measured stall.
+
+   THE WINDOW IS THE STALL, NOT THE PREFETCH LATENCY. icache_tag_inflight_miss resets its
+   counters when the DEMAND fetch is issued (the merge returns success, so the icache takes the
+   ICACHE_WAIT_FOR_MISS path exactly as for a fresh miss), so the denominator runs from the
+   demand request to the fill and excludes however long the prefetch was already in flight.
+   That is the quantity wanted -- the cycles the front end was stopped on this line -- and it
+   makes the fraction directly comparable with a demand miss's. A fill that lands in the same
+   cycle the demand was issued leaves a zero-length window and so reports nothing, which is the
+   same edge the demand path has.
+
+   INTERACTS WITH --mlp_lin_pref_lambda, and the two pull opposite ways on the SAME fill: the
+   line is still prefetch-installed (cache_set_next_fill_prefetch reads req->type, which the
+   merge leaves alone), so at 1 a late FDIP prefetch can take the instruction bonus AND the
+   prefetch penalty, netting to whatever the lambdas say. That is worth knowing before reading a
+   sweep, because on these traces the prefetch penalty is the term carrying most of LIN's
+   measured benefit. If the intent is "demand-merged prefetches are not speculative any more",
+   that is a change to the PREFETCH flag, not to this knob, and it does not exist yet.
+
+   WIDENS THE FEBOUND MEASUREMENT POPULATION, like --mlp_lin_instr_include_offpath and for the
+   same reason: eligibility gates whether a fraction is reported at all, so at 1 the
+   MLC_FEBOUND_* chains and the reuse-distance split take in these fills too. Deliberate -- the
+   histograms should describe the population the policy acts on -- but it means FEBOUND counts
+   are not comparable between a 0 and a 1 arm.
+
+   Applies to REPL_MLP (policy 9) only. td_fe_rrip_on_mlc and td_combined_* keep testing
+   req->type == MRT_IFETCH in their own fill paths and are untouched. */
+DEF_PARAM(mlp_lin_instr_include_pref_merge, MLP_LIN_INSTR_INCLUDE_PREF_MERGE, Flag, Flag, FALSE, )
+
 DEF_PARAM(mlp_lin_data_thresh, MLP_LIN_DATA_THRESH, float, float, 0.5, )
 DEF_PARAM(mlp_lin_instr_thresh, MLP_LIN_INSTR_THRESH, float, float, 0.7, )
 
