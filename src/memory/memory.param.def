@@ -357,6 +357,46 @@ DEF_PARAM(mlp_lin_bound_signal, MLP_LIN_BOUND_SIGNAL, uns, uns, 0, )
    this only relabels a mark nothing weighs. Applies to REPL_MLP (policy 9) only. */
 DEF_PARAM(mlp_lin_instr_no_commit, MLP_LIN_INSTR_NO_COMMIT, Flag, Flag, FALSE, )
 
+/* --mlp_lin_instr_include_offpath: make EVERY awaited demand instruction fetch eligible for
+   REPL_MLP's instruction-side priority, not just on-path ones.
+
+     0 (DEFAULT)  the fraction is reported only while the blocked fetch stream is on path, so an
+                  instruction fill behind a wrong-path fetch gets no fraction, no mark and no
+                  bonus -- it scores like a prefetch or a writeback. Identical to every run made
+                  before this knob existed.
+     1            the path gate is dropped. The awaited-line match, the window and the threshold
+                  are unchanged, so such a fill is marked on exactly the same evidence an on-path
+                  one is: the stall its own miss caused.
+
+   WHY. Scarab never squashes an off-path request, and the front end really is stalled on it:
+   fetch is in-order, so while the L1I waits on a wrong-path line NOTHING is fetched, on-path or
+   not, and those cycles land in the window either way. The resulting line is also a real
+   occupant of the L2 competing for capacity -- 39% of MLC misses are off-path here -- and on
+   these traces instruction lines reach the L2 almost entirely as FDIP prefetch, so demand
+   ifetch is the thin slice the gate was quietly halving. Excluding them means the policy ranks
+   a measured stall as worth nothing merely because the branch above it resolved wrong.
+
+   THE OTHER READING, which is why this is a knob and not a fix: a wrong-path line's stall cost
+   is REAL but its future VALUE is not implied by it. Protecting it spends capacity on a line
+   the machine may never ask for again. Compare arms before believing either story.
+
+   INTERACTS WITH --mlp_lin_offpath_lambda, deliberately and without special-casing. At 1 an
+   off-path instruction fill can now take the boundness BONUS while that knob subtracts its
+   off-path PENALTY; the two are separate terms of one sum, so the net is whatever the lambdas
+   say. Running both is a legitimate arm (is the stall worth more than the speculation risk?)
+   but not a control -- set one at a time to attribute an effect.
+
+   WIDENS THE FEBOUND MEASUREMENT POPULATION TOO, unlike --mlp_lin_instr_no_commit, which only
+   swaps a numerator. Eligibility IS the gate on reporting a fraction at all, so at 1 the
+   MLC_FEBOUND_* chains and the reuse-distance split count these fills as well. That is the
+   intent rather than a side effect: the histograms then describe the population the policy
+   acts on, and a run whose stats omitted the lines it was protecting could not be read.
+
+   Applies to REPL_MLP (policy 9) only -- td_fe_rrip_mark, td_fe_rrip_on_mlc and td_combined_*
+   keep their own on-path gate. (The L1I variant is already path-agnostic by its own design, for
+   the reason above: it inserts the line the awaited miss returned, as hardware does.) */
+DEF_PARAM(mlp_lin_instr_include_offpath, MLP_LIN_INSTR_INCLUDE_OFFPATH, Flag, Flag, FALSE, )
+
 DEF_PARAM(mlp_lin_data_thresh, MLP_LIN_DATA_THRESH, float, float, 0.5, )
 DEF_PARAM(mlp_lin_instr_thresh, MLP_LIN_INSTR_THRESH, float, float, 0.7, )
 

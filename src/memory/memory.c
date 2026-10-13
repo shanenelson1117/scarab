@@ -683,25 +683,23 @@ static inline void membound_classify_fill(Mem_Req* req, Flag* is_membound, Flag*
   if (!MEMBOUND_STATS && !REUSE_DIST_STATS && MLP_LIN_DATA_LAMBDA == 0.0 && MLP_LIN_INSTR_LAMBDA == 0.0)
     return;
   if (req->type == MRT_IFETCH) {
-    double fe_frac = 0.0;
-    if (icache_fe_frac_for_line(req->proc_id, req->addr, &fe_frac)) {
+    /* Instruction fills have no load window, so --mlp_lin_bound_signal does not apply here. The
+       instruction side has its own two selectors, both read inside this one reporter:
+       --mlp_lin_instr_no_commit picks the numerator (empty issue queue, or that AND nothing
+       committed) and --mlp_lin_instr_include_offpath picks the path gate (on-path demand fetch
+       only, or any awaited demand miss). Policy 9 is the only consumer: td_fe_rrip_on_mlc and
+       td_combined_* call icache_fe_frac_for_line, which keeps the old gate and numerator. */
+    double fe_frac = 0.0, policy_frac = 0.0;
+    if (icache_fe_frac_for_line_mlp(req->proc_id, req->addr, &fe_frac, &policy_frac)) {
+      /* The MEASUREMENT numerator, always fe_bound/window, so a sweep over
+         --mlp_lin_instr_no_commit leaves MLC_FEBOUND_FRAC_* comparable arm to arm -- exactly as
+         the data branch below keeps *bound_frac on MEMBOUND under --mlp_lin_bound_signal.
+         (--mlp_lin_instr_include_offpath is different in kind: eligibility is the gate on
+         reporting at all, so at 1 these chains do take in the off-path fills. Intended; see the
+         knob's note.) */
       *bound_frac = fe_frac;
       *have_frac = TRUE;
-      /* Instruction fills have no load window, so --mlp_lin_bound_signal does not apply here;
-         the FE fraction is the policy's value on this path whatever the knob says.
-
-         --mlp_lin_instr_no_commit is the instruction-side selector that DOES apply: it swaps
-         this numerator for the commit-gated one (empty issue queue AND nothing committed) over
-         the same window. Reported separately from *bound_frac above -- which keeps the fe_bound
-         numerator -- so the FEBOUND measurement chains stay comparable across a sweep over it,
-         exactly as the data branch keeps *bound_frac on MEMBOUND under --mlp_lin_bound_signal.
-         Both reporters gate identically, so a TRUE above guarantees a TRUE here. */
-      double policy_frac = fe_frac;
-      if (MLP_LIN_INSTR_NO_COMMIT) {
-        Flag have_commit = icache_fe_commit_frac_for_line(req->proc_id, req->addr, &policy_frac);
-        ASSERT(req->proc_id, have_commit);
-        ASSERT(req->proc_id, policy_frac <= fe_frac);
-      }
+      ASSERT(req->proc_id, policy_frac <= fe_frac);
       if (out_policy_frac)
         *out_policy_frac = policy_frac;
       /* The MARK comes from the SELECTED fraction, against the unchanged --td_fe_rrip_thresh

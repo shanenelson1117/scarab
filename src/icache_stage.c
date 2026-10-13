@@ -507,9 +507,11 @@ Flag mem_req_on_icache_miss() {
 
       // a new demand icache miss starts here -> reset its FE-bound accounting so
       // icache_tag_inflight_miss accumulates fresh over this miss's window (needed whether the
-      // FE policy targets the L1I or the L2). Reset on- and off-path: off-path misses now carry
-      // their own window so the L1I marked-RRIP insert can derive an RRPV for them too. (The
-      // L2/MLC variant keeps its own on-path gate in icache_fe_frac_for_line, so it is unaffected.)
+      // FE policy targets the L1I or the L2). Reset on- and off-path: off-path misses carry
+      // their own window so the L1I marked-RRIP insert can derive an RRPV for them too, and so
+      // REPL_MLP can read one under --mlp_lin_instr_include_offpath. (td_fe_rrip_on_mlc and
+      // td_combined_* keep their on-path gate in icache_fe_frac_for_line, so they are
+      // unaffected either way.)
       /* MLP_LIN_INSTR_LAMBDA belongs in this gate for the same reason it opens the accumulation
          gate in topdown.c: without it a policy-9 run with only --mlp_lin_instr_lambda set never
          resets, so the window spans EVERY demand miss of the run and the "fraction" each
@@ -1068,8 +1070,10 @@ static inline void icache_process_ops(Stage_Data* cur_data, Flag fetched_from_uo
  * for --mlp_lin_instr_no_commit). Called once per cycle from topdown_idq_update.
  * Credits the demand miss fetch is currently blocked on (in-order fetch), on- or off-path: the
  * L1I fill sets the line's RRPV whether the awaited miss is on- or off-path, matching the
- * path-agnostic L1D marked-RRIP policy. (The L2/MLC variant keeps its own on-path gate in
- * icache_fe_frac_for_line, so accumulating off-path here stays MLC-neutral.) */
+ * path-agnostic L1D marked-RRIP policy. (Accumulating off-path here stays MLC-neutral for the
+ * td_fe_rrip_on_mlc / td_combined_* consumers, which keep their on-path gate in
+ * icache_fe_frac_for_line. REPL_MLP can opt into reading these windows with
+ * --mlp_lin_instr_include_offpath, which is why they are accumulated and not merely reset.) */
 void icache_tag_inflight_miss(uns8 proc_id, Flag fe_bound_cycle, Flag fe_commit_cycle) {
   Icache_Stage* ics = &cmp_model.icache_stage[proc_id];
   if (ics->state != ICACHE_WAIT_FOR_MISS)
@@ -1085,36 +1089,66 @@ void icache_tag_inflight_miss(uns8 proc_id, Flag fe_bound_cycle, Flag fe_commit_
     ics->fe_miss_commit_cycles++;
 }
 
-/* The shared body of the two reporters below. `use_commit` picks the NUMERATOR and nothing
- * else -- the gating, the window and the TRUE/FALSE decision are identical -- so a caller that
- * switches numerators on a knob cannot accidentally also change which fills report a fraction
- * at all. */
-static inline Flag icache_fe_frac_for_line_sel(uns8 proc_id, Addr line_addr, Flag use_commit, double* out_frac) {
-  if (out_frac)
-    *out_frac = 0.0;
+/* The shared body of the two reporters below. The two selector arguments are orthogonal and
+ * each does exactly one thing:
+ *
+ *   include_offpath  widens the PATH GATE. ics->off_path is sticky from the mispredicting fetch
+ *                    until the stage comes back on path (icache_stage.c clears it with
+ *                    `ic->off_path &= !ic->back_on_path`), so it reads as "the fetch stream
+ *                    currently blocked on this miss is on the wrong path" -- which is the
+ *                    property being relaxed, not a property of the request.
+ *   out_commit_frac  asks for the commit-gated numerator IN ADDITION to fe_bound, over the same
+ *                    window. Both are reported rather than one being selected here, so a caller
+ *                    can histogram one while the policy weighs the other without a second call
+ *                    that might gate differently.
+ *
+ * Everything else -- the awaited-line match, the window, and the TRUE/FALSE decision -- is
+ * common, so switching either selector cannot quietly change which fills report at all. */
+static inline Flag icache_fe_frac_for_line_sel(uns8 proc_id, Addr line_addr, Flag include_offpath,
+                                               double* out_bound_frac, double* out_commit_frac) {
+  if (out_bound_frac)
+    *out_bound_frac = 0.0;
+  if (out_commit_frac)
+    *out_commit_frac = 0.0;
   Icache_Stage* ics = &cmp_model.icache_stage[proc_id];
-  if (ics->off_path || ics->state != ICACHE_WAIT_FOR_MISS || ics->line_addr != line_addr ||
-      ics->fe_miss_window_cycles == 0)
+  if ((ics->off_path && !include_offpath) || ics->state != ICACHE_WAIT_FOR_MISS ||
+      ics->line_addr != line_addr || ics->fe_miss_window_cycles == 0)
     return FALSE;
-  if (out_frac) {
-    Counter num = use_commit ? ics->fe_miss_commit_cycles : ics->fe_miss_bound_cycles;
-    *out_frac = (double)num / (double)ics->fe_miss_window_cycles;
-  }
+  /* The subset relation the two numerators are read under, enforced where they are read as well
+     as where they are written (icache_tag_inflight_miss): a commit-gated fraction above the
+     fe_bound one would silently invert the meaning of --mlp_lin_instr_no_commit. */
+  ASSERT(proc_id, ics->fe_miss_commit_cycles <= ics->fe_miss_bound_cycles);
+  if (out_bound_frac)
+    *out_bound_frac = (double)ics->fe_miss_bound_cycles / (double)ics->fe_miss_window_cycles;
+  if (out_commit_frac)
+    *out_commit_frac = (double)ics->fe_miss_commit_cycles / (double)ics->fe_miss_window_cycles;
   return TRUE;
 }
 
 /* td_fe_rrip_on_mlc: report the front-end-bound fraction of the demand icache miss the L1I is
  * currently blocked on, if it matches `line_addr` (used at the L2 fill to set an instruction
- * line's RRPV). Returns TRUE (and sets *out_frac) only for the awaited on-path demand line. */
+ * line's RRPV). Returns TRUE (and sets *out_frac) only for the awaited on-path demand line.
+ * REPL_MLP reads icache_fe_frac_for_line_mlp instead; this one keeps the on-path gate and the
+ * fe_bound numerator unconditionally, so no policy-9 knob can move it. */
 Flag icache_fe_frac_for_line(uns8 proc_id, Addr line_addr, double* out_frac) {
-  return icache_fe_frac_for_line_sel(proc_id, line_addr, FALSE, out_frac);
+  return icache_fe_frac_for_line_sel(proc_id, line_addr, FALSE, out_frac, NULL);
 }
 
-/* --mlp_lin_instr_no_commit: the same report over the commit-gated numerator -- front-end-bound
- * cycles in which retirement also committed nothing. REPL_MLP's instruction term is the only
- * consumer; every other FE-bound policy keeps reading the function above. */
-Flag icache_fe_commit_frac_for_line(uns8 proc_id, Addr line_addr, double* out_frac) {
-  return icache_fe_frac_for_line_sel(proc_id, line_addr, TRUE, out_frac);
+/* REPL_MLP's instruction term. See icache_stage.h for the two knobs this reads. */
+Flag icache_fe_frac_for_line_mlp(uns8 proc_id, Addr line_addr, double* out_bound_frac, double* out_policy_frac) {
+  double bound_frac = 0.0, commit_frac = 0.0;
+  if (!icache_fe_frac_for_line_sel(proc_id, line_addr, MLP_LIN_INSTR_INCLUDE_OFFPATH, &bound_frac, &commit_frac)) {
+    if (out_bound_frac)
+      *out_bound_frac = 0.0;
+    if (out_policy_frac)
+      *out_policy_frac = 0.0;
+    return FALSE;
+  }
+  if (out_bound_frac)
+    *out_bound_frac = bound_frac;
+  if (out_policy_frac)
+    *out_policy_frac = MLP_LIN_INSTR_NO_COMMIT ? commit_frac : bound_frac;
+  return TRUE;
 }
 
 /**************************************************************************************/

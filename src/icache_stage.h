@@ -105,7 +105,11 @@ typedef struct Icache_Stage_struct {
      fe_miss_commit_cycles is a SUBSET of fe_miss_bound_cycles: the front-end-bound cycles in
      which retirement also committed nothing (--mlp_lin_instr_no_commit). Accumulated over the
      same window, so commit/window and bound/window share a denominator and are directly
-     comparable; see icache_fe_commit_frac_for_line. */
+     comparable; see icache_fe_frac_for_line_mlp, which reports both.
+
+     All three are accumulated for an off-path demand miss exactly as for an on-path one -- the
+     accumulator and the per-miss reset are both path-agnostic. Which CONSUMERS may read an
+     off-path window is decided at the reporters below, not here. */
   Counter fe_miss_window_cycles;
   Counter fe_miss_bound_cycles;
   Counter fe_miss_commit_cycles;
@@ -181,10 +185,22 @@ void icache_tag_inflight_miss(uns8 proc_id, Flag fe_bound_cycle, Flag fe_commit_
  * matches line_addr (used at the L2 fill to prioritize an instruction line). */
 Flag icache_fe_frac_for_line(uns8 proc_id, Addr line_addr, double* out_frac);
 
-/* --mlp_lin_instr_no_commit: the same report, over the commit-gated numerator. Same gating,
-   same window, same TRUE/FALSE conditions as icache_fe_frac_for_line -- only the numerator
-   differs -- so the two are interchangeable at a call site and comparable arm to arm. */
-Flag icache_fe_commit_frac_for_line(uns8 proc_id, Addr line_addr, double* out_frac);
+/* The same report under REPL_MLP's instruction-side selectors, and the ONLY entry point policy 9
+   uses. Both knobs are read here rather than at the fill site, so the window, the numerator and
+   the path gate cannot be combined inconsistently by a caller:
+
+     --mlp_lin_instr_no_commit        picks the NUMERATOR: fe_bound (the front end took no ops)
+                                      or the commit-gated subset of it.
+     --mlp_lin_instr_include_offpath  picks the PATH GATE: on-path demand fetch only (as every
+                                      other FE-bound consumer sees it), or any awaited demand
+                                      miss whatever path the blocked fetch stream is on.
+
+   Reports BOTH numerators over the one window: *out_bound_frac is always fe_bound/window, which
+   is what the FEBOUND measurement chains histogram, and *out_policy_frac is the selected one,
+   which is what the policy weighs. They are equal unless --mlp_lin_instr_no_commit is set.
+   Either pointer may be NULL. Returns FALSE, leaving both at 0, when this fill has no window to
+   report -- same meaning as icache_fe_frac_for_line's FALSE. */
+Flag icache_fe_frac_for_line_mlp(uns8 proc_id, Addr line_addr, double* out_bound_frac, double* out_policy_frac);
 
 /**************************************************************************************/
 
