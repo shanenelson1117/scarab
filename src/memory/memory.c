@@ -680,7 +680,13 @@ static inline void membound_classify_fill(Mem_Req* req, Flag* is_membound, Flag*
      at zero, and the run looks like a workload with no marked lines rather than like a missing
      knob. Self-opening here is the only place that failure can be prevented -- nothing
      downstream can tell an unmarked line from an unclassified one. */
-  if (!MEMBOUND_STATS && !REUSE_DIST_STATS && MLP_LIN_DATA_LAMBDA == 0.0 && MLP_LIN_INSTR_LAMBDA == 0.0)
+  /* --mlp_lin_dyn_lambda joins this list for the same reason the static lambdas are in it, and
+     more urgently: the adaptive arm REPLACES both static params, which are normally left at 0.0,
+     so testing only those would return here on every fill. Nothing would ever be classified, no
+     line would carry a mark, and the controller's walk would drive a term with no inputs -- a
+     run that looks like the policy did nothing rather than like a knob that was never set. */
+  if (!MEMBOUND_STATS && !REUSE_DIST_STATS && !MLP_LIN_DYN_LAMBDA && MLP_LIN_DATA_LAMBDA == 0.0 &&
+      MLP_LIN_INSTR_LAMBDA == 0.0)
     return;
   /* IS THIS FILL AN INSTRUCTION FILL? A demand fetch says so by its type. --mlp_lin_instr_
      include_pref_merge adds the other way a line the front end is stalled on arrives: an

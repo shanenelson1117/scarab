@@ -50,6 +50,8 @@
 #include "node_stage.h"
 #include "op.h"
 #include "td_load_replay.h"
+#include "libs/cache_lib.h"  // --mlp_lin_dyn_lambda: the live lambda registers it writes
+
 #include "memory/memory.h"
 /* MLP_LIN_*_LAMBDA: REPL_MLP opens its own measurement windows below. */
 #include "memory/memory.param.h"
@@ -124,6 +126,129 @@ void topdown_bp_recovery(uns proc_id, Op* op) {
   idq_stage_set_recovery_cycle(TOPDOWN_RECOVERY_DEPTH);
 }
 
+/* ============ --mlp_lin_dyn_lambda: REPL_MLP's adaptive-lambda controller ============
+ *
+ * Two registers per signal -- the window just finished and the one before it -- and a relative
+ * rule between them. See memory.param.def for the design and for why the branch side compares
+ * raw counts while the data side compares a fraction.
+ *
+ * State is per-proc so the accumulation is honest on a multi-core build, but the lambdas it
+ * writes are global to the policy, which is why single core is asserted at seed time rather
+ * than left to produce two controllers fighting over one pair.
+ */
+static Flag    g_mlpdyn_seeded[MAX_NUM_PROCS];
+static Flag    g_mlpdyn_have_prev[MAX_NUM_PROCS];
+static Counter g_mlpdyn_win_idx[MAX_NUM_PROCS];      // inst_count >> N, as of the last check
+static Counter g_mlpdyn_mis_snap[MAX_NUM_PROCS];     // BP mispred total at the window's open
+static Counter g_mlpdyn_cur_mis[MAX_NUM_PROCS], g_mlpdyn_prev_mis[MAX_NUM_PROCS];
+static Counter g_mlpdyn_cur_fuwait[MAX_NUM_PROCS], g_mlpdyn_prev_fuwait[MAX_NUM_PROCS];
+static Counter g_mlpdyn_cur_cycles[MAX_NUM_PROCS], g_mlpdyn_prev_cycles[MAX_NUM_PROCS];
+
+/* The branch signal: both predictors' mispredictions, read straight off the stat counters.
+   bp.c charges these unconditionally, so there is no knob to remember -- and no off-path guard
+   either, which is the documented meaning of this numerator, not an oversight here. */
+static inline Counter mlpdyn_mispred_total(uns proc_id) {
+  return GET_STAT_EVENT(proc_id, BP_L0_MISPRED) + GET_STAT_EVENT(proc_id, BP_MAIN_MISPRED);
+}
+
+static inline double mlpdyn_clamp(double v) {
+  const double lo = (double)MLP_LIN_DYN_LAMBDA_MIN;
+  const double hi = (double)MLP_LIN_DYN_LAMBDA_MAX;
+  return v < lo ? lo : (v > hi ? hi : v);
+}
+
+/* One signal's verdict. Returns -1, 0 or +1 -- the SIGN of the step, with the dead band in the
+   middle -- so both signals go through identical arithmetic and cannot drift apart. A previous
+   window of zero yields 0: a relative threshold on zero has no meaning. */
+static inline int mlpdyn_verdict(double cur, double prev) {
+  const double t = (double)MLP_LIN_DYN_THRESH;
+  if (!(prev > 0.0))
+    return 0;
+  if (cur > (1.0 + t) * prev)
+    return 1;
+  if (cur < (1.0 - t) * prev)
+    return -1;
+  return 0;
+}
+
+static void mlpdyn_update(uns proc_id, Flag fu_wait_cycle) {
+  if (!MLP_LIN_DYN_LAMBDA)
+    return;
+
+  if (!g_mlpdyn_seeded[proc_id]) {
+    ASSERTM(proc_id, NUM_CORES == 1,
+            "--mlp_lin_dyn_lambda is single-core only: the lambdas it drives are global to the "
+            "policy while its signals are per-core\n");
+    /* 2^N must stay inside a Counter and be big enough that one window is a measurement rather
+       than noise; 10 is ~1K instructions, 40 is ~1T. */
+    ASSERTM(proc_id, MLP_LIN_DYN_WINDOW_LOG2 >= 10 && MLP_LIN_DYN_WINDOW_LOG2 <= 40,
+            "--mlp_lin_dyn_window_log2 %u is out of range (10..40)\n", MLP_LIN_DYN_WINDOW_LOG2);
+    cache_set_mlp_dyn_lambdas((double)MLP_LIN_DYN_INSTR_START, (double)MLP_LIN_DYN_DATA_START);
+    g_mlpdyn_win_idx[proc_id] = inst_count[proc_id] >> MLP_LIN_DYN_WINDOW_LOG2;
+    g_mlpdyn_mis_snap[proc_id] = mlpdyn_mispred_total(proc_id);
+    g_mlpdyn_seeded[proc_id] = TRUE;
+  }
+
+  /* Accumulate THIS window. Cycles are counted here and not taken from NODE_CYCLE so the
+     denominator is exactly the cycles this controller saw its own signal over. */
+  g_mlpdyn_cur_cycles[proc_id]++;
+  if (fu_wait_cycle)
+    g_mlpdyn_cur_fuwait[proc_id]++;
+
+  /* THE BIT FLIP: the window closes on the cycle where the retired-instruction count crosses a
+     2^N boundary. Checked per cycle, so the window is 2^N instructions give or take the handful
+     that retire together on the closing cycle. */
+  const Counter win = inst_count[proc_id] >> MLP_LIN_DYN_WINDOW_LOG2;
+  if (win == g_mlpdyn_win_idx[proc_id])
+    return;
+  g_mlpdyn_win_idx[proc_id] = win;
+
+  const Counter mis_now = mlpdyn_mispred_total(proc_id);
+  g_mlpdyn_cur_mis[proc_id] = mis_now - g_mlpdyn_mis_snap[proc_id];
+  g_mlpdyn_mis_snap[proc_id] = mis_now;
+  STAT_EVENT(proc_id, MLP_DYN_WINDOWS);
+
+  if (g_mlpdyn_have_prev[proc_id]) {
+    double instr_lam = cache_mlp_dyn_instr_lambda();
+    double data_lam = cache_mlp_dyn_data_lambda();
+    const double step = (double)MLP_LIN_DYN_STEP;
+
+    /* Branch mispredictions -> INSTRUCTION lambda. Raw counts: equal-instruction windows share
+       a denominator, so the counts are already rates. */
+    const int bv = mlpdyn_verdict((double)g_mlpdyn_cur_mis[proc_id], (double)g_mlpdyn_prev_mis[proc_id]);
+    instr_lam = mlpdyn_clamp(instr_lam + step * (double)bv);
+    STAT_EVENT(proc_id, bv > 0 ? MLP_DYN_INSTR_UP : (bv < 0 ? MLP_DYN_INSTR_DOWN : MLP_DYN_INSTR_HOLD));
+
+    /* FU_WAIT -> DATA lambda, as a SHARE of each window's own cycles: the windows are equal in
+       instructions, not cycles, so a raw count would also move with IPC. */
+    const double cur_frac = g_mlpdyn_cur_cycles[proc_id]
+                                ? (double)g_mlpdyn_cur_fuwait[proc_id] / (double)g_mlpdyn_cur_cycles[proc_id]
+                                : 0.0;
+    const double prev_frac = g_mlpdyn_prev_cycles[proc_id]
+                                 ? (double)g_mlpdyn_prev_fuwait[proc_id] / (double)g_mlpdyn_prev_cycles[proc_id]
+                                 : 0.0;
+    const int fv = mlpdyn_verdict(cur_frac, prev_frac);
+    data_lam = mlpdyn_clamp(data_lam + step * (double)fv);
+    STAT_EVENT(proc_id, fv > 0 ? MLP_DYN_DATA_UP : (fv < 0 ? MLP_DYN_DATA_DOWN : MLP_DYN_DATA_HOLD));
+
+    cache_set_mlp_dyn_lambdas(instr_lam, data_lam);
+    /* Time series of the walk, one sample per ADJUSTED window: divide by MLP_DYN_WINDOWS - 1
+       (the first window closes without adjusting) for the mean lambda the run actually ran at,
+       which is the number to quote -- not the start value. */
+    INC_STAT_EVENT(proc_id, MLP_DYN_INSTR_LAMBDA_X1000_SUM, (Counter)(instr_lam * 1000.0 + 0.5));
+    INC_STAT_EVENT(proc_id, MLP_DYN_DATA_LAMBDA_X1000_SUM, (Counter)(data_lam * 1000.0 + 0.5));
+  }
+
+  /* Current becomes previous; current restarts. The only history the rule can see. */
+  g_mlpdyn_prev_mis[proc_id] = g_mlpdyn_cur_mis[proc_id];
+  g_mlpdyn_prev_fuwait[proc_id] = g_mlpdyn_cur_fuwait[proc_id];
+  g_mlpdyn_prev_cycles[proc_id] = g_mlpdyn_cur_cycles[proc_id];
+  g_mlpdyn_cur_mis[proc_id] = 0;
+  g_mlpdyn_cur_fuwait[proc_id] = 0;
+  g_mlpdyn_cur_cycles[proc_id] = 0;
+  g_mlpdyn_have_prev[proc_id] = TRUE;
+}
+
 void topdown_idq_update(uns proc_id, int count_available, int count_issued, int count_issued_on_path) {
   // per-load memory-boundness tracking: classify this cycle and tag every in-flight load's window
   // (needed by the record pass, the in-sim gap-tracking mode, the on-demand marked-RRIP policy
@@ -148,9 +273,12 @@ void topdown_idq_update(uns proc_id, int count_available, int count_issued, int 
      window distribution must still open the gate that accumulates it. Otherwise every window is
      0, both chains come back empty, and the output reads as "all windows are zero-length"
      instead of as a knob that was never turned on. */
+  /* MLP_LIN_DYN_LAMBDA joins this gate because the adaptive arm's data-side signal IS
+     fu_wait_cycle, computed just below. Self-opening for the same reason as the lambdas: the
+     policy must not depend on a stats knob having been remembered. */
   if (TD_LOAD_TRACK_ENABLE || TD_LOAD_EVICT_TRACK || TD_LOAD_RRIP_MARK || TD_COMBINED_ON_MLC ||
       TD_COMBINED_ON_L1 || MEMBOUND_STATS || MARKED_LOAD_RECORD || MLP_LIN_DATA_LAMBDA != 0.0 ||
-      TD_LOAD_WINDOW_STATS || MEMPROXY_STATS) {
+      TD_LOAD_WINDOW_STATS || MEMPROXY_STATS || MLP_LIN_DYN_LAMBDA) {
     Flag backend_stall = (count_issued == 0 && idq_stage_get_stage_data()->op_count > 0);
     const int in_flight = lsq_get_in_flight_load_num();
     Flag mem_bound_cycle = backend_stall && (in_flight > 0);
@@ -172,6 +300,11 @@ void topdown_idq_update(uns proc_id, int count_available, int count_issued, int 
        difference between the two counters is the non-memory share. */
     Flag fu_wait_cycle = (exec->fus_busy == 0) && node_ops_waiting_on_operands();
     lsq_tag_inflight_loads(mem_bound_cycle, fu0_cycle, fu_wait_cycle);
+
+    /* --mlp_lin_dyn_lambda consumes this cycle's FU_WAIT verdict directly rather than reading
+       MEMPROXY_FU0_WAIT, which only exists under --memproxy_stats. Accumulation is per cycle;
+       the controller acts only when a window closes. */
+    mlpdyn_update(proc_id, fu_wait_cycle);
 
     /* --memproxy_stats: the incumbent proxy above against the FU-based one, on THIS cycle and
        off THIS SINGLE load-queue sample -- `in_flight` is read once and shared, so the two
@@ -248,8 +381,12 @@ void topdown_idq_update(uns proc_id, int count_available, int count_issued, int 
      to get the fraction would confound a LIN experiment with an unrelated L1I policy change.
      Opening the window is behaviour-neutral by itself: it only accumulates fe_bound cycles
      against in-flight icache misses. */
+  /* MLP_LIN_DYN_LAMBDA opens this gate too. Under the adaptive arm the STATIC instr lambda is
+     not what the policy weighs -- and is typically left at its 0.0 default -- so testing it here
+     would leave the FE-bound window unmeasured and the instruction term permanently dead while
+     the controller happily walked a lambda nothing read. */
   if (TD_FE_RRIP_MARK || TD_FE_RRIP_ON_MLC || TD_COMBINED_ON_MLC || TD_COMBINED_ON_L1 ||
-      MLP_LIN_INSTR_LAMBDA != 0.0) {
+      MLP_LIN_INSTR_LAMBDA != 0.0 || MLP_LIN_DYN_LAMBDA) {
     Flag backend_stall = (count_issued == 0 && idq_stage_get_stage_data()->op_count > 0);
     Flag fe_bound_cycle = !backend_stall && (count_available == 0);
     /* --mlp_lin_instr_no_commit: the STRICTER front-end-bound cycle, accumulated alongside the

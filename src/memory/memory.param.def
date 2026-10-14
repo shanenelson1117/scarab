@@ -449,6 +449,83 @@ DEF_PARAM(mlp_lin_instr_include_offpath, MLP_LIN_INSTR_INCLUDE_OFFPATH, Flag, Fl
    req->type == MRT_IFETCH in their own fill paths and are untouched. */
 DEF_PARAM(mlp_lin_instr_include_pref_merge, MLP_LIN_INSTR_INCLUDE_PREF_MERGE, Flag, Flag, FALSE, )
 
+/* ======================= REPL_MLP ADAPTIVE LAMBDAS (--mlp_lin_dyn_lambda) =======================
+   A CLOSED LOOP on the two boundness lambdas. Every window of 2^N retired instructions, each
+   lambda is nudged by one step according to whether its own signal got WORSE or BETTER than the
+   window before:
+
+     instruction lambda  <- branch mispredictions per window    (fetch is hurting -> protect
+                                                                 instruction lines harder)
+     data lambda         <- FU_WAIT share of the window's cycles (the machine is dependence-
+                                                                 stalled more -> protect data)
+
+   TWO REGISTERS PER SIGNAL, previous window and current window, which is the whole state: the
+   rule is relative, so nothing older than one window can influence it. Mispredictions are read
+   as a delta of the always-charged BP_L0_MISPRED + BP_MAIN_MISPRED counters (no knob to
+   remember, and the same numerator as the MPKI these runs are reported with -- note it includes
+   WRONG-PATH branches, since those counters carry no off-path guard). FU_WAIT is accumulated
+   here from the per-cycle signal itself, NOT from MEMPROXY_FU0_WAIT, which only exists under
+   --memproxy_stats: a policy that silently became a no-op because a stats knob was off is the
+   failure this codebase keeps designing out.
+
+   WHY THE WINDOW IS IN INSTRUCTIONS AND A POWER OF TWO. Equal-instruction windows make two
+   consecutive mispredict COUNTS directly comparable -- they are already per-instruction rates
+   with the same denominator -- so the branch rule needs no division. A power of two makes the
+   boundary a bit flip in the retired-instruction count: the window closes on the cycle where
+   inst_count >> N changes, costing a shift and a compare per cycle. 20 is 1,048,576
+   instructions, the "1M" window.
+
+   THE DATA SIDE CANNOT USE A RAW COUNT for the same reason the branch side can: the windows are
+   equal in instructions, not cycles, so a window with worse IPC contains more cycles and more
+   FU_WAIT cycles at an unchanged stall fraction. It therefore compares
+   fu_wait_cycles/window_cycles, and keeps the extra register pair that requires.
+
+   FIRST WINDOW NEVER ADJUSTS -- there is no previous window to compare against -- and neither
+   does a window whose predecessor measured zero, since a relative threshold on zero is
+   meaningless. Both are counted as HOLD in the stats so the arm's activity is auditable.
+
+   MUTUALLY EXCLUSIVE WITH --load_prio_stats, enforced at init rather than left to be
+   discovered. That instrumentation builds an EXACT-MATCH table of the boosts reachable from the
+   static lambdas and looks a fill's boost up in it; the first fill after any adjustment would
+   find a boost that is not in the table and abort. See load_prio_levels_init.
+
+   SINGLE CORE ONLY, also asserted: the lambdas are global to the policy while the signals are
+   per-core, so two cores would fight over one pair of registers.
+
+   SELF-OPENING, and this one matters more than usual. The arm REPLACES --mlp_lin_instr_lambda /
+   --mlp_lin_data_lambda, which are normally left at their 0.0 defaults -- but those same params
+   are what open the measurement: the fill classification in membound_classify_fill, the
+   FE-bound window in topdown_idq_update, and its per-miss reset in icache_stage.c all test
+   them. So --mlp_lin_dyn_lambda is in all three gates as well. Without that, the controller
+   would walk a pair of lambdas that weighed marks nothing ever set, and the arm would read as
+   "the policy does nothing" instead of as a knob that was never wired up. */
+DEF_PARAM(mlp_lin_dyn_lambda, MLP_LIN_DYN_LAMBDA, Flag, Flag, FALSE, )
+
+/* Window size, as a LOG2 of retired instructions. 20 = 1,048,576. Range-checked at first use. */
+DEF_PARAM(mlp_lin_dyn_window_log2, MLP_LIN_DYN_WINDOW_LOG2, uns, uns, 20, )
+
+/* Relative change that triggers a step, applied symmetrically: a signal above (1+t)x its
+   previous window steps its lambda UP, below (1-t)x steps it DOWN, and anything between holds.
+   0.05 is the 5% rule. A band, not a single threshold, so a signal hovering at the boundary
+   does not oscillate every window. */
+DEF_PARAM(mlp_lin_dyn_thresh, MLP_LIN_DYN_THRESH, float, float, 0.05, )
+
+/* How much one step moves a lambda, in LRU stack positions. 1.0 is "increase by one". */
+DEF_PARAM(mlp_lin_dyn_step, MLP_LIN_DYN_STEP, float, float, 1.0, )
+
+/* Where the two lambdas START, before any window has closed. These REPLACE --mlp_lin_instr_lambda
+   / --mlp_lin_data_lambda while the arm is on; those static params are not read at all, so a run
+   cannot half-set the policy. */
+DEF_PARAM(mlp_lin_dyn_instr_start, MLP_LIN_DYN_INSTR_START, float, float, 34.0, )
+DEF_PARAM(mlp_lin_dyn_data_start, MLP_LIN_DYN_DATA_START, float, float, 17.0, )
+
+/* Clamps on the walk. The floor is 0 and not negative on purpose: a negative lambda inverts the
+   policy -- a "boost" that evicts the lines it is supposed to protect -- which cache_lib refuses
+   for the static params too. The ceiling stops an unbounded drift over a long run; at assoc 16
+   anything past ~16 already outranks recency entirely, so 64 is slack, not a target. */
+DEF_PARAM(mlp_lin_dyn_lambda_min, MLP_LIN_DYN_LAMBDA_MIN, float, float, 0.0, )
+DEF_PARAM(mlp_lin_dyn_lambda_max, MLP_LIN_DYN_LAMBDA_MAX, float, float, 64.0, )
+
 DEF_PARAM(mlp_lin_data_thresh, MLP_LIN_DATA_THRESH, float, float, 0.5, )
 DEF_PARAM(mlp_lin_instr_thresh, MLP_LIN_INSTR_THRESH, float, float, 0.7, )
 

@@ -518,7 +518,7 @@ Flag mem_req_on_icache_miss() {
          instruction fill is marked from is a running global average rather than this miss's
          stall. The counters are per-miss state, so the reset must follow the accumulation. */
       if (TD_FE_RRIP_MARK || TD_FE_RRIP_ON_MLC || TD_COMBINED_ON_MLC || TD_COMBINED_ON_L1 ||
-          MLP_LIN_INSTR_LAMBDA != 0.0) {
+          MLP_LIN_INSTR_LAMBDA != 0.0 || MLP_LIN_DYN_LAMBDA) {
         ic->fe_miss_window_cycles = 0;
         ic->fe_miss_bound_cycles = 0;
         ic->fe_miss_commit_cycles = 0;

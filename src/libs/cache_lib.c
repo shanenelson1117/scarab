@@ -151,6 +151,40 @@ void cache_set_next_fill_prefetch(Flag is_prefetch) {
   g_next_fill_prefetch = is_prefetch;
 }
 
+/* --mlp_lin_dyn_lambda: the live lambdas of the adaptive arm. ONE pair for the whole policy,
+   not one per cache: the controller in topdown.c owns the adaptation and asserts single-core,
+   and holding the state here means lin_lam_instr/lin_lam_data read the same values the ATDs
+   would, exactly as they do for the static params.
+   Lazily seeded from the START params so the opening values are in force at the first fill,
+   with no dependence on whether the controller or a cache access runs first. */
+static Flag   g_mlp_dyn_seeded = FALSE;
+static double g_mlp_dyn_instr = 0.0;
+static double g_mlp_dyn_data = 0.0;
+
+static inline void mlp_dyn_seed(void) {
+  if (!g_mlp_dyn_seeded) {
+    g_mlp_dyn_instr = (double)MLP_LIN_DYN_INSTR_START;
+    g_mlp_dyn_data = (double)MLP_LIN_DYN_DATA_START;
+    g_mlp_dyn_seeded = TRUE;
+  }
+}
+
+void cache_set_mlp_dyn_lambdas(double instr_lambda, double data_lambda) {
+  g_mlp_dyn_instr = instr_lambda;
+  g_mlp_dyn_data = data_lambda;
+  g_mlp_dyn_seeded = TRUE;
+}
+
+double cache_mlp_dyn_instr_lambda(void) {
+  mlp_dyn_seed();
+  return g_mlp_dyn_instr;
+}
+
+double cache_mlp_dyn_data_lambda(void) {
+  mlp_dyn_seed();
+  return g_mlp_dyn_data;
+}
+
 void cache_set_next_fill_store(Flag is_store) {
   g_next_fill_store = is_store;
 }
@@ -353,11 +387,19 @@ static inline uns mlp_lin_costq(double cost_cycles) {
 static inline double lin_lam_mlp(const Cache* c) {
   return c->lin_lambda_override ? c->lin_lambda_mlp : (double)MLP_LIN_LAMBDA;
 }
+/* --mlp_lin_dyn_lambda REPLACES the static param rather than scaling it, so the two cannot be
+ * set to different things and silently half-apply. SBAR's per-cache override still wins where it
+ * is in force, but the two cannot meet: ps_enabled() requires REPL_MLP_PAPER, which has no
+ * boundness term at all. */
 static inline double lin_lam_data(const Cache* c) {
-  return c->lin_lambda_override ? c->lin_lambda_data : (double)MLP_LIN_DATA_LAMBDA;
+  if (c->lin_lambda_override)
+    return c->lin_lambda_data;
+  return MLP_LIN_DYN_LAMBDA ? cache_mlp_dyn_data_lambda() : (double)MLP_LIN_DATA_LAMBDA;
 }
 static inline double lin_lam_instr(const Cache* c) {
-  return c->lin_lambda_override ? c->lin_lambda_instr : (double)MLP_LIN_INSTR_LAMBDA;
+  if (c->lin_lambda_override)
+    return c->lin_lambda_instr;
+  return MLP_LIN_DYN_LAMBDA ? cache_mlp_dyn_instr_lambda() : (double)MLP_LIN_INSTR_LAMBDA;
 }
 
 /* REPL_MLP_PAPER: the lambda in force. SBAR pins it per-cache via cache_set_lin_lambdas (the
@@ -407,6 +449,18 @@ static void load_prio_levels_init(Cache* cache) {
   memset(cache->prio_boost, 0, sizeof(cache->prio_boost));
   if (!cache->set_miss_ctr)
     return;  /* not tracked; set_miss_ctr is the single enable test */
+
+  /* --mlp_lin_dyn_lambda moves the lambdas while the run is in flight, and the table built just
+     below is an EXACT-MATCH table of the boosts reachable from the lambdas as they are right
+     now. The first fill after the first adjustment would compute a boost that is not in it and
+     die in load_prio_level_of. Refuse the combination here, where the message can say why,
+     instead of 2^20 instructions into the run with an assert about a float not being found. */
+  ASSERTM(0, !MLP_LIN_DYN_LAMBDA,
+          "--load_prio_stats cannot be combined with --mlp_lin_dyn_lambda: the priority level "
+          "table for cache '%s' is built once from the lambdas in force at init, and the "
+          "adaptive arm changes them every window. Run the dynamic arm without --load_prio_stats, "
+          "or pin the lambdas with --mlp_lin_dyn_lambda 0 to plot levels.\n",
+          cache->name);
 
   /* The three bound-term values, in the order mlp_lin_bound_term can return them. A line is
      membound, FE-bound, or neither, and those are mutually exclusive, so this enumerates the

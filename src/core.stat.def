@@ -755,6 +755,31 @@ DEF_STAT(  MEMPROXY_AGREE_NOT               , COUNT, NO_RATIO  )
 DEF_STAT(  MEMPROXY_ONLY_BACKEND            , COUNT, NO_RATIO  )
 DEF_STAT(  MEMPROXY_ONLY_FU                 , COUNT, NO_RATIO  )
 DEF_STAT(  MEMPROXY_AGREE                   , COUNT, NO_RATIO  )
+
+/* --mlp_lin_dyn_lambda: what REPL_MLP's adaptive-lambda controller did. One window = 2^N retired
+   instructions (--mlp_lin_dyn_window_log2).
+
+   MLP_DYN_WINDOWS counts every window that closed, INCLUDING the first, which by definition
+   cannot adjust anything -- so UP + DOWN + HOLD on either side is MLP_DYN_WINDOWS - 1, and the
+   missing one is not a lost event. HOLD covers both "inside the +/-thresh dead band" and "the
+   previous window measured zero", which are different reasons to do nothing and are deliberately
+   not separated: either way the lambda did not move.
+
+   The two *_LAMBDA_X1000_SUM chains are the walk itself, one sample per ADJUSTED window, as the
+   lambda times 1000 (so 34000 is a lambda of 34). Divide by (MLP_DYN_WINDOWS - 1) for the mean
+   lambda the run actually executed at -- the number to quote when reporting what this arm did,
+   since --mlp_lin_dyn_*_start only says where it began. There is no max/min chain: a walk that
+   spent one window at the ceiling and the rest at the floor has the same sum as a steady middle,
+   so read these together with UP/DOWN, which say how much movement produced that mean. */
+DEF_STAT(  MLP_DYN_WINDOWS                  , COUNT, NO_RATIO  )
+DEF_STAT(  MLP_DYN_INSTR_UP                 , COUNT, NO_RATIO  )
+DEF_STAT(  MLP_DYN_INSTR_DOWN               , COUNT, NO_RATIO  )
+DEF_STAT(  MLP_DYN_INSTR_HOLD               , COUNT, NO_RATIO  )
+DEF_STAT(  MLP_DYN_DATA_UP                  , COUNT, NO_RATIO  )
+DEF_STAT(  MLP_DYN_DATA_DOWN                , COUNT, NO_RATIO  )
+DEF_STAT(  MLP_DYN_DATA_HOLD                , COUNT, NO_RATIO  )
+DEF_STAT(  MLP_DYN_INSTR_LAMBDA_X1000_SUM   , COUNT, NO_RATIO  )
+DEF_STAT(  MLP_DYN_DATA_LAMBDA_X1000_SUM    , COUNT, NO_RATIO  )
 DEF_STAT(  FU_STARVED,         RATIO,  NODE_CYCLE     )
 DEF_STAT(  CHIP_UTILIZATION,   RATIO,  NODE_CYCLE     )
 DEF_STAT(  CYCLES_UNDER_MEM_REQ,                       COUNT,  NO_RATIO       )
