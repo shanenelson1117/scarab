@@ -105,7 +105,6 @@ static Flag   g_next_fill_fe_bound = FALSE;
 static double g_next_fill_bound_frac = 0.0;
 static double g_next_fill_mlp_cost = 0.0;
 static Flag   g_next_fill_prefetch = FALSE;
-  g_next_fill_delta_prio = DELTA_PRIO_NONE;
 static uns8   g_next_fill_delta_prio = DELTA_PRIO_NONE;
 static Flag   g_next_fill_store = FALSE;
 static Flag   g_next_fill_offpath = FALSE;
@@ -225,6 +224,7 @@ void cache_save_fill_stage(Cache_Fill_Stage* out) {
   out->bound_frac = g_next_fill_bound_frac;
   out->mlp_cost = g_next_fill_mlp_cost;
   out->prefetch = g_next_fill_prefetch;
+  out->delta_prio = g_next_fill_delta_prio;
   out->store = g_next_fill_store;
   out->offpath = g_next_fill_offpath;
   out->traffic = g_next_fill_traffic;
@@ -236,13 +236,14 @@ void cache_restore_fill_stage(const Cache_Fill_Stage* in) {
   g_next_fill_bound_frac = in->bound_frac;
   g_next_fill_mlp_cost = in->mlp_cost;
   g_next_fill_prefetch = in->prefetch;
+  g_next_fill_delta_prio = in->delta_prio;
   g_next_fill_store = in->store;
   g_next_fill_offpath = in->offpath;
   g_next_fill_traffic = in->traffic;
 }
 
 void cache_clear_fill_stage(void) {
-  /* Designated initialisers, not positional: this struct has eight fields now and a positional
+  /* Designated initialisers, not positional: this struct has nine fields now and a positional
      list silently shifts every value when one is inserted. The cleared traffic class is OTHER,
      not 0 -- 0 is IFETCH, which would attribute an unstaged fill to real instruction traffic. */
   Cache_Fill_Stage z = {.membound = FALSE,
@@ -250,6 +251,7 @@ void cache_clear_fill_stage(void) {
                         .bound_frac = 0.0,
                         .mlp_cost = 0.0,
                         .prefetch = FALSE,
+                        .delta_prio = DELTA_PRIO_NONE,
                         .store = FALSE,
                         .offpath = FALSE,
                         .traffic = LOAD_PRIO_TC_OTHER};
@@ -305,6 +307,7 @@ static inline void consume_fill_bound(Cache_Entry* line) {
   g_next_fill_bound_frac = 0.0;
   g_next_fill_mlp_cost = 0.0;
   g_next_fill_prefetch = FALSE;
+  g_next_fill_delta_prio = DELTA_PRIO_NONE;
   g_next_fill_store = FALSE;
   g_next_fill_offpath = FALSE;
   /* OTHER, not 0: 0 is LOAD_PRIO_TC_IFETCH, so clearing to it would charge every unstaged fill to

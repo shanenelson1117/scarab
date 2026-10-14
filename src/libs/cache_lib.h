@@ -652,6 +652,7 @@ typedef struct Cache_Fill_Stage_struct {
   double bound_frac;
   double mlp_cost;
   Flag   prefetch;
+  uns8   delta_prio; /* --fdip_delta_place: a Delta_Prio */
   Flag   store;
   Flag   offpath;
   uns8   traffic; /* --load_prio_stats: a Load_Prio_Traffic */
