@@ -172,7 +172,9 @@ static inline int mlpdyn_verdict(double cur, double prev) {
 }
 
 static void mlpdyn_update(uns proc_id, Flag fu_wait_cycle) {
-  if (!MLP_LIN_DYN_LAMBDA)
+  /* Either toggle runs the controller: the window clock, the mispredict snapshot and the cycle
+     accounting are shared, and each side's verdict is applied below only if that side is on. */
+  if (!MLP_LIN_DYN_INSTR && !MLP_LIN_DYN_DATA)
     return;
 
   if (!g_mlpdyn_seeded[proc_id]) {
@@ -216,29 +218,36 @@ static void mlpdyn_update(uns proc_id, Flag fu_wait_cycle) {
     const double step = (double)MLP_LIN_DYN_STEP;
 
     /* Branch mispredictions -> INSTRUCTION lambda. Raw counts: equal-instruction windows share
-       a denominator, so the counts are already rates. */
-    const int bv = mlpdyn_verdict((double)g_mlpdyn_cur_mis[proc_id], (double)g_mlpdyn_prev_mis[proc_id]);
-    instr_lam = mlpdyn_clamp(instr_lam + step * (double)bv);
-    STAT_EVENT(proc_id, bv > 0 ? MLP_DYN_INSTR_UP : (bv < 0 ? MLP_DYN_INSTR_DOWN : MLP_DYN_INSTR_HOLD));
+       a denominator, so the counts are already rates.
+       The verdict is computed only when this side is enabled, so a pinned side emits no UP /
+       DOWN / HOLD at all -- an empty chain says "this loop was not running", which a chain of
+       all-HOLD could not distinguish from "running and never triggered". */
+    if (MLP_LIN_DYN_INSTR) {
+      const int bv = mlpdyn_verdict((double)g_mlpdyn_cur_mis[proc_id], (double)g_mlpdyn_prev_mis[proc_id]);
+      instr_lam = mlpdyn_clamp(instr_lam + step * (double)bv);
+      STAT_EVENT(proc_id, bv > 0 ? MLP_DYN_INSTR_UP : (bv < 0 ? MLP_DYN_INSTR_DOWN : MLP_DYN_INSTR_HOLD));
+      INC_STAT_EVENT(proc_id, MLP_DYN_INSTR_LAMBDA_X1000_SUM, (Counter)(instr_lam * 1000.0 + 0.5));
+    }
 
     /* FU_WAIT -> DATA lambda, as a SHARE of each window's own cycles: the windows are equal in
        instructions, not cycles, so a raw count would also move with IPC. */
-    const double cur_frac = g_mlpdyn_cur_cycles[proc_id]
-                                ? (double)g_mlpdyn_cur_fuwait[proc_id] / (double)g_mlpdyn_cur_cycles[proc_id]
-                                : 0.0;
-    const double prev_frac = g_mlpdyn_prev_cycles[proc_id]
-                                 ? (double)g_mlpdyn_prev_fuwait[proc_id] / (double)g_mlpdyn_prev_cycles[proc_id]
-                                 : 0.0;
-    const int fv = mlpdyn_verdict(cur_frac, prev_frac);
-    data_lam = mlpdyn_clamp(data_lam + step * (double)fv);
-    STAT_EVENT(proc_id, fv > 0 ? MLP_DYN_DATA_UP : (fv < 0 ? MLP_DYN_DATA_DOWN : MLP_DYN_DATA_HOLD));
+    if (MLP_LIN_DYN_DATA) {
+      const double cur_frac = g_mlpdyn_cur_cycles[proc_id]
+                                  ? (double)g_mlpdyn_cur_fuwait[proc_id] / (double)g_mlpdyn_cur_cycles[proc_id]
+                                  : 0.0;
+      const double prev_frac = g_mlpdyn_prev_cycles[proc_id]
+                                   ? (double)g_mlpdyn_prev_fuwait[proc_id] / (double)g_mlpdyn_prev_cycles[proc_id]
+                                   : 0.0;
+      const int fv = mlpdyn_verdict(cur_frac, prev_frac);
+      data_lam = mlpdyn_clamp(data_lam + step * (double)fv);
+      STAT_EVENT(proc_id, fv > 0 ? MLP_DYN_DATA_UP : (fv < 0 ? MLP_DYN_DATA_DOWN : MLP_DYN_DATA_HOLD));
+      INC_STAT_EVENT(proc_id, MLP_DYN_DATA_LAMBDA_X1000_SUM, (Counter)(data_lam * 1000.0 + 0.5));
+    }
 
+    /* One write for both, with the disabled side passing through the value it was seeded with.
+       The register of a pinned side is therefore never stale -- it simply never moves, and
+       nothing reads it. */
     cache_set_mlp_dyn_lambdas(instr_lam, data_lam);
-    /* Time series of the walk, one sample per ADJUSTED window: divide by MLP_DYN_WINDOWS - 1
-       (the first window closes without adjusting) for the mean lambda the run actually ran at,
-       which is the number to quote -- not the start value. */
-    INC_STAT_EVENT(proc_id, MLP_DYN_INSTR_LAMBDA_X1000_SUM, (Counter)(instr_lam * 1000.0 + 0.5));
-    INC_STAT_EVENT(proc_id, MLP_DYN_DATA_LAMBDA_X1000_SUM, (Counter)(data_lam * 1000.0 + 0.5));
   }
 
   /* Current becomes previous; current restarts. The only history the rule can see. */
@@ -275,12 +284,14 @@ void topdown_idq_update(uns proc_id, int count_available, int count_issued, int 
      window distribution must still open the gate that accumulates it. Otherwise every window is
      0, both chains come back empty, and the output reads as "all windows are zero-length"
      instead of as a knob that was never turned on. */
-  /* MLP_LIN_DYN_LAMBDA joins this gate because the adaptive arm's data-side signal IS
-     fu_wait_cycle, computed just below. Self-opening for the same reason as the lambdas: the
-     policy must not depend on a stats knob having been remembered. */
+  /* The adaptive arm joins this gate because its data-side signal IS fu_wait_cycle, computed
+     just below -- and because the controller itself is called from in here, so the INSTRUCTION
+     side needs the gate open too even though it reads no per-cycle signal. Hence both toggles,
+     not just the data one. Self-opening for the same reason as the lambdas: the policy must not
+     depend on a stats knob having been remembered. */
   if (TD_LOAD_TRACK_ENABLE || TD_LOAD_EVICT_TRACK || TD_LOAD_RRIP_MARK || TD_COMBINED_ON_MLC ||
       TD_COMBINED_ON_L1 || MEMBOUND_STATS || MARKED_LOAD_RECORD || MLP_LIN_DATA_LAMBDA != 0.0 ||
-      TD_LOAD_WINDOW_STATS || MEMPROXY_STATS || MLP_LIN_DYN_LAMBDA) {
+      TD_LOAD_WINDOW_STATS || MEMPROXY_STATS || MLP_LIN_DYN_INSTR || MLP_LIN_DYN_DATA) {
     Flag backend_stall = (count_issued == 0 && idq_stage_get_stage_data()->op_count > 0);
     const int in_flight = lsq_get_in_flight_load_num();
     Flag mem_bound_cycle = backend_stall && (in_flight > 0);
@@ -383,12 +394,13 @@ void topdown_idq_update(uns proc_id, int count_available, int count_issued, int 
      to get the fraction would confound a LIN experiment with an unrelated L1I policy change.
      Opening the window is behaviour-neutral by itself: it only accumulates fe_bound cycles
      against in-flight icache misses. */
-  /* MLP_LIN_DYN_LAMBDA opens this gate too. Under the adaptive arm the STATIC instr lambda is
-     not what the policy weighs -- and is typically left at its 0.0 default -- so testing it here
-     would leave the FE-bound window unmeasured and the instruction term permanently dead while
-     the controller happily walked a lambda nothing read. */
+  /* --mlp_lin_dyn_instr opens this gate too, and only that toggle: this window feeds the
+     INSTRUCTION side's mark. A dynamic instruction side may start at 0 and walk up, so testing
+     the static lambda alone would leave the window unmeasured and the term permanently dead
+     while the controller walked a lambda that weighed nothing. A dynamic DATA side needs
+     nothing here. */
   if (TD_FE_RRIP_MARK || TD_FE_RRIP_ON_MLC || TD_COMBINED_ON_MLC || TD_COMBINED_ON_L1 ||
-      MLP_LIN_INSTR_LAMBDA != 0.0 || MLP_LIN_DYN_LAMBDA) {
+      MLP_LIN_INSTR_LAMBDA != 0.0 || MLP_LIN_DYN_INSTR) {
     Flag backend_stall = (count_issued == 0 && idq_stage_get_stage_data()->op_count > 0);
     Flag fe_bound_cycle = !backend_stall && (count_available == 0);
     /* --mlp_lin_instr_no_commit: the STRICTER front-end-bound cycle, accumulated alongside the

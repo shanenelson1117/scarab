@@ -449,7 +449,7 @@ DEF_PARAM(mlp_lin_instr_include_offpath, MLP_LIN_INSTR_INCLUDE_OFFPATH, Flag, Fl
    req->type == MRT_IFETCH in their own fill paths and are untouched. */
 DEF_PARAM(mlp_lin_instr_include_pref_merge, MLP_LIN_INSTR_INCLUDE_PREF_MERGE, Flag, Flag, FALSE, )
 
-/* ======================= REPL_MLP ADAPTIVE LAMBDAS (--mlp_lin_dyn_lambda) =======================
+/* ============ REPL_MLP ADAPTIVE LAMBDAS (--mlp_lin_dyn_instr / --mlp_lin_dyn_data) ============
    A CLOSED LOOP on the two boundness lambdas. Every window of 2^N retired instructions, each
    lambda is nudged by one step according to whether its own signal got WORSE or BETTER than the
    window before:
@@ -498,19 +498,36 @@ DEF_PARAM(mlp_lin_instr_include_pref_merge, MLP_LIN_INSTR_INCLUDE_PREF_MERGE, Fl
    per-core, so two cores would fight over one pair of registers.
 
    WHERE IT STARTS: --mlp_lin_instr_lambda and --mlp_lin_data_lambda, the ordinary static
-   lambdas, which the arm takes as its OPENING VALUES and then moves. There is deliberately no
-   second pair of "start" knobs: a dynamic descriptor names its lambdas exactly as a static one
-   does, so an arm and its own static control differ by this one flag and nothing else. The pair
-   is seeded once, on first read, in cache_lib.
+   lambdas, which an enabled side takes as its OPENING VALUE and then moves. There is
+   deliberately no separate pair of "start" knobs: a dynamic descriptor names its lambdas exactly
+   as a static one does, so an arm and its own static control differ by one flag and nothing
+   else. The pair is seeded once, on first read, in cache_lib; a DISABLED side simply keeps
+   reading its static param and never consults the register.
 
    SELF-OPENING, and this one matters more than usual. Those same static lambdas are what open
    the MEASUREMENT -- the fill classification in membound_classify_fill, the FE-bound window in
-   topdown_idq_update, and its per-miss reset in icache_stage.c all test them for != 0 -- so
-   --mlp_lin_dyn_lambda is in all three gates as well. That matters even now that it starts from
-   them, because starting a side at 0 and letting it walk UP is a legitimate arm: without the
-   knob in those gates, such a run would classify nothing, mark nothing, and walk a lambda that
-   weighed an empty term, reading as "the policy does nothing" rather than as a missing input. */
-DEF_PARAM(mlp_lin_dyn_lambda, MLP_LIN_DYN_LAMBDA, Flag, Flag, FALSE, )
+   topdown_idq_update, and its per-miss reset in icache_stage.c all test them for != 0 -- so the
+   toggles are in those gates too, each where it belongs: the instruction-side gates take
+   --mlp_lin_dyn_instr, and the gates that serve either side take both. That matters even though
+   a side starts from its static lambda, because starting at 0 and letting it walk UP is a
+   legitimate arm: without the toggle in those gates, such a run would classify nothing, mark
+   nothing, and walk a lambda that weighed an empty term, reading as "the policy does nothing"
+   rather than as a missing input. */
+/* ONE TOGGLE PER SIDE, independent. Each says only "does THIS lambda move"; the side that is
+   off keeps its static --mlp_lin_*_lambda value for the whole run, exactly as if the arm did not
+   exist. The four combinations are the experiment:
+
+     0 0   the static policy -- the control for any of the others
+     1 0   instruction lambda tracks branch mispredictions, data lambda pinned
+     0 1   data lambda tracks the FU_WAIT share, instruction lambda pinned
+     1 1   both loops closed
+
+   Worth having as two knobs rather than one because the loops are not symmetric and do not have
+   to be judged together: the instruction side can only help where the front end is the limit,
+   while the data side is the one competing with it for the same ways. Running them one at a time
+   is what attributes a result to a loop; running both and comparing to a 0 0 control cannot. */
+DEF_PARAM(mlp_lin_dyn_instr, MLP_LIN_DYN_INSTR, Flag, Flag, FALSE, )
+DEF_PARAM(mlp_lin_dyn_data, MLP_LIN_DYN_DATA, Flag, Flag, FALSE, )
 
 /* Window size, as a LOG2 of retired instructions. 20 = 1,048,576. Range-checked at first use. */
 DEF_PARAM(mlp_lin_dyn_window_log2, MLP_LIN_DYN_WINDOW_LOG2, uns, uns, 20, )

@@ -158,9 +158,12 @@ void cache_set_next_fill_prefetch(Flag is_prefetch) {
 
    SEEDED FROM --mlp_lin_instr_lambda / --mlp_lin_data_lambda, the ordinary static lambdas. The
    arm therefore does not introduce a second way to say where the policy starts: a descriptor
-   names its lambdas exactly as a static run does, and --mlp_lin_dyn_lambda only decides whether
-   they then move. A static arm and the dynamic arm that begins at the same point are one edit
-   apart, which is what makes them comparable.
+   names its lambdas exactly as a static run does, and --mlp_lin_dyn_instr / --mlp_lin_dyn_data
+   only decide whether each then moves. A static arm and the dynamic arm that begins at the same
+   point are one edit apart, which is what makes them comparable.
+
+   BOTH are seeded even when only one side is enabled. Harmless -- the pinned side's reader never
+   consults its register -- and it keeps the seed a single unconditional expression.
 
    Lazy rather than an init hook so the opening pair is in force at the FIRST fill whatever order
    initialisation runs in -- no dependence on whether a cache access or the controller's first
@@ -395,19 +398,20 @@ static inline uns mlp_lin_costq(double cost_cycles) {
 static inline double lin_lam_mlp(const Cache* c) {
   return c->lin_lambda_override ? c->lin_lambda_mlp : (double)MLP_LIN_LAMBDA;
 }
-/* --mlp_lin_dyn_lambda REPLACES the static param rather than scaling it, so the two cannot be
- * set to different things and silently half-apply. SBAR's per-cache override still wins where it
- * is in force, but the two cannot meet: ps_enabled() requires REPL_MLP_PAPER, which has no
- * boundness term at all. */
+/* Each side independently: a dynamic side reads the live register (seeded from its own static
+ * param and moved by the controller), a static side reads the param and never looks at the
+ * register, so --mlp_lin_dyn_instr 1 --mlp_lin_dyn_data 0 really does pin the data lambda for
+ * the whole run. SBAR's per-cache override still wins where it is in force, but the two cannot
+ * meet: ps_enabled() requires REPL_MLP_PAPER, which has no boundness term at all. */
 static inline double lin_lam_data(const Cache* c) {
   if (c->lin_lambda_override)
     return c->lin_lambda_data;
-  return MLP_LIN_DYN_LAMBDA ? cache_mlp_dyn_data_lambda() : (double)MLP_LIN_DATA_LAMBDA;
+  return MLP_LIN_DYN_DATA ? cache_mlp_dyn_data_lambda() : (double)MLP_LIN_DATA_LAMBDA;
 }
 static inline double lin_lam_instr(const Cache* c) {
   if (c->lin_lambda_override)
     return c->lin_lambda_instr;
-  return MLP_LIN_DYN_LAMBDA ? cache_mlp_dyn_instr_lambda() : (double)MLP_LIN_INSTR_LAMBDA;
+  return MLP_LIN_DYN_INSTR ? cache_mlp_dyn_instr_lambda() : (double)MLP_LIN_INSTR_LAMBDA;
 }
 
 /* REPL_MLP_PAPER: the lambda in force. SBAR pins it per-cache via cache_set_lin_lambdas (the
@@ -463,11 +467,13 @@ static void load_prio_levels_init(Cache* cache) {
      now. The first fill after the first adjustment would compute a boost that is not in it and
      die in load_prio_level_of. Refuse the combination here, where the message can say why,
      instead of 2^20 instructions into the run with an assert about a float not being found. */
-  ASSERTM(0, !MLP_LIN_DYN_LAMBDA,
-          "--load_prio_stats cannot be combined with --mlp_lin_dyn_lambda: the priority level "
-          "table for cache '%s' is built once from the lambdas in force at init, and the "
-          "adaptive arm changes them every window. Run the dynamic arm without --load_prio_stats, "
-          "or pin the lambdas with --mlp_lin_dyn_lambda 0 to plot levels.\n",
+  ASSERTM(0, !MLP_LIN_DYN_INSTR && !MLP_LIN_DYN_DATA,
+          "--load_prio_stats cannot be combined with --mlp_lin_dyn_instr / --mlp_lin_dyn_data: "
+          "the priority level table for cache '%s' is built once from the lambdas in force at "
+          "init, and an adaptive side changes them every window. EITHER side breaks it -- the "
+          "table enumerates boosts over both lambdas, so one moving lambda is enough to produce "
+          "a boost that is not in it. Run the dynamic arm without --load_prio_stats, or set both "
+          "toggles to 0 to plot levels.\n",
           cache->name);
 
   /* The three bound-term values, in the order mlp_lin_bound_term can return them. A line is
