@@ -1234,6 +1234,13 @@ Flag icache_fill_line(Mem_Req* req)  // cmp FIXME maybe needed to be optimized
       // eviction victim, so FDIP's eviction tracking (repl_line_addr2) stays correct.
       if (TD_FE_RRIP_MARK)
         cache_set_marked_next_insert(td_fe_have_rrpv, td_fe_rrpv);
+      /* --fdip_delta_place: the same obligation for the placement class. The staged value is
+         consumed and cleared by the icache insert above, so without re-staging it here the
+         shadow would hold every line at DELTA_PRIO_NONE while the icache holds owned lines
+         boosted -- different victims, and FDIP would record an eviction for a line the icache
+         did not evict while the one it did evict went unrecorded. get_miss_reason then reaches
+         its fall-through and reports an MSHR hit for a line with no request in flight. */
+      cache_set_next_fill_delta_prio(instr_place_l1i_class(req));
       line_info = (Icache_Data*)cache_insert(&ic->icache_line_info, ic->proc_id, ic->fetch_addr, &dummy_addr2,
                                              &repl_line_addr2);
       if (line_info) {
@@ -1299,6 +1306,10 @@ Flag icache_fill_line(Mem_Req* req)  // cmp FIXME maybe needed to be optimized
     // prefetch fill: no FE-bound measurement -> both caches insert at basic, in lockstep.
     if (TD_FE_RRIP_MARK)
       cache_set_marked_next_insert(FALSE, 0);
+    /* --fdip_delta_place: a prefetch fill carries its placement class too -- an L1I-owned line
+       can arrive this way when the merging demand has already been served. Staged for each
+       insert separately because the first consumes it. */
+    cache_set_next_fill_delta_prio(instr_place_l1i_class(req));
     line = (Inst_Info**)cache_insert(&ic->icache, ic->proc_id, req->addr, &dummy_addr, &repl_line_addr);
     icache_record_evict();  // --early_evict_stats
     icache_footprint_record(dummy_addr);
@@ -1306,6 +1317,7 @@ Flag icache_fill_line(Mem_Req* req)  // cmp FIXME maybe needed to be optimized
     if (WP_COLLECT_STATS) {  // cmp IGNORE
       if (TD_FE_RRIP_MARK)
         cache_set_marked_next_insert(FALSE, 0);
+      cache_set_next_fill_delta_prio(instr_place_l1i_class(req));  /* lockstep, as above */
       line_info =
           (Icache_Data*)cache_insert(&ic->icache_line_info, ic->proc_id, req->addr, &dummy_addr2, &repl_line_addr2);
       if (line_info) {
