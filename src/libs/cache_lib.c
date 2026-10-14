@@ -105,6 +105,8 @@ static Flag   g_next_fill_fe_bound = FALSE;
 static double g_next_fill_bound_frac = 0.0;
 static double g_next_fill_mlp_cost = 0.0;
 static Flag   g_next_fill_prefetch = FALSE;
+  g_next_fill_delta_prio = DELTA_PRIO_NONE;
+static uns8   g_next_fill_delta_prio = DELTA_PRIO_NONE;
 static Flag   g_next_fill_store = FALSE;
 static Flag   g_next_fill_offpath = FALSE;
 /* --load_prio_stats: the traffic class of the next fill. Defaults to LOAD_PRIO_TC_OTHER rather
@@ -149,6 +151,11 @@ void cache_set_next_fill_cost(double bound_frac, double mlp_cost) {
 
 void cache_set_next_fill_prefetch(Flag is_prefetch) {
   g_next_fill_prefetch = is_prefetch;
+}
+
+/* --fdip_delta_place: the placement class the next fill carries in this cache. */
+void cache_set_next_fill_delta_prio(uns8 delta_prio) {
+  g_next_fill_delta_prio = delta_prio;
 }
 
 /* --mlp_lin_dyn_lambda: the live lambdas of the adaptive arm. ONE pair for the whole policy,
@@ -289,6 +296,7 @@ static inline void consume_fill_bound(Cache_Entry* line) {
   line->bound_frac = g_next_fill_bound_frac;
   line->mlp_cost = g_next_fill_mlp_cost;
   line->fill_was_prefetch = g_next_fill_prefetch;
+  line->delta_prio = g_next_fill_delta_prio;
   line->was_written = g_next_fill_store;
   line->offpath_unproven = g_next_fill_offpath;
   line->fill_traffic = g_next_fill_traffic;  // --load_prio_stats
@@ -436,8 +444,24 @@ static inline double mlp_lin_bound_term(const Cache* cache, const Cache_Entry* e
  * Both terms are already weighted, so the result is in LRU STACK POSITIONS and is directly
  * comparable against associativity: a boost of 4 means this line sits four positions further from
  * eviction than its recency alone would put it. */
+/* --fdip_delta_place: flat bonus for a line this cache OWNS under lead-time placement. One
+ * lambda shared by all three levels, so the owner of a line is protected by the same amount
+ * wherever it landed -- the placement decision is which level, not how much. Added to the
+ * sticky part because ownership is fill history and is never rewritten. */
+static inline double mlp_lin_delta_term(const Cache_Entry* entry) {
+  switch (entry->delta_prio) {
+    case DELTA_PRIO_OWNER:
+      return (double)FDIP_DELTA_LAMBDA;
+    case DELTA_PRIO_BACKUP:
+      return (double)FDIP_DELTA_L1I_BACKUP_LAMBDA;
+    default:
+      return 0.0;
+  }
+}
+
 static inline double mlp_lin_prio_boost(const Cache* cache, const Cache_Entry* entry) {
-  return lin_lam_mlp(cache) * (double)mlp_lin_costq(entry->mlp_cost) + mlp_lin_bound_term(cache, entry);
+  return lin_lam_mlp(cache) * (double)mlp_lin_costq(entry->mlp_cost) + mlp_lin_bound_term(cache, entry) +
+         mlp_lin_delta_term(entry);
 }
 
 /**************************************************************************************/
@@ -467,6 +491,14 @@ static void load_prio_levels_init(Cache* cache) {
      now. The first fill after the first adjustment would compute a boost that is not in it and
      die in load_prio_level_of. Refuse the combination here, where the message can say why,
      instead of 2^20 instructions into the run with an assert about a float not being found. */
+  /* --fdip_delta_place adds a third sticky term to the boost, which multiplies the reachable
+     combinations past what prio_boost[] enumerates. Same failure as a moving lambda, same
+     refusal. */
+  ASSERTM(0, !FDIP_DELTA_PLACE,
+          "--load_prio_stats cannot be combined with --fdip_delta_place: the priority level table "
+          "for cache '%s' enumerates boosts over the cost and boundness terms only, and the "
+          "placement bonus produces boosts that are not in it.\n",
+          cache->name);
   ASSERTM(0, !MLP_LIN_DYN_INSTR && !MLP_LIN_DYN_DATA,
           "--load_prio_stats cannot be combined with --mlp_lin_dyn_instr / --mlp_lin_dyn_data: "
           "the priority level table for cache '%s' is built once from the lambdas in force at "
@@ -1116,6 +1148,7 @@ void init_cache(Cache* cache, const char* name, uns cache_size, uns assoc, uns l
       cache->entries[ii][jj].bound_frac = 0.0;
       cache->entries[ii][jj].mlp_cost = 0.0;
       cache->entries[ii][jj].fill_was_prefetch = FALSE;
+      cache->entries[ii][jj].delta_prio = DELTA_PRIO_NONE;
       cache->entries[ii][jj].was_written = FALSE;
       cache->entries[ii][jj].offpath_unproven = FALSE;
       cache->entries[ii][jj].fe_bound_fill = FALSE;
@@ -1495,6 +1528,7 @@ void cache_invalidate(Cache* cache, Addr addr, Addr* line_addr) {
       line->bound_frac = 0.0;
       line->mlp_cost = 0.0;
       line->fill_was_prefetch = FALSE;
+      line->delta_prio = DELTA_PRIO_NONE;
       line->was_written = FALSE;
       line->offpath_unproven = FALSE;
       line->fe_bound_fill = FALSE;
@@ -2562,6 +2596,7 @@ void general_action_init(Cache* cache, const char* name, uns cache_size, uns ass
       cache->entries[ii][jj].bound_frac = 0.0;
       cache->entries[ii][jj].mlp_cost = 0.0;
       cache->entries[ii][jj].fill_was_prefetch = FALSE;
+      cache->entries[ii][jj].delta_prio = DELTA_PRIO_NONE;
       cache->entries[ii][jj].was_written = FALSE;
       cache->entries[ii][jj].offpath_unproven = FALSE;
       cache->entries[ii][jj].fe_bound_fill = FALSE;

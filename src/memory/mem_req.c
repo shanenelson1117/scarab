@@ -67,6 +67,13 @@ Flag mem_req_type_is_prefetch(Mem_Req_Type type) {
 /**************************************************************************************/
 /* mem_req_type_is_stalling */
 
+/* The INSTRUCTION prefetch types, i.e. the ones mem_search_queue lets a demand MRT_IFETCH merge
+   into. MRT_DPRF is deliberately absent: the match table gives it no MRT_IFETCH arm, so a data
+   prefetch can never carry an instruction demand. */
+Flag mem_req_type_is_instr_prefetch(Mem_Req_Type type) {
+  return type == MRT_IPRF || type == MRT_UOCPRF || type == MRT_FDIPPRFON || type == MRT_FDIPPRFOFF;
+}
+
 Flag mem_req_type_is_stalling(Mem_Req_Type type) {
   return type == MRT_IFETCH || type == MRT_DFETCH || (!STORES_DO_NOT_BLOCK_WINDOW && type == MRT_DSTORE);
 }

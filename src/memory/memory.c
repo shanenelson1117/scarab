@@ -831,6 +831,136 @@ static inline Flag marked_bypass_fill(Cache* cache, Mem_Req* req, int instr_dept
   return cache_marked_should_bypass(cache, req->addr, basic_rrpv);
 }
 
+/* ================= --fdip_delta_place: lead-time-directed instruction placement =================
+ *
+ * ONE LEVEL OWNS EACH INSTRUCTION LINE, chosen by how much latency the prefetch that fetched it
+ * actually managed to hide. The lead time of a prefetch is a direct measurement of how much
+ * latency that line's next access can tolerate, so it names the furthest-out level that could
+ * still have delivered in time:
+ *
+ *   lead >= --fdip_delta_llc_thresh   the LLC was fast enough          -> LLC owns it
+ *   lead >= --fdip_delta_mlc_thresh   only the MLC was fast enough     -> MLC owns it
+ *   lead <  that, or a demand that    nothing but the L1I was in time  -> L1I owns it
+ *     merged nothing at all
+ *   no demand merged (timely/unused)  nobody was waiting               -> LLC owns it, or
+ *                                                                          nothing does under
+ *                                                       --fdip_delta_unmerged_pref_bypass_llc
+ *
+ * THE OWNER ALLOCATES AND PRIORITISES; THE OTHER LEVELS DO NOT ALLOCATE AT ALL. The L1I always
+ * receives the line because the fetch needs it there to make progress, but it is prioritised
+ * only when the L1I is the owner. Within a priority class ordinary recency decides, which falls
+ * out of REPL_MLP for free: the boost is added to the LRU stack position, so equal-boost lines
+ * stay in LRU order.
+ *
+ * CONSEQUENCE WORTH STATING PLAINLY: an L1I-owned line exists nowhere else on chip, so when the
+ * L1I evicts it the next fetch goes to memory. That is the intended reading of "the lead time
+ * was too short for even the MLC to help", but it converts L1I capacity misses into memory
+ * trips, and on these traces instruction lines are most of the MLC. Expect that to show up as
+ * memory traffic before it shows up as IPC.
+ *
+ * INSTRUCTION TRAFFIC ONLY. Data fills return INSTR_PLACE_NONE and keep today's behaviour
+ * exactly -- every level allocates, and placement makes no decision for them. */
+typedef enum Instr_Place_enum {
+  INSTR_PLACE_NONE = 0, /* not instruction traffic, or the arm is off: no placement decision */
+  INSTR_PLACE_L1I,
+  INSTR_PLACE_MLC,
+  INSTR_PLACE_LLC,
+  /* --fdip_delta_unmerged_pref_bypass_llc: NO level owns it. The L1I still receives it, because
+     that is where a prefetch is for, but it is unprioritised there and declined everywhere else.
+     Distinct from INSTR_PLACE_NONE, which means placement is not steering this fill at all and
+     every level allocates normally -- here every other level is actively declining. */
+  INSTR_PLACE_L1I_UNPRIO,
+} Instr_Place;
+
+/* The bucket edges ARE the modelled access latencies, read from the latency params themselves so
+   there is no second place to keep in sync: re-time the MLC with --mlc_cycles and the placement
+   rule re-times with it. Nothing here is a literal. */
+static inline Counter instr_place_mlc_thresh(void) {
+  return (Counter)MLC_CYCLES;
+}
+static inline Counter instr_place_llc_thresh(void) {
+  return (Counter)L1_CYCLES;
+}
+
+/* --fdip_delta_l1i_backup_level: the level that ALSO keeps an L1I-owned line, so it is not the
+   only copy on chip. INSTR_PLACE_NONE means no backup, which is the default and reproduces the
+   strict one-level rule. The MLC answer is conditional on the MLC actually being configured --
+   "if it is present" -- since --mlc_present 0 is a legal machine and naming an absent level as
+   the backup would otherwise silently mean no backup at all. */
+static inline Instr_Place instr_place_backup_level(void) {
+  switch (FDIP_DELTA_L1I_BACKUP_LEVEL) {
+    case 1:
+      return MLC_PRESENT ? INSTR_PLACE_MLC : INSTR_PLACE_NONE;
+    case 2:
+      return INSTR_PLACE_LLC;
+    default:
+      return INSTR_PLACE_NONE;
+  }
+}
+
+static inline Instr_Place instr_place_of(Mem_Req* req) {
+  if (!FDIP_DELTA_PLACE)
+    return INSTR_PLACE_NONE;
+
+  /* A demand-CREATED request: no prefetch ever ran ahead of this line, so there is no lead time
+     to spend. Note this stays the L1I bucket even if a prefetch later merged INTO it -- such a
+     prefetch arrived after the demand and hid nothing. */
+  if (req->type == MRT_IFETCH)
+    return INSTR_PLACE_L1I;
+
+  if (!mem_req_type_is_instr_prefetch(req->type))
+    return INSTR_PLACE_NONE; /* data traffic, or a writeback: untouched */
+
+  /* A prefetch-created request. The MRT_IFETCH bit is what says a demand caught it in flight;
+     instr_merge_delta is only meaningful once it is set, since a zero lead time is a real
+     measurement (demand in the same cycle) and not a sentinel. */
+  if (!mem_req_is_type(req, MRT_IFETCH)) {
+    /* Nobody waited on it: timely, or never used at all. By default the LLC keeps it as the
+       backstop for prefetches no demand has needed YET; --fdip_delta_unmerged_pref_bypass_llc
+       instead drops it from the shared hierarchy entirely, so a prefetch earns LLC capacity only
+       by having actually been caught in flight by a demand. */
+    return FDIP_DELTA_UNMERGED_PREF_BYPASS_LLC ? INSTR_PLACE_L1I_UNPRIO : INSTR_PLACE_LLC;
+  }
+
+  if (req->instr_merge_delta >= instr_place_llc_thresh())
+    return INSTR_PLACE_LLC;
+  if (req->instr_merge_delta >= instr_place_mlc_thresh())
+    /* An absent MLC cannot own anything, and mlc_fill_line never runs to allocate it -- so
+       without this the MLC bucket would mean NOWHERE, silently: the LLC would decline a line
+       whose owner does not exist and it would survive only in the L1I. Fold the bucket outward
+       to the next level that does exist, which is also the conservative direction (more
+       retention, not less). */
+    return MLC_PRESENT ? INSTR_PLACE_MLC : INSTR_PLACE_LLC;
+  return INSTR_PLACE_L1I;
+}
+
+/* What `level` holds this line as: owner, backup copy, or nothing (in which case it declines).
+   One function so the allocate decision and the priority staged on the allocated line cannot
+   disagree -- they are the same answer read twice. */
+static inline Delta_Prio instr_place_class(Mem_Req* req, Instr_Place level) {
+  const Instr_Place owner = instr_place_of(req);
+  if (owner == INSTR_PLACE_NONE)
+    return DELTA_PRIO_NONE; /* not steering this fill at all; the level allocates as usual */
+  if (owner == level)
+    return DELTA_PRIO_OWNER;
+  if (owner == INSTR_PLACE_L1I && level == instr_place_backup_level())
+    return DELTA_PRIO_BACKUP;
+  return DELTA_PRIO_NONE;
+}
+
+/* --fdip_delta_place: the class the L1I holds this line as. Exported because the icache fill
+   lives in icache_stage.c, which cannot see the classifier above. The L1I is never a backup --
+   backups exist to keep an L1I-owned line somewhere further out -- so this is OWNER or NONE. */
+uns8 instr_place_l1i_class(Mem_Req* req) {
+  return (uns8)instr_place_class(req, INSTR_PLACE_L1I);
+}
+
+/* Does `level` have to decline this fill? Only when placement is steering the line and this
+   level is neither its owner nor its backup. */
+static inline Flag instr_place_declines(Mem_Req* req, Instr_Place level) {
+  return instr_place_of(req) != INSTR_PLACE_NONE && instr_place_class(req, level) == DELTA_PRIO_NONE;
+}
+
 /**************************************************************************************/
 /* Macros */
 
@@ -4480,6 +4610,17 @@ Flag mem_adjust_matching_request(Mem_Req* req, Mem_Req_Type type, Addr addr, uns
 
   higher_priority = current_priority < old_priority;
 
+  /* --fdip_delta_place: the prefetch's LEAD TIME, captured at the first demand ifetch to merge
+     into it. Read against req->types BEFORE mem_req_set_types runs below, so "no MRT_IFETCH bit
+     yet" means this is the first such merge and a later one cannot overwrite it.
+
+     emitted_cycle rather than fdip_emitted_cycle because the latter is set only for the two FDIP
+     types, while MRT_IPRF and MRT_UOCPRF are instruction prefetches that a demand can merge into
+     just the same. Both timestamps are core-domain: an FDIP prefetch is emitted from the core
+     loop and so is the icache's demand fetch, so the subtraction is apples to apples. */
+  if (type == MRT_IFETCH && mem_req_type_is_instr_prefetch(req->type) && !mem_req_is_type(req, MRT_IFETCH))
+    req->instr_merge_delta = cycle_count >= req->emitted_cycle ? cycle_count - req->emitted_cycle : 0;
+
   STAT_EVENT(req->proc_id, MEM_REQ_BUFFER_HIT);
   if (req->fdip_emitted_cycle) {
     STAT_EVENT(req->proc_id, MEM_REQ_FDIP_BUFFER_HIT);
@@ -4979,6 +5120,7 @@ static void mem_init_new_req(Mem_Req* new_req, Mem_Req_Type type, Mem_Queue_Type
   new_req->type = type;
   new_req->types = 0;
   new_req->emitted_cycle = cycle_count;
+  new_req->instr_merge_delta = 0;
   if (type == MRT_IFETCH) {
     new_req->demand_icache_emitted_cycle = cycle_count;
     new_req->fdip_emitted_cycle = 0;
@@ -5810,6 +5952,17 @@ Flag l1_fill_line(Mem_Req* req) {
     return SUCCESS;
   }
 
+  /* --fdip_delta_place: owned by another level, so the LLC does not allocate it. Same shape and
+     the same obligations as the Mockingjay bypass immediately above. */
+  if (instr_place_declines(req, INSTR_PLACE_LLC)) {
+    STAT_EVENT(req->proc_id, L1_INSTR_PLACE_DECLINE);
+    req->l1_miss_satisfied = TRUE;
+    req->l1_miss_cycle = MAX_CTR;
+    if (TRACK_L1_MISS_DEPS || MARK_L1_MISSES)
+      mark_ops_as_l1_miss_satisfied(req);
+    return SUCCESS;
+  }
+
   /* REPL_MARKED_RRIP bypass (--marked_rrip_bypass): an unprotected fill whose RRPV would be
      strictly more distant than every resident line in its set is not allocated at all -- it
      would be the immediate next victim, so caching it can only evict something more useful.
@@ -6067,6 +6220,11 @@ Flag l1_fill_line(Mem_Req* req) {
     /* --mlp_lin_pref_lambda: on PARAMS.google this is always an FDIP instruction prefetch, the
        data prefetchers being off. Staged for every fill so the flag is never stale. */
     cache_set_next_fill_prefetch(mem_req_type_is_prefetch(req->type));
+    /* --fdip_delta_place: this level reached the insert, so it is either the line's owner or
+       its backup -- anything else returned above. Staged unconditionally so the class never
+       goes stale on a fill placement is not steering (arm off, or data traffic), where it is
+       DELTA_PRIO_NONE. */
+    cache_set_next_fill_delta_prio(instr_place_class(req, INSTR_PLACE_LLC));
     /* --mlp_lin_store_lambda: write traffic. A store miss, or a writeback which by definition
        carries modified data. A writeback that HITS an already-resident line is handled
        separately by cache_mark_written, since that happens long after the fill. */
@@ -6312,6 +6470,22 @@ Flag mlc_fill_line(Mem_Req* req) {
     ASSERT(req->proc_id, req->mlc_miss_cycle != MAX_CTR);
     ASSERT(req->proc_id, req->mlc_miss);
     mlp_cost_finalize(req); /* bypassed, but the miss was still paid for */
+    req->mlc_miss_satisfied = TRUE;
+    req->mlc_miss_cycle = MAX_CTR;
+    return SUCCESS;
+  }
+
+  /* --fdip_delta_place: this instruction line is owned by another level, so the MLC does not
+     allocate it. Modelled on the Mockingjay bypass directly above -- same early return, same
+     obligations (retire the miss, mark it satisfied), and for the same reason it is placed
+     before get_next_repl_line: no victim may be chosen and no writeback scheduled for a fill
+     that is not going to happen. The request still completes and still fills the core-side
+     caches, so the only effect is that a later access to this line misses in the MLC. */
+  if (instr_place_declines(req, INSTR_PLACE_MLC)) {
+    STAT_EVENT(req->proc_id, MLC_INSTR_PLACE_DECLINE);
+    ASSERT(req->proc_id, req->mlc_miss_cycle != MAX_CTR);
+    ASSERT(req->proc_id, req->mlc_miss);
+    mlp_cost_finalize(req); /* declined, but the miss was still paid for */
     req->mlc_miss_satisfied = TRUE;
     req->mlc_miss_cycle = MAX_CTR;
     return SUCCESS;
@@ -6574,6 +6748,11 @@ Flag mlc_fill_line(Mem_Req* req) {
     /* --mlp_lin_pref_lambda: on PARAMS.google this is always an FDIP instruction prefetch, the
        data prefetchers being off. Staged for every fill so the flag is never stale. */
     cache_set_next_fill_prefetch(mem_req_type_is_prefetch(req->type));
+    /* --fdip_delta_place: this level reached the insert, so it is either the line's owner or
+       its backup -- anything else returned above. Staged unconditionally so the class never
+       goes stale on a fill placement is not steering (arm off, or data traffic), where it is
+       DELTA_PRIO_NONE. */
+    cache_set_next_fill_delta_prio(instr_place_class(req, INSTR_PLACE_MLC));
     /* --mlp_lin_store_lambda: write traffic. A store miss, or a writeback which by definition
        carries modified data. A writeback that HITS an already-resident line is handled
        separately by cache_mark_written, since that happens long after the fill. */

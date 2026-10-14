@@ -179,7 +179,15 @@ void init_icache_stage(uns8 proc_id, const char* name) {
 
   /* initialize the cache structure (td_fe_rrip_mark swaps in the marked-line SRRIP variant
      that protects icache lines whose fetch miss stalled the front end) */
-  Repl_Policy icache_repl = TD_FE_RRIP_MARK ? REPL_MARKED_RRIP : REPL_TRUE_LRU;
+  /* --fdip_delta_place prioritises L1I-owned lines with REPL_MLP's boost, so the icache has to
+     run that policy to honour it. Its other terms are inert here: nothing stages a cost or a
+     boundness mark at an icache fill, so costq is 0 and the bound term is 0, leaving
+     "LRU, plus a flat bonus for owned lines" -- which is exactly the intended ordering, LRU
+     within each priority class. Takes precedence over td_fe_rrip_mark's marked-RRIP, which
+     cannot express the boost; setting both is a configuration error rather than a blend. */
+  Repl_Policy icache_repl = FDIP_DELTA_PLACE ? REPL_MLP : (TD_FE_RRIP_MARK ? REPL_MARKED_RRIP : REPL_TRUE_LRU);
+  ASSERTM(proc_id, !(FDIP_DELTA_PLACE && TD_FE_RRIP_MARK),
+          "--fdip_delta_place and --td_fe_rrip_mark both claim the L1I replacement policy\n");
   init_cache(&ic->icache, "ICACHE", ICACHE_SIZE, ICACHE_ASSOC, ICACHE_LINE_SIZE, 0, icache_repl);
 
   /* init icache_line_info struct - this struct keeps data about corresponding
@@ -1193,6 +1201,11 @@ Flag icache_fill_line(Mem_Req* req)  // cmp FIXME maybe needed to be optimized
       ic->icache_miss_fulfilled = TRUE;
       return TRUE;
     }
+
+    /* --fdip_delta_place: the L1I always receives the line, but prioritises it only when the
+       L1I is its owner -- i.e. the lead time was too short for even the MLC to have helped, or
+       no prefetch ran ahead of it at all. Staged unconditionally so the bit is never stale. */
+    cache_set_next_fill_delta_prio(instr_place_l1i_class(req));
 
     // td_fe_rrip_mark: this fill satisfies the demand miss the front end was blocked on.
     // Derive its L1I insert RRPV from the FE-bound fraction of the miss's outstanding window

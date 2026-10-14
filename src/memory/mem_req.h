@@ -113,6 +113,13 @@ struct Mem_Req_struct {
   uns64 ghist;
   Counter demand_icache_emitted_cycle; /* cycle when the request is emitted. */
   Counter emitted_cycle;               /* cycle when request of any type was first initialized */
+  /* --fdip_delta_place: LEAD TIME of this instruction prefetch, in core cycles -- the gap
+     between emitted_cycle and the moment the FIRST demand instruction fetch merged into it.
+     0 means no demand has merged (a timely or unused prefetch), which the placement classifier
+     distinguishes from a merge by the MRT_IFETCH bit in `types`, never by this being 0: a demand
+     arriving in the same cycle the prefetch was sent is a legitimate zero-lead merge. Written
+     once, at the first merge, in mem_adjust_matching_request. */
+  Counter instr_merge_delta;
   struct Mem_Queue_struct* queue;      /* Pointer to the queue this entry is in */
   Counter priority;                    /* priority of the miss */
   Addr addr;                           /* address to fetch */
@@ -215,6 +222,7 @@ struct Mem_Req_struct {
 
 Flag mem_req_type_is_demand(Mem_Req_Type type);
 Flag mem_req_type_is_prefetch(Mem_Req_Type type);
+Flag mem_req_type_is_instr_prefetch(Mem_Req_Type type);
 Flag mem_req_type_is_stalling(Mem_Req_Type type);
 
 /* Returns whether this type either started or was ever coalesced into this mem_req. */

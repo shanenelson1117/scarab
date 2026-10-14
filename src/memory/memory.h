@@ -315,6 +315,11 @@ void wp_process_reqbuf_match(Mem_Req* req, Op* op);
 uns num_chip_demands(void);
 uns num_offchip_stall_reqs(uns proc_id);
 
+/* --fdip_delta_place: the Delta_Prio the L1I holds this fill as -- DELTA_PRIO_OWNER when the
+   icache should prioritise the line as well as hold it, DELTA_PRIO_NONE otherwise (including on
+   every run with the arm off). See the classifier in memory.c. */
+uns8 instr_place_l1i_class(Mem_Req* req);
+
 Mem_Req* mem_search_reqbuf_wrapper(uns8 proc_id, Addr addr, Mem_Req_Type type, uns size, Flag* demand_hit_prefetch,
                                    Flag* demand_hit_writeback, uns queues_to_search, Mem_Queue_Entry** queue_entry,
                                    Flag* ramulator_match);

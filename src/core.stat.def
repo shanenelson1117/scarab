@@ -760,8 +760,13 @@ DEF_STAT(  MEMPROXY_AGREE                   , COUNT, NO_RATIO  )
    window = 2^N retired instructions (--mlp_lin_dyn_window_log2).
 
    MLP_DYN_WINDOWS counts every window that closed, INCLUDING the first, which by definition
-   cannot adjust anything -- so for an ENABLED side, UP + DOWN + HOLD = MLP_DYN_WINDOWS - 1, and
-   the missing one is not a lost event. HOLD covers both "inside the +/-thresh dead band" and
+   cannot adjust anything. So for an ENABLED side the identity depends on which column you read:
+   UP + DOWN + HOLD = MLP_DYN_WINDOWS - 1 in the CUMULATIVE column, but = MLP_DYN_WINDOWS in the
+   target-only one, because under --full_warmup that unadjusted first window closes during warmup
+   and is outside the ROI entirely. USE THE IDENTITY THAT MATCHES THE COLUMN as the denominator
+   for the means below: dividing target-only sums by WINDOWS - 1 overstates a mean lambda by one
+   window's worth, which is 2% at 48 windows and 4% at 24 -- enough to invent a drift away from
+   the starting lambda that is not there. HOLD covers both "inside the +/-thresh dead band" and
    "the previous window measured zero", which are different reasons to do nothing and are
    deliberately not separated: either way the lambda did not move.
 
@@ -771,8 +776,9 @@ DEF_STAT(  MEMPROXY_AGREE                   , COUNT, NO_RATIO  )
    side's toggle was off, not that the signal was flat.
 
    The two *_LAMBDA_X1000_SUM chains are the walk itself, one sample per window ADJUSTED on that
-   side, as the lambda times 1000 (so 34000 is a lambda of 34). Divide by (MLP_DYN_WINDOWS - 1)
-   for the mean lambda that side actually ran at -- the number to quote when reporting what the
+   side, as the lambda times 1000 (so 34000 is a lambda of 34). Divide by that side's own
+   UP + DOWN + HOLD -- the count of windows it actually sampled, and the one denominator that is
+   right in either column -- for the mean lambda that side ran at -- the number to quote when reporting what the
    arm did, since --mlp_lin_*_lambda only says where it began. There is no max/min chain: a walk
    that spent one window at the ceiling and the rest at the floor has the same sum as a steady
    middle, so read these together with UP/DOWN, which say how much movement produced that

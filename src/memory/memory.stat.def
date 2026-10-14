@@ -866,6 +866,13 @@ DEF_STAT(  MLC_DEMAND_FILL,  DIST,  NO_RATIO  )
 DEF_STAT(  MLC_PREF_FILL,    DIST,  NO_RATIO  ) 
 
 /* REPL_MOCKINGJAY: fills the policy declined to allocate (the line was not inserted). */
+/* --fdip_delta_place: fills a level declined because another level owns the line. The line
+   still reaches the core-side caches, so these are capacity NOT spent, not lost fills. Read
+   against that level's total fills to see how much of the instruction stream placement moved
+   elsewhere. */
+DEF_STAT(  MLC_INSTR_PLACE_DECLINE               , COUNT , NO_RATIO  )
+DEF_STAT(  L1_INSTR_PLACE_DECLINE                , COUNT , NO_RATIO  )
+
 DEF_STAT(  MLC_MOCKINGJAY_BYPASS         ,  COUNT,  NO_RATIO  )
 DEF_STAT(  L1_MOCKINGJAY_BYPASS          ,  COUNT,  NO_RATIO  )
 

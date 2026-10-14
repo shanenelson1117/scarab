@@ -44,6 +44,15 @@ extern "C" {
 
 /**************************************************************************************/
 
+/* --fdip_delta_place: what a line is to the cache holding it. Two classes rather than a flag
+   because an L1I-owned line may ALSO be kept at a backup level (--fdip_delta_l1i_backup_level),
+   and the backup protects it by a different amount -- it is a second copy, not a second owner. */
+typedef enum Delta_Prio_enum {
+  DELTA_PRIO_NONE = 0, /* placement is not steering this line in this cache */
+  DELTA_PRIO_OWNER,    /* this cache owns it: --fdip_delta_lambda */
+  DELTA_PRIO_BACKUP,   /* L1I owns it, this cache keeps a copy: --fdip_delta_l1i_backup_lambda */
+} Delta_Prio;
+
 typedef enum Repl_Policy_enum {
   REPL_TRUE_LRU,              /* actual least-recently-used replacement */
   REPL_RANDOM,                /* random replacement */
@@ -151,6 +160,12 @@ typedef struct Cache_Entry_struct {
      off (--pref_framework_on 0, --pref_stream_on 0) -- so on those traces this flag means
      "FDIP instruction line". */
   Flag fill_was_prefetch;
+
+  /* --fdip_delta_place: which placement class this line holds IN THIS CACHE -- a Delta_Prio.
+     Sticky fill history like the flags above: the lead time that chose the owner was a property
+     of the fill, so an owner never stops being one. DELTA_PRIO_NONE on all data traffic and on
+     every line of a cache that neither owns nor backs up the line. */
+  uns8 delta_prio;
 
   /* --mlp_lin_store_lambda: does this line carry WRITE traffic? Set when the fill was caused by
      a store (MRT_DSTORE) or was itself a writeback (MRT_WB), and set later by
@@ -610,6 +625,7 @@ void cache_get_fill_stage(Flag* membound, Flag* fe_bound, double* bound_frac, do
 void cache_put_fill_stage(Flag membound, Flag fe_bound, double bound_frac, double mlp_cost);
 /* --mlp_lin_pref_lambda: stage / read the prefetch flag for the next fill. */
 void cache_set_next_fill_prefetch(Flag is_prefetch);
+void cache_set_next_fill_delta_prio(uns8 delta_prio);
 
 /* --mlp_lin_dyn_lambda: the live boundness lambdas of REPL_MLP's adaptive arm. The controller
    (topdown.c, once per 2^N retired instructions) writes them; lin_lam_instr / lin_lam_data read

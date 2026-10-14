@@ -545,6 +545,101 @@ DEF_PARAM(mlp_lin_dyn_step, MLP_LIN_DYN_STEP, float, float, 1.0, )
    policy -- a "boost" that evicts the lines it is supposed to protect -- which cache_lib refuses
    for the static params too. The ceiling stops an unbounded drift over a long run; at assoc 16
    anything past ~16 already outranks recency entirely, so 64 is slack, not a target. */
+/* ============ LEAD-TIME DIRECTED INSTRUCTION PLACEMENT (--fdip_delta_place) ============
+   ONE LEVEL OWNS EACH INSTRUCTION LINE. When a demand instruction fetch merges into an
+   in-flight instruction prefetch, the gap between the prefetch being sent and the demand
+   arriving -- the prefetch's LEAD TIME -- measures how much latency that line's access can
+   tolerate. The owner is the furthest-out level that could still have delivered inside it:
+
+     lead >= --l1_cycles    (the LLC access latency)   LLC owns it
+     lead >= --mlc_cycles   (the MLC access latency)   MLC owns it
+     lead <  --mlc_cycles                              L1I owns it
+     demand that merged no prefetch at all             L1I owns it  (there was no lead time)
+     prefetch no demand ever merged                    LLC owns it  (nobody was waiting), or
+                                                       no level does, under
+                                                       --fdip_delta_unmerged_pref_bypass_llc
+
+   THE EDGES ARE THE LATENCY PARAMS THEMSELVES, not copies of their values: re-time a cache and
+   the rule re-times with it, because "could this level have delivered inside the lead time" is
+   a question about the modelled latency and nothing else. There is deliberately no separate
+   pair of threshold knobs to drift out of sync with the machine being modelled.
+
+   AN L1I-OWNED LINE MAY ALSO BE KEPT further out, at its own lambda -- see
+   --fdip_delta_l1i_backup_level below. Off by default.
+
+   THE OWNER ALLOCATES AND TAKES --fdip_delta_lambda; THE OTHER LEVELS DO NOT ALLOCATE AT ALL.
+   The L1I always receives the line because fetch cannot proceed otherwise, but prioritises it
+   only when it owns it. Ordering inside a priority class is plain recency, which REPL_MLP gives
+   for free: the bonus is added to the LRU stack position, so equal-boost lines stay in LRU
+   order.
+
+   WHY LEAD TIME IS THE RIGHT SIGNAL. It is the only direct measurement the machine has of how
+   early this line was needed relative to when it was asked for. A line whose prefetch had 30
+   cycles of head start can be refetched from the LLC next time without the front end noticing;
+   one whose prefetch was caught after 3 cycles cannot survive anything but an L1I hit. Cost and
+   boundness say how much a miss HURT; this says how far away the line can afford to live.
+
+   WHAT IT COSTS, STATED UP FRONT: with no backup level configured, an L1I-owned line exists
+   nowhere else on chip, so an L1I eviction sends the next fetch to memory. Instruction lines are
+   most of the MLC on these traces, so expect memory traffic to move before IPC does, and measure
+   that first. --fdip_delta_l1i_backup_level is the knob that buys that back.
+
+   REQUIRES REPL_MLP (policy 9) on whichever of the MLC and LLC you want to honour the bonus;
+   the L1I is switched to REPL_MLP automatically, which is why this conflicts with
+   --td_fe_rrip_mark (both claim the L1I policy) and with --load_prio_stats (the level table
+   cannot enumerate a third sticky term). Instruction traffic only: data fills are untouched.
+
+   MEASURE BEFORE YOU BELIEVE THE BUCKETS. MEM_REQ_FDIP_CYCLE_DELTA / MEM_REQ_FDIP_BUFFER_HIT
+   already give the mean lead time of merged FDIP prefetches on any existing run. If almost every
+   merge lands in one bucket the policy degenerates to a single level -- and since the edges are
+   the latencies, the fix is then a different RULE, not a re-cut threshold. */
+DEF_PARAM(fdip_delta_place, FDIP_DELTA_PLACE, Flag, Flag, FALSE, )
+
+/* Boost for a line at its OWNING level, in LRU stack positions. Shared by all three levels: the
+   placement decision is WHICH level protects the line, not how much. 0 (the default) leaves the
+   allocation behaviour in place with no protection, which is the control arm for the lambda. */
+DEF_PARAM(fdip_delta_lambda, FDIP_DELTA_LAMBDA, float, float, 0.0, )
+
+/* --fdip_delta_unmerged_pref_bypass_llc: a prefetch no demand ever merged into fills the L1I
+   and NOTHING ELSE -- declined by both the MLC and the LLC, and unprioritised in the L1I.
+
+   The default instead lets such a prefetch own an LLC way, on the theory that a timely prefetch
+   is one whose demand simply has not arrived yet. This knob takes the opposite position: a
+   prefetch earns shared capacity only by having been CAUGHT IN FLIGHT by a demand, which is the
+   only evidence in this scheme that anything wanted it. Everything else is speculation holding
+   an LLC way.
+
+   It is the sharpest capacity lever here, because on these traces most instruction prefetches
+   are never merged -- so this decides what the bulk of the FDIP stream is allowed to occupy.
+   Note it interacts with --mlp_lin_pref_lambda, which DEMOTES prefetch-installed lines rather
+   than refusing them: with both on, the few prefetch lines that still get in are also pushed
+   down, which is two mechanisms aimed at one population. */
+DEF_PARAM(fdip_delta_unmerged_pref_bypass_llc, FDIP_DELTA_UNMERGED_PREF_BYPASS_LLC, Flag, Flag, FALSE, )
+
+/* --fdip_delta_l1i_backup_level: the level that ALSO keeps an L1I-owned line, so it is not the
+   only copy on chip.
+
+     0  none (DEFAULT)  the strict rule: an L1I-owned line lives in the L1I alone, and an L1I
+                        eviction sends the next fetch to memory.
+     1  MLC             ... if --mlc_present. Naming an absent level would otherwise silently
+                        mean "no backup", so the presence test is explicit.
+     2  LLC
+
+   WHY IT EXISTS. The strict rule gives the shortest-lead-time lines -- the ones the front end
+   was most exposed to -- the least retention anywhere, which inverts what their lead time was
+   telling you. A backup keeps that line reachable on chip at a cost the lambda controls, so the
+   placement idea can be tested without also testing "evict instruction lines to memory".
+
+   It is a COPY, not a second owner: it carries --fdip_delta_l1i_backup_lambda, not
+   --fdip_delta_lambda, so the backup level can hold it loosely (lambda 0 is allocate-with-no-
+   protection, a pure backstop) while the L1I holds it tightly. */
+DEF_PARAM(fdip_delta_l1i_backup_level, FDIP_DELTA_L1I_BACKUP_LEVEL, uns, uns, 0, )
+
+/* Boost for the BACKUP copy of an L1I-owned line at that level, in LRU stack positions. 0 (the
+   default) allocates it with no protection at all, which is the control for the lambda: it
+   isolates "the line is reachable on chip" from "the line is protected there". */
+DEF_PARAM(fdip_delta_l1i_backup_lambda, FDIP_DELTA_L1I_BACKUP_LAMBDA, float, float, 0.0, )
+
 DEF_PARAM(mlp_lin_dyn_lambda_min, MLP_LIN_DYN_LAMBDA_MIN, float, float, 0.0, )
 DEF_PARAM(mlp_lin_dyn_lambda_max, MLP_LIN_DYN_LAMBDA_MAX, float, float, 64.0, )
 
