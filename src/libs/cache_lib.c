@@ -155,16 +155,24 @@ void cache_set_next_fill_prefetch(Flag is_prefetch) {
    not one per cache: the controller in topdown.c owns the adaptation and asserts single-core,
    and holding the state here means lin_lam_instr/lin_lam_data read the same values the ATDs
    would, exactly as they do for the static params.
-   Lazily seeded from the START params so the opening values are in force at the first fill,
-   with no dependence on whether the controller or a cache access runs first. */
+
+   SEEDED FROM --mlp_lin_instr_lambda / --mlp_lin_data_lambda, the ordinary static lambdas. The
+   arm therefore does not introduce a second way to say where the policy starts: a descriptor
+   names its lambdas exactly as a static run does, and --mlp_lin_dyn_lambda only decides whether
+   they then move. A static arm and the dynamic arm that begins at the same point are one edit
+   apart, which is what makes them comparable.
+
+   Lazy rather than an init hook so the opening pair is in force at the FIRST fill whatever order
+   initialisation runs in -- no dependence on whether a cache access or the controller's first
+   cycle happens first. */
 static Flag   g_mlp_dyn_seeded = FALSE;
 static double g_mlp_dyn_instr = 0.0;
 static double g_mlp_dyn_data = 0.0;
 
 static inline void mlp_dyn_seed(void) {
   if (!g_mlp_dyn_seeded) {
-    g_mlp_dyn_instr = (double)MLP_LIN_DYN_INSTR_START;
-    g_mlp_dyn_data = (double)MLP_LIN_DYN_DATA_START;
+    g_mlp_dyn_instr = (double)MLP_LIN_INSTR_LAMBDA;
+    g_mlp_dyn_data = (double)MLP_LIN_DATA_LAMBDA;
     g_mlp_dyn_seeded = TRUE;
   }
 }

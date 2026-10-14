@@ -613,9 +613,10 @@ void cache_set_next_fill_prefetch(Flag is_prefetch);
 
 /* --mlp_lin_dyn_lambda: the live boundness lambdas of REPL_MLP's adaptive arm. The controller
    (topdown.c, once per 2^N retired instructions) writes them; lin_lam_instr / lin_lam_data read
-   them in place of --mlp_lin_instr_lambda / --mlp_lin_data_lambda whenever the arm is on. The
-   readers seed themselves from --mlp_lin_dyn_*_start, so the opening pair is in force at the
-   first fill whatever order init runs in. */
+   them whenever the arm is on. The readers seed the pair on first use from
+   --mlp_lin_instr_lambda / --mlp_lin_data_lambda, so those params keep their ordinary meaning as
+   the policy's lambdas -- the arm takes them as its starting point rather than replacing them --
+   and the opening pair is in force at the first fill whatever order init runs in. */
 void cache_set_mlp_dyn_lambdas(double instr_lambda, double data_lambda);
 double cache_mlp_dyn_instr_lambda(void);
 double cache_mlp_dyn_data_lambda(void);

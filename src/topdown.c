@@ -183,7 +183,9 @@ static void mlpdyn_update(uns proc_id, Flag fu_wait_cycle) {
        than noise; 10 is ~1K instructions, 40 is ~1T. */
     ASSERTM(proc_id, MLP_LIN_DYN_WINDOW_LOG2 >= 10 && MLP_LIN_DYN_WINDOW_LOG2 <= 40,
             "--mlp_lin_dyn_window_log2 %u is out of range (10..40)\n", MLP_LIN_DYN_WINDOW_LOG2);
-    cache_set_mlp_dyn_lambdas((double)MLP_LIN_DYN_INSTR_START, (double)MLP_LIN_DYN_DATA_START);
+    /* No seeding here: cache_lib seeds the pair from --mlp_lin_instr_lambda /
+       --mlp_lin_data_lambda on first read, so the opening values exist whether or not this
+       controller has run yet, and there is exactly one expression that defines them. */
     g_mlpdyn_win_idx[proc_id] = inst_count[proc_id] >> MLP_LIN_DYN_WINDOW_LOG2;
     g_mlpdyn_mis_snap[proc_id] = mlpdyn_mispred_total(proc_id);
     g_mlpdyn_seeded[proc_id] = TRUE;
