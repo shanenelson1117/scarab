@@ -624,6 +624,88 @@ static inline void load_prio_count_hit(uns8 proc_id, Cache* cache, Flag is_mlc) 
   INC_STAT_EVENT(proc_id, (is_mlc ? MLC_PRIO_REUSE_MISSES_L0 : L1_PRIO_REUSE_MISSES_L0) + level, reuse_misses);
 }
 
+/**************************************************************************************/
+/* --delta_prio_stats: the same publish-then-count split as the three functions above, keyed on
+   PLACEMENT CLASS (Cache_Entry.delta_prio) instead of on priority level.
+ *
+ * Separate functions rather than extra chains inside the load_prio_* trio because the two have
+ * different enable conditions and must stay independently usable: a priority level exists only
+ * under REPL_MLP, while a placement class is stamped by the insert path on every cache. The whole
+ * point of these chains is to measure --instr_upfill on an LRU baseline, which --load_prio_stats
+ * structurally cannot do.
+ *
+ * Every chain is indexed as <base> + delta_prio, so the Delta_Prio enum order and the stat.def
+ * chain order are the same contract the PRIO_* chains have with their levels. The `< DELTA_PRIO_NUM`
+ * tests are not belt-and-braces: delta_prio is a uns8 fed from a caller-staged value, and an
+ * out-of-range class would charge a stat in a neighbouring chain. */
+static inline void delta_prio_count_hit(uns8 proc_id, Cache* cache, Flag is_mlc) {
+  uns8 cls = 0;
+  if (!DELTA_PRIO_STATS || !early_evict_in_roi())
+    return;
+  if (!cache_last_hit_delta_prio(cache, &cls))
+    return;  // a miss, or a probe -- cache_lib excludes update_repl==FALSE accesses deliberately
+  if (cls >= DELTA_PRIO_NUM)
+    return;
+  STAT_EVENT(proc_id, (is_mlc ? MLC_DELTA_HIT_NONE : L1_DELTA_HIT_NONE) + cls);
+}
+
+/* The fill just made and the line it displaced, on their own classes -- the arriving line and its
+   victim are counted independently for the same reason load_prio_count_fill does it: the question
+   is which classes displace which. Call immediately after the insert, inside the same validity
+   window as the *_EARLY_EVICT read. */
+static inline void delta_prio_count_fill(uns8 proc_id, Cache* cache, Flag is_mlc) {
+  uns8    fill_cls = 0, ev_cls = 0;
+  Counter hits = 0;
+  if (!DELTA_PRIO_STATS || !early_evict_in_roi())
+    return;
+
+  if (cache_last_fill_delta_prio(cache, &fill_cls) && fill_cls < DELTA_PRIO_NUM)
+    STAT_EVENT(proc_id, (is_mlc ? MLC_DELTA_FILL_NONE : L1_DELTA_FILL_NONE) + fill_cls);
+
+  if (!cache_last_evict_delta_prio(cache, &ev_cls, &hits))
+    return;  // the insert took a free way, so nothing was displaced
+  if (ev_cls >= DELTA_PRIO_NUM)
+    return;
+  STAT_EVENT(proc_id, (is_mlc ? MLC_DELTA_EVICT_NONE : L1_DELTA_EVICT_NONE) + ev_cls);
+  INC_STAT_EVENT(proc_id, (is_mlc ? MLC_DELTA_HITS_NONE : L1_DELTA_HITS_NONE) + ev_cls, hits);
+  /* The half the summed hits cannot show: a class can lift its mean purely by holding a few
+     popular lines longer while the rest die untouched. Same reasoning as PRIO_NOREUSE_Ln. */
+  if (!hits)
+    STAT_EVENT(proc_id, (is_mlc ? MLC_DELTA_NOREUSE_NONE : L1_DELTA_NOREUSE_NONE) + ev_cls);
+}
+
+/* Resident lines by class in the set this fill is arriving into. MUST be called BEFORE the
+   insert, for the reason load_prio_snapshot_set documents: afterwards the set describes what the
+   fill left behind rather than what it found. */
+static inline void delta_prio_snapshot_set(uns8 proc_id, Cache* cache, Addr addr, Flag is_mlc) {
+  uns occ[DELTA_PRIO_NUM];
+  if (!DELTA_PRIO_STATS || !early_evict_in_roi())
+    return;
+  cache_delta_prio_set_occupancy(cache, addr, occ);
+  const int base = is_mlc ? MLC_DELTA_OCCUP_NONE : L1_DELTA_OCCUP_NONE;
+  for (uns k = 0; k < DELTA_PRIO_NUM; k++) {
+    if (occ[k])
+      INC_STAT_EVENT(proc_id, base + k, occ[k]);
+  }
+}
+
+/* --instr_upfill_hit_invalidate: the OTHER way a line leaves, counted apart from eviction
+   because there is no victim and no replacement -- the line is simply dropped. Without this the
+   per-class FILL and EVICT counts would appear not to balance under that knob, with the whole
+   difference silently unaccounted. MUST be called BEFORE the release, which clears the class as
+   it invalidates the line. */
+static inline void delta_prio_count_release(uns8 proc_id, Cache* cache, Addr addr, Flag is_mlc) {
+  /* The tag walk is INSIDE the gate, which is why the lookup is done here rather than passed in:
+     this runs on every instruction hit at a level under --instr_upfill_hit_invalidate, and an
+     argument would be evaluated whether the knob wanted it or not. */
+  if (!DELTA_PRIO_STATS || !early_evict_in_roi())
+    return;
+  const uns8 cls = cache_line_delta_prio(cache, addr);
+  if (cls >= DELTA_PRIO_NUM)
+    return;
+  STAT_EVENT(proc_id, (is_mlc ? MLC_DELTA_RELEASE_NONE : L1_DELTA_RELEASE_NONE) + cls);
+}
+
 /* --membound_stats: classify a fill by the signal of the access that caused it, and stage the
    result for the cache_insert that follows.
 
@@ -1871,15 +1953,30 @@ static inline uns8 instr_upfill_carry(uns8 carried) {
   return (uns8)DELTA_PRIO_UPFILL;
 }
 
-static inline void instr_upfill_insert(Cache* cache, uns8 proc_id, Addr line_addr, uns8 carried) {
+static inline void instr_upfill_insert(Cache* cache, uns8 proc_id, Addr line_addr, uns8 carried, Flag is_mlc) {
   Cache_Fill_Stage saved;
   Addr             ins_line_addr = 0, repl_line_addr = 0;
   cache_save_fill_stage(&saved);
   cache_clear_fill_stage();
   cache_set_next_fill_instr(TRUE);
   cache_set_next_fill_delta_prio(instr_upfill_carry(carried));
+  /* --load_prio_stats: cache_clear_fill_stage above leaves fill_traffic at LOAD_PRIO_TC_OTHER,
+     which is the right default for an unstaged fill and the WRONG answer here -- a demoted line
+     is instruction traffic, and leaving it in OTHER makes it invisible to every composition walk,
+     so MLC_COMP_ALL_INSTR_* undercounts the instruction footprint by the whole demoted
+     population. Staged as IFETCH rather than IPREF because the distinction the demotion cannot
+     preserve is how the line FIRST arrived; what it can say is that the line reached the L1I and
+     was held there, which is demand instruction traffic by provenance. The exact demand/prefetch
+     split of these lines is not recoverable here -- read the --delta_prio_stats chains for the
+     per-class breakdown instead. */
+  cache_set_next_fill_traffic(LOAD_PRIO_TC_IFETCH);
+  /* --delta_prio_stats: BEFORE the insert, like every other snapshot. A demotion is a real fill
+     and can evict, so it is counted on the same footing as the ordinary fill paths -- without
+     this the arrivals that the whole mechanism exists to create are counted nowhere. */
+  delta_prio_snapshot_set(proc_id, cache, line_addr, is_mlc);
   L1_Data* data = (L1_Data*)cache_insert(cache, proc_id, line_addr, &ins_line_addr, &repl_line_addr);
   cache_restore_fill_stage(&saved);
+  delta_prio_count_fill(proc_id, cache, is_mlc);
 
   /* INITIALISE THE PAYLOAD. cache_insert allocates the way and returns its data area, but does
      NOT clear it -- as mlc_fill_line puts it, "the data area still contains values from the
@@ -1941,7 +2038,7 @@ void instr_upfill_to_mlc(uns8 proc_id, Addr line_addr, uns8 carried) {
   uns8 victim_class = (uns8)DELTA_PRIO_NONE;
   if (cache_peek_victim(mlc, proc_id, line_addr, &victim_addr, &victim_is_instr, &victim_class) && victim_is_instr)
     instr_upfill_to_llc(proc_id, victim_addr, victim_class); /* carries its class one level further */
-  instr_upfill_insert(mlc, proc_id, line_addr, carried);
+  instr_upfill_insert(mlc, proc_id, line_addr, carried, TRUE);
   STAT_EVENT(proc_id, INSTR_UPFILL_MLC);
 }
 
@@ -1968,7 +2065,7 @@ static void instr_upfill_to_llc(uns8 proc_id, Addr line_addr, uns8 carried) {
     STAT_EVENT(proc_id, INSTR_UPFILL_LLC_WB);
     STAT_EVENT(proc_id, L1_FILL_DIRTY);
   }
-  instr_upfill_insert(llc, proc_id, line_addr, carried);
+  instr_upfill_insert(llc, proc_id, line_addr, carried, FALSE);
   STAT_EVENT(proc_id, INSTR_UPFILL_LLC);
 }
 
@@ -3152,6 +3249,9 @@ Flag mem_process_l1_hit_access(Mem_Req* req, Mem_Queue_Entry* l1_queue_entry, Ad
     /* --load_prio_stats: the same reuse, charged to the hit line's priority level and measured in
        MISSES to the set rather than accesses. Same guard and same population as the two above. */
     load_prio_count_hit(req->proc_id, &L1(req->proc_id)->cache, FALSE);
+    /* --delta_prio_stats: the same hit, charged to the line's placement class. Same guard and
+       same population as the three above. */
+    delta_prio_count_hit(req->proc_id, &L1(req->proc_id)->cache, FALSE);
     if (0 && DEBUG_EXC_INSERTS) {
       printf("addr:%s hit in L1 type:%s\n", hexstr64s(req->addr), Mem_Req_Type_str(req->type));
     }
@@ -3271,6 +3371,8 @@ Flag mem_process_mlc_hit_access(Mem_Req* req, Mem_Queue_Entry* mlc_queue_entry, 
       reuse_dist_count_hit(req->proc_id, &MLC(req->proc_id)->cache, TRUE);
       /* --load_prio_stats: see the matching call on the L1 hit path. */
       load_prio_count_hit(req->proc_id, &MLC(req->proc_id)->cache, TRUE);
+      /* --delta_prio_stats: see the matching call on the L1 hit path. */
+      delta_prio_count_hit(req->proc_id, &MLC(req->proc_id)->cache, TRUE);
       if (0 && DEBUG_EXC_INSERTS) {
         printf("addr:%s hit in MLC type:%s\n", hexstr64s(req->addr), Mem_Req_Type_str(req->type));
       }
@@ -3664,6 +3766,8 @@ static Flag mem_complete_l1_access(Mem_Req* req, Mem_Queue_Entry* l1_queue_entry
     else {
       /* --instr_upfill_hit_invalidate: see the MLC counterpart. */
       if (INSTR_UPFILL_HIT_INVALIDATE && INSTR_UPFILL && mem_req_type_is_instr(req->type) && data && !data->dirty) {
+        /* --delta_prio_stats: read the class BEFORE the release -- cache_invalidate clears it. */
+        delta_prio_count_release(req->proc_id, &L1(req->proc_id)->cache, req->addr, FALSE);
         instr_upfill_hit_release(&L1(req->proc_id)->cache, req, data);
         STAT_EVENT(req->proc_id, L1_INSTR_UPFILL_HIT_RELEASE);
       }
@@ -3900,6 +4004,8 @@ static Flag mem_complete_mlc_access(Mem_Req* req, Mem_Queue_Entry* mlc_queue_ent
     } else {
       /* --instr_upfill_hit_invalidate: delivery is confirmed here, so release the MLC copy. */
       if (INSTR_UPFILL_HIT_INVALIDATE && INSTR_UPFILL && mem_req_type_is_instr(req->type) && data && !data->dirty) {
+        /* --delta_prio_stats: read the class BEFORE the release -- cache_invalidate clears it. */
+        delta_prio_count_release(req->proc_id, &MLC(req->proc_id)->cache, req->addr, TRUE);
         instr_upfill_hit_release(&MLC(req->proc_id)->cache, req, data);
         STAT_EVENT(req->proc_id, INSTR_UPFILL_MLC_HIT_RELEASE);
       }
@@ -6599,6 +6705,8 @@ Flag l1_fill_line(Mem_Req* req) {
      place the level table is described, which has to happen once a cache exists. */
   load_prio_dump_levels(req->proc_id, &L1(req->proc_id)->cache, FALSE);
   load_prio_snapshot_set(req->proc_id, &L1(req->proc_id)->cache, req->addr, FALSE);
+  /* --delta_prio_stats: same BEFORE-the-insert requirement, own knob. */
+  delta_prio_snapshot_set(req->proc_id, &L1(req->proc_id)->cache, req->addr, FALSE);
 
   /* The insert below silently drops this line from the one-line stream buffer if the buffer
      holds it (it must not be resident in both). That is safe only while the dropped occupant
@@ -6666,6 +6774,8 @@ Flag l1_fill_line(Mem_Req* req) {
   /* --load_prio_stats: the fill just made and the line it displaced, on their own levels. Same
      validity window as the two reads above -- before any further insert on this cache. */
   load_prio_count_fill(req->proc_id, &L1(req->proc_id)->cache, FALSE);
+  /* --delta_prio_stats: same fill, same victim, same window, keyed on placement class. */
+  delta_prio_count_fill(req->proc_id, &L1(req->proc_id)->cache, FALSE);
 
   /* --td_load_rrip_fixup: record where this fill landed, for the correction at window close. */
   td_rrip_fixup_record(l1_fixup_op, TD_RRIP_FIXUP_L1, line_addr, l1_fix_depth, l1_fix_thresh, l1_fix_basic);
@@ -7187,6 +7297,8 @@ Flag mlc_fill_line(Mem_Req* req) {
      before the insert below displaces anything. */
   load_prio_dump_levels(req->proc_id, &MLC(req->proc_id)->cache, TRUE);
   load_prio_snapshot_set(req->proc_id, &MLC(req->proc_id)->cache, req->addr, TRUE);
+  /* --delta_prio_stats: see the matching call in l1_fill_line. */
+  delta_prio_snapshot_set(req->proc_id, &MLC(req->proc_id)->cache, req->addr, TRUE);
 
   /* See the identical check in l1_fill_line: the insert below drops a matching stream-buffer
      occupant, which is only safe while that occupant is clean. */
@@ -7234,6 +7346,8 @@ Flag mlc_fill_line(Mem_Req* req) {
   reuse_dist_count_evict(req->proc_id, &MLC(req->proc_id)->cache, TRUE);
   /* --load_prio_stats: see the matching call in the L1 fill. */
   load_prio_count_fill(req->proc_id, &MLC(req->proc_id)->cache, TRUE);
+  /* --delta_prio_stats: see the matching call in l1_fill_line. */
+  delta_prio_count_fill(req->proc_id, &MLC(req->proc_id)->cache, TRUE);
 
   /* --td_load_rrip_fixup: the line is in now, so its fill_cycle is this cycle. `line_addr` is
      the one the insert above reported for THIS cache, which is what the correction must look
@@ -7562,6 +7676,7 @@ L1_Data* l1_pref_cache_access(Mem_Req* req) {
     load_prio_stage_fill(req);
     load_prio_dump_levels(req->proc_id, &L1(req->proc_id)->cache, FALSE);
     load_prio_snapshot_set(req->proc_id, &L1(req->proc_id)->cache, req->addr, FALSE);
+    delta_prio_snapshot_set(req->proc_id, &L1(req->proc_id)->cache, req->addr, FALSE);
 
     data = cache_insert(&L1(req->proc_id)->cache, req->proc_id, req->addr, &line_addr, &repl_line_addr);
 
@@ -7582,6 +7697,8 @@ L1_Data* l1_pref_cache_access(Mem_Req* req) {
     reuse_dist_count_evict(req->proc_id, &L1(req->proc_id)->cache, FALSE);
     /* --load_prio_stats: same population, same reason. */
     load_prio_count_fill(req->proc_id, &L1(req->proc_id)->cache, FALSE);
+    /* --delta_prio_stats: same population, same reason. */
+    delta_prio_count_fill(req->proc_id, &L1(req->proc_id)->cache, FALSE);
 
     STAT_EVENT(req->proc_id, L1_DATA_EVICT);
     STAT_EVENT(req->proc_id, L1_PREF_MOVE_L1);

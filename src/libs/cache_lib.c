@@ -387,7 +387,7 @@ void cache_mark_written(Cache* cache, Addr addr) {
    The graded pair clears here too, and not in cache_set_next_fill_cost, so a fill that stages
    the Flags but not the costs (any caller that has not been updated) gets 0 rather than the
    previous fill's values. */
-static inline void consume_fill_bound(Cache_Entry* line) {
+static inline void consume_fill_bound(Cache* cache, Cache_Entry* line) {
   line->membound_fill = g_next_fill_membound;
   line->fe_bound_fill = g_next_fill_fe_bound;
   line->bound_frac = g_next_fill_bound_frac;
@@ -398,6 +398,12 @@ static inline void consume_fill_bound(Cache_Entry* line) {
   line->was_written = g_next_fill_store;
   line->offpath_unproven = g_next_fill_offpath;
   line->fill_traffic = g_next_fill_traffic;  // --load_prio_stats
+  /* --delta_prio_stats: the hit counter restarts with the class it belongs to. This is the ONLY
+     place either is written at a fill, so they cannot come apart -- a line can never report hits
+     a previous occupant of the way earned. */
+  line->delta_hits = 0;
+  cache->last_fill_delta_prio = line->delta_prio;
+  cache->last_fill_delta_valid = TRUE;
   g_next_fill_membound = FALSE;
   g_next_fill_fe_bound = FALSE;
   g_next_fill_bound_frac = 0.0;
@@ -878,10 +884,17 @@ static inline void record_evict_age(Cache* cache, Cache_Entry* victim) {
     cache->last_evict_reused = victim->reuse_seen;
     cache->last_evict_membound = victim->membound_fill;
     cache->last_evict_fe_bound = victim->fe_bound_fill;
+    /* --delta_prio_stats: ungated, beside the three above rather than in the set_miss_ctr block
+       below, because the classes it reports are produced by --instr_upfill, which does not
+       require REPL_MLP. Read under last_evict_valid. */
+    cache->last_evict_delta_prio = victim->delta_prio;
+    cache->last_evict_delta_hits = victim->delta_hits;
   } else {
     cache->last_evict_reused = FALSE;
     cache->last_evict_membound = FALSE;
     cache->last_evict_fe_bound = FALSE;
+    cache->last_evict_delta_prio = (uns8)DELTA_PRIO_NONE;
+    cache->last_evict_delta_hits = 0;
   }
 
   /* --load_prio_stats: the victim's sticky level, its residency in MISSES to its set, and how
@@ -975,6 +988,30 @@ Flag cache_last_evict_prio(Cache* cache, uns8* level, Counter* residency_misses,
   return TRUE;
 }
 
+/* --delta_prio_stats. No set_miss_ctr test in any of the three: the placement class lives on the
+   line unconditionally, so these are valid on an LRU cache too -- see the header note. */
+Flag cache_last_hit_delta_prio(Cache* cache, uns8* delta_prio) {
+  if (!cache->last_hit_delta_valid)
+    return FALSE;
+  *delta_prio = cache->last_hit_delta_prio;
+  return TRUE;
+}
+
+Flag cache_last_fill_delta_prio(Cache* cache, uns8* delta_prio) {
+  if (!cache->last_fill_delta_valid)
+    return FALSE;
+  *delta_prio = cache->last_fill_delta_prio;
+  return TRUE;
+}
+
+Flag cache_last_evict_delta_prio(Cache* cache, uns8* delta_prio, Counter* hits) {
+  if (!cache->last_evict_valid)
+    return FALSE;
+  *delta_prio = cache->last_evict_delta_prio;
+  *hits = cache->last_evict_delta_hits;
+  return TRUE;
+}
+
 /* Both walks below index the set from `addr` and read only valid ways. Invalid ways are counted in
    NEITHER output, so on a set that is not yet full the totals fall short of assoc -- which is the
    honest answer: an empty way holds nothing. */
@@ -1012,6 +1049,28 @@ void cache_load_prio_set_occupancy(Cache* cache, Addr addr, uns* counts) {
       continue;
     if (e->prio_level < cache->prio_num_levels)
       counts[e->prio_level]++;
+  }
+}
+
+/* --delta_prio_stats: resident lines by PLACEMENT class, for the occupancy half of the per-class
+   accounting. Same contract as the two walks above (valid ways only, so a half-full set totals
+   less than assoc), and, like the composition walk and unlike the occupancy walk, with NO
+   policy gate -- delta_prio is stamped by the insert path on every cache, so this is as valid on
+   an LRU baseline as on REPL_MLP. The caller owns the knob test. */
+void cache_delta_prio_set_occupancy(Cache* cache, Addr addr, uns* counts) {
+  memset(counts, 0, DELTA_PRIO_NUM * sizeof(uns));
+  Addr      tag = 0, line_addr = 0;
+  const uns set = cache_index(cache, addr, &tag, &line_addr);
+  for (uns ii = 0; ii < cache->assoc; ii++) {
+    const Cache_Entry* e = &cache->entries[set][ii];
+    if (!e->valid)
+      continue;
+    /* Clamped rather than trusted, like the composition walk: delta_prio is a uns8 fed from a
+       caller-staged value, and an out-of-range class would write past the end of `counts`. */
+    if (e->delta_prio < DELTA_PRIO_NUM)
+      counts[e->delta_prio]++;
+    else
+      counts[DELTA_PRIO_NONE]++;
   }
 }
 
@@ -1190,6 +1249,14 @@ void init_cache(Cache* cache, const char* name, uns cache_size, uns assoc, uns l
   cache->last_evict_reused = FALSE;
   cache->last_evict_membound = FALSE;
   cache->last_evict_fe_bound = FALSE;
+  /* --delta_prio_stats: same reason -- these have no allocation acting as an enable test, so an
+     unwritten byte here would be read as a real class. */
+  cache->last_hit_delta_valid = FALSE;
+  cache->last_hit_delta_prio = (uns8)DELTA_PRIO_NONE;
+  cache->last_fill_delta_valid = FALSE;
+  cache->last_fill_delta_prio = (uns8)DELTA_PRIO_NONE;
+  cache->last_evict_delta_prio = (uns8)DELTA_PRIO_NONE;
+  cache->last_evict_delta_hits = 0;
   /* --load_prio_stats: cleared for EVERY cache, ahead of the strategy branch, for the same reason
      the fields above are -- Cache structs are malloc'd, so an untracked cache must read as
      untracked rather than as garbage. set_miss_ctr is the enable test on every hot path and is
@@ -1266,6 +1333,7 @@ void init_cache(Cache* cache, const char* name, uns cache_size, uns assoc, uns l
       cache->entries[ii][jj].mlp_cost = 0.0;
       cache->entries[ii][jj].fill_was_prefetch = FALSE;
       cache->entries[ii][jj].delta_prio = DELTA_PRIO_NONE;
+      cache->entries[ii][jj].delta_hits = 0;  // --delta_prio_stats
       cache->entries[ii][jj].instr_line = FALSE;
       cache->entries[ii][jj].was_written = FALSE;
       cache->entries[ii][jj].offpath_unproven = FALSE;
@@ -1365,7 +1433,8 @@ void* cache_access(Cache* cache, Addr addr, Addr* line_addr, Flag update_repl) {
   cache->last_hit_bound_frac = 0.0;
   cache->last_hit_fe_bound = FALSE;
   cache->last_hit_reuse_valid = FALSE;
-  cache->last_hit_prio_valid = FALSE;  // --load_prio_stats
+  cache->last_hit_prio_valid = FALSE;   // --load_prio_stats
+  cache->last_hit_delta_valid = FALSE;  // --delta_prio_stats
 
   /* --reuse_dist_stats: count this access against the set BEFORE the lookup, so the distance a
      hit reports includes the hit itself and the minimum distance is 1. Ticked here rather than
@@ -1423,6 +1492,15 @@ void* cache_access(Cache* cache, Addr addr, Addr* line_addr, Flag update_repl) {
         cache->num_demand_access++;
         reuse_dist_on_hit(cache, line, set);  // --reuse_dist_stats
         load_prio_on_hit(cache, line, set);   // --load_prio_stats
+        /* --delta_prio_stats: inside the update_repl guard, unlike the last_hit_membound publish
+           above. The membound counters are a property of how a resident line was brought in and a
+           probe that finds it has genuinely found it; a HIT RATE is not -- the oracle and warmup
+           lookups in memory.c probe the MLC and LLC with update_repl FALSE, and counting those
+           would put accesses in the numerator that the program never issued. Published and
+           counted on one population, so hits/fill divides cleanly. */
+        line->delta_hits++;
+        cache->last_hit_delta_prio = line->delta_prio;
+        cache->last_hit_delta_valid = TRUE;
         update_repl_policy(cache, line, set, ii, FALSE);
         DEBUG(0, "(%s, %d) [0x%x, 0x%x]: in access\n\n", cache->name, cache->repl_policy, cache->num_sets,
               cache->assoc);
@@ -1529,7 +1607,7 @@ void* cache_insert_replpos(Cache* cache, uns8 proc_id, Addr addr, Addr* line_add
 
   new_line->pw_start_addr = addr;  // only means anything for uop cache
   new_line->marked_promote_rrpv = RRIP_DISTANT_VAL - 1;  // neutral; set at marked-RRIP insert
-  consume_fill_bound(new_line);    // --membound_stats: non-strategy path (incl. REPL_TRUE_LRU)
+  consume_fill_bound(cache, new_line);  // --membound_stats: non-strategy path (incl. REPL_TRUE_LRU)
   stamp_fill_cycle(new_line);      // --early_evict_stats: start this line's residency clock
   stamp_reuse_dist(cache, new_line, set);  // --reuse_dist_stats: start its reuse clock
   /* --load_prio_stats: AFTER consume_fill_bound, which writes the mlp_cost / bound_frac /
@@ -1647,6 +1725,10 @@ void cache_invalidate(Cache* cache, Addr addr, Addr* line_addr) {
       line->mlp_cost = 0.0;
       line->fill_was_prefetch = FALSE;
       line->delta_prio = DELTA_PRIO_NONE;
+      /* --delta_prio_stats: cleared with the class, so the pair stays consistent on the
+         --instr_upfill_hit_invalidate path too -- there the invalidate is how a promoted line
+         leaves, and a stale count would be charged to whatever fills the way next. */
+      line->delta_hits = 0;
       line->instr_line = FALSE;
       line->was_written = FALSE;
       line->offpath_unproven = FALSE;
@@ -2636,6 +2718,15 @@ void* cache_access_strategy(Cache* cache, Addr addr, Addr* line_addr, Flag updat
 
       if (update_repl) {
         reuse_dist_on_hit(cache, line, set);  // --reuse_dist_stats
+        /* --delta_prio_stats: see the matching publish in cache_access, including why it sits
+           inside the update_repl guard while the membound group above does not. Present here and
+           absent on load_prio_on_hit deliberately: a priority level needs REPL_MLP, which is
+           below REPL_VOID and so never reaches this function, while a placement class is stamped
+           by every policy's insert path -- including SRRIP, Mockingjay and marked-RRIP, which
+           only ever take THIS path. */
+        line->delta_hits++;
+        cache->last_hit_delta_prio = line->delta_prio;
+        cache->last_hit_delta_valid = TRUE;
         repl_policy_func_table[policy].update_hit(cache, set, ii, NULL);
       }
 
@@ -2716,6 +2807,7 @@ void general_action_init(Cache* cache, const char* name, uns cache_size, uns ass
       cache->entries[ii][jj].mlp_cost = 0.0;
       cache->entries[ii][jj].fill_was_prefetch = FALSE;
       cache->entries[ii][jj].delta_prio = DELTA_PRIO_NONE;
+      cache->entries[ii][jj].delta_hits = 0;  // --delta_prio_stats
       cache->entries[ii][jj].instr_line = FALSE;
       cache->entries[ii][jj].was_written = FALSE;
       cache->entries[ii][jj].offpath_unproven = FALSE;
@@ -2771,7 +2863,7 @@ void general_action_repl(Cache* cache, Cache_Entry* new_line, uns8 proc_id, Addr
   new_line->valid = TRUE;
   new_line->tag = tag;
   new_line->base = *line_addr;
-  consume_fill_bound(new_line);  // --membound_stats: strategy path (>= REPL_VOID)
+  consume_fill_bound(cache, new_line);  // --membound_stats: strategy path (>= REPL_VOID)
   stamp_fill_cycle(new_line);    // --early_evict_stats: start this line's residency clock
 }
 

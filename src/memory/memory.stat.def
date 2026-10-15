@@ -4773,3 +4773,260 @@ DEF_STAT(  L1_COMP_ALL_DATA_NONLOAD_15               , COUNT , NO_RATIO         
 DEF_STAT(  L1_COMP_ALL_DATA_NONLOAD_16               , DIST  , NO_RATIO                    )
 
 
+
+
+/**************************************************************************************/
+/* --delta_prio_stats: PER-PLACEMENT-CLASS accounting for the L1I, the MLC and the LLC.
+   See the --delta_prio_stats comment in memory.param.def for the full contract; in brief:
+
+   The seven classes are the Delta_Prio enum, IN ENUM ORDER -- NONE, OWNER, BACKUP, UPFILL,
+   UPFILL_HIT, NO_PREF, LATE_PREF -- because the code charges these chains as
+   <base> + line->delta_prio. DO NOT REORDER, INSERT INTO, OR SPLIT A CHAIN. Adding a class means
+   adding it last in the enum, before DELTA_PRIO_NUM, and last in every one of these chains.
+
+   NONE is not a residual bucket: it is every line no placement mechanism marked, which on any
+   realistic configuration is all data traffic plus the instruction fills that arrived by the
+   ordinary path. On a run with every mechanism off, NONE holds everything and the other six are
+   empty -- that is the control, not a bug.
+
+   WHAT DIVIDES INTO WHAT:
+     per-class hit rate      = HIT_C / (HIT_C + FILL_C)
+     mean uses per residency = HITS_C / EVICT_C          (its ratio column)
+     never-used share        = NOREUSE_C / EVICT_C       (its ratio column)
+     share of capacity       = OCCUP_C / sum(OCCUP_*)    (its DIST column)
+     share of admissions     = FILL_C  / sum(FILL_*)     (its DIST column)
+
+   FILL_C does NOT equal EVICT_C + NOREUSE_C or anything like it. The exits are
+   EVICT_C + RELEASE_C + still-resident; RELEASE is --instr_upfill_hit_invalidate, which removes
+   a line without replacing it and is therefore not an eviction.
+
+   FILL AND EVICT CAN DISAGREE ON CLASS FOR THE SAME LINE, deliberately. cache_promote_upfill
+   relabels UPFILL as UPFILL_HIT and cache_mark_delta_owner installs OWNER, both after the fill,
+   so a promoted line is charged to FILL_UPFILL and EVICT_UPFILL_HIT. Reading EVICT_UPFILL_HIT
+   against FILL_UPFILL_HIT (which only --fdip_delta_hit_pins ever charges) is how much promotion
+   happened.
+
+   HIT_C EXCLUDES PROBES. The oracle and warmup lookups in memory.c access the MLC and the LLC
+   with update_repl FALSE, and --perfect_icache synthesizes a hit with no line behind it at all.
+   None of those are accesses the program issued and none are counted here.
+
+   WINDOW: target-only, on the early_evict_in_roi() gate -- the Periodic_* window. Divide by
+   Periodic_Instructions, never by Cumulative_*. */
+/**************************************************************************************/
+
+/* ---------- L1I ---------- */
+/* Lines of each class ADMITTED. The DIST column is the class's share of admissions. */
+DEF_STAT(  ICACHE_DELTA_FILL_NONE                      , DIST  , NO_RATIO                   )
+DEF_STAT(  ICACHE_DELTA_FILL_OWNER                     , COUNT , NO_RATIO                   )
+DEF_STAT(  ICACHE_DELTA_FILL_BACKUP                    , COUNT , NO_RATIO                   )
+DEF_STAT(  ICACHE_DELTA_FILL_UPFILL                    , COUNT , NO_RATIO                   )
+DEF_STAT(  ICACHE_DELTA_FILL_UPFILL_HIT                , COUNT , NO_RATIO                   )
+DEF_STAT(  ICACHE_DELTA_FILL_NO_PREF                   , COUNT , NO_RATIO                   )
+DEF_STAT(  ICACHE_DELTA_FILL_LATE_PREF                 , DIST  , NO_RATIO                   )
+
+/* Accesses that HIT a line of each class. Demand/prefetch accesses only -- no probes. */
+DEF_STAT(  ICACHE_DELTA_HIT_NONE                       , DIST  , NO_RATIO                   )
+DEF_STAT(  ICACHE_DELTA_HIT_OWNER                      , COUNT , NO_RATIO                   )
+DEF_STAT(  ICACHE_DELTA_HIT_BACKUP                     , COUNT , NO_RATIO                   )
+DEF_STAT(  ICACHE_DELTA_HIT_UPFILL                     , COUNT , NO_RATIO                   )
+DEF_STAT(  ICACHE_DELTA_HIT_UPFILL_HIT                 , COUNT , NO_RATIO                   )
+DEF_STAT(  ICACHE_DELTA_HIT_NO_PREF                    , COUNT , NO_RATIO                   )
+DEF_STAT(  ICACHE_DELTA_HIT_LATE_PREF                  , DIST  , NO_RATIO                   )
+
+/* Lines of each class REPLACED. Charged at the eviction, so it reads the class the line
+   held when it left, which promotion may have changed since the fill. */
+DEF_STAT(  ICACHE_DELTA_EVICT_NONE                     , DIST  , NO_RATIO                   )
+DEF_STAT(  ICACHE_DELTA_EVICT_OWNER                    , COUNT , NO_RATIO                   )
+DEF_STAT(  ICACHE_DELTA_EVICT_BACKUP                   , COUNT , NO_RATIO                   )
+DEF_STAT(  ICACHE_DELTA_EVICT_UPFILL                   , COUNT , NO_RATIO                   )
+DEF_STAT(  ICACHE_DELTA_EVICT_UPFILL_HIT               , COUNT , NO_RATIO                   )
+DEF_STAT(  ICACHE_DELTA_EVICT_NO_PREF                  , COUNT , NO_RATIO                   )
+DEF_STAT(  ICACHE_DELTA_EVICT_LATE_PREF                , DIST  , NO_RATIO                   )
+
+/* SUMMED hits of the evicted lines of each class. The ratio column is therefore the mean
+   number of times a class-C line was used per completed residency. Read NOREUSE first. */
+DEF_STAT(  ICACHE_DELTA_HITS_NONE                      , RATIO , ICACHE_DELTA_EVICT_NONE    )
+DEF_STAT(  ICACHE_DELTA_HITS_OWNER                     , RATIO , ICACHE_DELTA_EVICT_OWNER   )
+DEF_STAT(  ICACHE_DELTA_HITS_BACKUP                    , RATIO , ICACHE_DELTA_EVICT_BACKUP  )
+DEF_STAT(  ICACHE_DELTA_HITS_UPFILL                    , RATIO , ICACHE_DELTA_EVICT_UPFILL  )
+DEF_STAT(  ICACHE_DELTA_HITS_UPFILL_HIT                , RATIO , ICACHE_DELTA_EVICT_UPFILL_HIT)
+DEF_STAT(  ICACHE_DELTA_HITS_NO_PREF                   , RATIO , ICACHE_DELTA_EVICT_NO_PREF )
+DEF_STAT(  ICACHE_DELTA_HITS_LATE_PREF                 , RATIO , ICACHE_DELTA_EVICT_LATE_PREF)
+
+/* Evicted class-C lines that were NEVER hit. The ratio column is the wasted-fill share --
+   the half HITS_C cannot show, since a class can lift its mean by holding a few popular
+   lines longer while the rest die untouched. */
+DEF_STAT(  ICACHE_DELTA_NOREUSE_NONE                   , RATIO , ICACHE_DELTA_EVICT_NONE    )
+DEF_STAT(  ICACHE_DELTA_NOREUSE_OWNER                  , RATIO , ICACHE_DELTA_EVICT_OWNER   )
+DEF_STAT(  ICACHE_DELTA_NOREUSE_BACKUP                 , RATIO , ICACHE_DELTA_EVICT_BACKUP  )
+DEF_STAT(  ICACHE_DELTA_NOREUSE_UPFILL                 , RATIO , ICACHE_DELTA_EVICT_UPFILL  )
+DEF_STAT(  ICACHE_DELTA_NOREUSE_UPFILL_HIT             , RATIO , ICACHE_DELTA_EVICT_UPFILL_HIT)
+DEF_STAT(  ICACHE_DELTA_NOREUSE_NO_PREF                , RATIO , ICACHE_DELTA_EVICT_NO_PREF )
+DEF_STAT(  ICACHE_DELTA_NOREUSE_LATE_PREF              , RATIO , ICACHE_DELTA_EVICT_LATE_PREF)
+
+/* --instr_upfill_hit_invalidate: class-C lines dropped because the line was delivered up
+   to the L1I. The other exit, and NOT an eviction -- no victim, no replacement. Zero on
+   every run with that knob off. */
+DEF_STAT(  ICACHE_DELTA_RELEASE_NONE                   , DIST  , NO_RATIO                   )
+DEF_STAT(  ICACHE_DELTA_RELEASE_OWNER                  , COUNT , NO_RATIO                   )
+DEF_STAT(  ICACHE_DELTA_RELEASE_BACKUP                 , COUNT , NO_RATIO                   )
+DEF_STAT(  ICACHE_DELTA_RELEASE_UPFILL                 , COUNT , NO_RATIO                   )
+DEF_STAT(  ICACHE_DELTA_RELEASE_UPFILL_HIT             , COUNT , NO_RATIO                   )
+DEF_STAT(  ICACHE_DELTA_RELEASE_NO_PREF                , COUNT , NO_RATIO                   )
+DEF_STAT(  ICACHE_DELTA_RELEASE_LATE_PREF              , DIST  , NO_RATIO                   )
+
+/* Resident class-C lines, summed once per fill over the set the fill lands in. The DIST
+   column is the class's share of CAPACITY, which the admission counts cannot give: a
+   class can take 2% of fills and hold 40% of the array, or the reverse. */
+DEF_STAT(  ICACHE_DELTA_OCCUP_NONE                     , DIST  , NO_RATIO                   )
+DEF_STAT(  ICACHE_DELTA_OCCUP_OWNER                    , COUNT , NO_RATIO                   )
+DEF_STAT(  ICACHE_DELTA_OCCUP_BACKUP                   , COUNT , NO_RATIO                   )
+DEF_STAT(  ICACHE_DELTA_OCCUP_UPFILL                   , COUNT , NO_RATIO                   )
+DEF_STAT(  ICACHE_DELTA_OCCUP_UPFILL_HIT               , COUNT , NO_RATIO                   )
+DEF_STAT(  ICACHE_DELTA_OCCUP_NO_PREF                  , COUNT , NO_RATIO                   )
+DEF_STAT(  ICACHE_DELTA_OCCUP_LATE_PREF                , DIST  , NO_RATIO                   )
+
+/* ---------- MLC ---------- */
+/* Lines of each class ADMITTED. The DIST column is the class's share of admissions. */
+DEF_STAT(  MLC_DELTA_FILL_NONE                         , DIST  , NO_RATIO                   )
+DEF_STAT(  MLC_DELTA_FILL_OWNER                        , COUNT , NO_RATIO                   )
+DEF_STAT(  MLC_DELTA_FILL_BACKUP                       , COUNT , NO_RATIO                   )
+DEF_STAT(  MLC_DELTA_FILL_UPFILL                       , COUNT , NO_RATIO                   )
+DEF_STAT(  MLC_DELTA_FILL_UPFILL_HIT                   , COUNT , NO_RATIO                   )
+DEF_STAT(  MLC_DELTA_FILL_NO_PREF                      , COUNT , NO_RATIO                   )
+DEF_STAT(  MLC_DELTA_FILL_LATE_PREF                    , DIST  , NO_RATIO                   )
+
+/* Accesses that HIT a line of each class. Demand/prefetch accesses only -- no probes. */
+DEF_STAT(  MLC_DELTA_HIT_NONE                          , DIST  , NO_RATIO                   )
+DEF_STAT(  MLC_DELTA_HIT_OWNER                         , COUNT , NO_RATIO                   )
+DEF_STAT(  MLC_DELTA_HIT_BACKUP                        , COUNT , NO_RATIO                   )
+DEF_STAT(  MLC_DELTA_HIT_UPFILL                        , COUNT , NO_RATIO                   )
+DEF_STAT(  MLC_DELTA_HIT_UPFILL_HIT                    , COUNT , NO_RATIO                   )
+DEF_STAT(  MLC_DELTA_HIT_NO_PREF                       , COUNT , NO_RATIO                   )
+DEF_STAT(  MLC_DELTA_HIT_LATE_PREF                     , DIST  , NO_RATIO                   )
+
+/* Lines of each class REPLACED. Charged at the eviction, so it reads the class the line
+   held when it left, which promotion may have changed since the fill. */
+DEF_STAT(  MLC_DELTA_EVICT_NONE                        , DIST  , NO_RATIO                   )
+DEF_STAT(  MLC_DELTA_EVICT_OWNER                       , COUNT , NO_RATIO                   )
+DEF_STAT(  MLC_DELTA_EVICT_BACKUP                      , COUNT , NO_RATIO                   )
+DEF_STAT(  MLC_DELTA_EVICT_UPFILL                      , COUNT , NO_RATIO                   )
+DEF_STAT(  MLC_DELTA_EVICT_UPFILL_HIT                  , COUNT , NO_RATIO                   )
+DEF_STAT(  MLC_DELTA_EVICT_NO_PREF                     , COUNT , NO_RATIO                   )
+DEF_STAT(  MLC_DELTA_EVICT_LATE_PREF                   , DIST  , NO_RATIO                   )
+
+/* SUMMED hits of the evicted lines of each class. The ratio column is therefore the mean
+   number of times a class-C line was used per completed residency. Read NOREUSE first. */
+DEF_STAT(  MLC_DELTA_HITS_NONE                         , RATIO , MLC_DELTA_EVICT_NONE       )
+DEF_STAT(  MLC_DELTA_HITS_OWNER                        , RATIO , MLC_DELTA_EVICT_OWNER      )
+DEF_STAT(  MLC_DELTA_HITS_BACKUP                       , RATIO , MLC_DELTA_EVICT_BACKUP     )
+DEF_STAT(  MLC_DELTA_HITS_UPFILL                       , RATIO , MLC_DELTA_EVICT_UPFILL     )
+DEF_STAT(  MLC_DELTA_HITS_UPFILL_HIT                   , RATIO , MLC_DELTA_EVICT_UPFILL_HIT )
+DEF_STAT(  MLC_DELTA_HITS_NO_PREF                      , RATIO , MLC_DELTA_EVICT_NO_PREF    )
+DEF_STAT(  MLC_DELTA_HITS_LATE_PREF                    , RATIO , MLC_DELTA_EVICT_LATE_PREF  )
+
+/* Evicted class-C lines that were NEVER hit. The ratio column is the wasted-fill share --
+   the half HITS_C cannot show, since a class can lift its mean by holding a few popular
+   lines longer while the rest die untouched. */
+DEF_STAT(  MLC_DELTA_NOREUSE_NONE                      , RATIO , MLC_DELTA_EVICT_NONE       )
+DEF_STAT(  MLC_DELTA_NOREUSE_OWNER                     , RATIO , MLC_DELTA_EVICT_OWNER      )
+DEF_STAT(  MLC_DELTA_NOREUSE_BACKUP                    , RATIO , MLC_DELTA_EVICT_BACKUP     )
+DEF_STAT(  MLC_DELTA_NOREUSE_UPFILL                    , RATIO , MLC_DELTA_EVICT_UPFILL     )
+DEF_STAT(  MLC_DELTA_NOREUSE_UPFILL_HIT                , RATIO , MLC_DELTA_EVICT_UPFILL_HIT )
+DEF_STAT(  MLC_DELTA_NOREUSE_NO_PREF                   , RATIO , MLC_DELTA_EVICT_NO_PREF    )
+DEF_STAT(  MLC_DELTA_NOREUSE_LATE_PREF                 , RATIO , MLC_DELTA_EVICT_LATE_PREF  )
+
+/* --instr_upfill_hit_invalidate: class-C lines dropped because the line was delivered up
+   to the L1I. The other exit, and NOT an eviction -- no victim, no replacement. Zero on
+   every run with that knob off. */
+DEF_STAT(  MLC_DELTA_RELEASE_NONE                      , DIST  , NO_RATIO                   )
+DEF_STAT(  MLC_DELTA_RELEASE_OWNER                     , COUNT , NO_RATIO                   )
+DEF_STAT(  MLC_DELTA_RELEASE_BACKUP                    , COUNT , NO_RATIO                   )
+DEF_STAT(  MLC_DELTA_RELEASE_UPFILL                    , COUNT , NO_RATIO                   )
+DEF_STAT(  MLC_DELTA_RELEASE_UPFILL_HIT                , COUNT , NO_RATIO                   )
+DEF_STAT(  MLC_DELTA_RELEASE_NO_PREF                   , COUNT , NO_RATIO                   )
+DEF_STAT(  MLC_DELTA_RELEASE_LATE_PREF                 , DIST  , NO_RATIO                   )
+
+/* Resident class-C lines, summed once per fill over the set the fill lands in. The DIST
+   column is the class's share of CAPACITY, which the admission counts cannot give: a
+   class can take 2% of fills and hold 40% of the array, or the reverse. */
+DEF_STAT(  MLC_DELTA_OCCUP_NONE                        , DIST  , NO_RATIO                   )
+DEF_STAT(  MLC_DELTA_OCCUP_OWNER                       , COUNT , NO_RATIO                   )
+DEF_STAT(  MLC_DELTA_OCCUP_BACKUP                      , COUNT , NO_RATIO                   )
+DEF_STAT(  MLC_DELTA_OCCUP_UPFILL                      , COUNT , NO_RATIO                   )
+DEF_STAT(  MLC_DELTA_OCCUP_UPFILL_HIT                  , COUNT , NO_RATIO                   )
+DEF_STAT(  MLC_DELTA_OCCUP_NO_PREF                     , COUNT , NO_RATIO                   )
+DEF_STAT(  MLC_DELTA_OCCUP_LATE_PREF                   , DIST  , NO_RATIO                   )
+
+/* ---------- LLC ---------- */
+/* Lines of each class ADMITTED. The DIST column is the class's share of admissions. */
+DEF_STAT(  L1_DELTA_FILL_NONE                          , DIST  , NO_RATIO                   )
+DEF_STAT(  L1_DELTA_FILL_OWNER                         , COUNT , NO_RATIO                   )
+DEF_STAT(  L1_DELTA_FILL_BACKUP                        , COUNT , NO_RATIO                   )
+DEF_STAT(  L1_DELTA_FILL_UPFILL                        , COUNT , NO_RATIO                   )
+DEF_STAT(  L1_DELTA_FILL_UPFILL_HIT                    , COUNT , NO_RATIO                   )
+DEF_STAT(  L1_DELTA_FILL_NO_PREF                       , COUNT , NO_RATIO                   )
+DEF_STAT(  L1_DELTA_FILL_LATE_PREF                     , DIST  , NO_RATIO                   )
+
+/* Accesses that HIT a line of each class. Demand/prefetch accesses only -- no probes. */
+DEF_STAT(  L1_DELTA_HIT_NONE                           , DIST  , NO_RATIO                   )
+DEF_STAT(  L1_DELTA_HIT_OWNER                          , COUNT , NO_RATIO                   )
+DEF_STAT(  L1_DELTA_HIT_BACKUP                         , COUNT , NO_RATIO                   )
+DEF_STAT(  L1_DELTA_HIT_UPFILL                         , COUNT , NO_RATIO                   )
+DEF_STAT(  L1_DELTA_HIT_UPFILL_HIT                     , COUNT , NO_RATIO                   )
+DEF_STAT(  L1_DELTA_HIT_NO_PREF                        , COUNT , NO_RATIO                   )
+DEF_STAT(  L1_DELTA_HIT_LATE_PREF                      , DIST  , NO_RATIO                   )
+
+/* Lines of each class REPLACED. Charged at the eviction, so it reads the class the line
+   held when it left, which promotion may have changed since the fill. */
+DEF_STAT(  L1_DELTA_EVICT_NONE                         , DIST  , NO_RATIO                   )
+DEF_STAT(  L1_DELTA_EVICT_OWNER                        , COUNT , NO_RATIO                   )
+DEF_STAT(  L1_DELTA_EVICT_BACKUP                       , COUNT , NO_RATIO                   )
+DEF_STAT(  L1_DELTA_EVICT_UPFILL                       , COUNT , NO_RATIO                   )
+DEF_STAT(  L1_DELTA_EVICT_UPFILL_HIT                   , COUNT , NO_RATIO                   )
+DEF_STAT(  L1_DELTA_EVICT_NO_PREF                      , COUNT , NO_RATIO                   )
+DEF_STAT(  L1_DELTA_EVICT_LATE_PREF                    , DIST  , NO_RATIO                   )
+
+/* SUMMED hits of the evicted lines of each class. The ratio column is therefore the mean
+   number of times a class-C line was used per completed residency. Read NOREUSE first. */
+DEF_STAT(  L1_DELTA_HITS_NONE                          , RATIO , L1_DELTA_EVICT_NONE        )
+DEF_STAT(  L1_DELTA_HITS_OWNER                         , RATIO , L1_DELTA_EVICT_OWNER       )
+DEF_STAT(  L1_DELTA_HITS_BACKUP                        , RATIO , L1_DELTA_EVICT_BACKUP      )
+DEF_STAT(  L1_DELTA_HITS_UPFILL                        , RATIO , L1_DELTA_EVICT_UPFILL      )
+DEF_STAT(  L1_DELTA_HITS_UPFILL_HIT                    , RATIO , L1_DELTA_EVICT_UPFILL_HIT  )
+DEF_STAT(  L1_DELTA_HITS_NO_PREF                       , RATIO , L1_DELTA_EVICT_NO_PREF     )
+DEF_STAT(  L1_DELTA_HITS_LATE_PREF                     , RATIO , L1_DELTA_EVICT_LATE_PREF   )
+
+/* Evicted class-C lines that were NEVER hit. The ratio column is the wasted-fill share --
+   the half HITS_C cannot show, since a class can lift its mean by holding a few popular
+   lines longer while the rest die untouched. */
+DEF_STAT(  L1_DELTA_NOREUSE_NONE                       , RATIO , L1_DELTA_EVICT_NONE        )
+DEF_STAT(  L1_DELTA_NOREUSE_OWNER                      , RATIO , L1_DELTA_EVICT_OWNER       )
+DEF_STAT(  L1_DELTA_NOREUSE_BACKUP                     , RATIO , L1_DELTA_EVICT_BACKUP      )
+DEF_STAT(  L1_DELTA_NOREUSE_UPFILL                     , RATIO , L1_DELTA_EVICT_UPFILL      )
+DEF_STAT(  L1_DELTA_NOREUSE_UPFILL_HIT                 , RATIO , L1_DELTA_EVICT_UPFILL_HIT  )
+DEF_STAT(  L1_DELTA_NOREUSE_NO_PREF                    , RATIO , L1_DELTA_EVICT_NO_PREF     )
+DEF_STAT(  L1_DELTA_NOREUSE_LATE_PREF                  , RATIO , L1_DELTA_EVICT_LATE_PREF   )
+
+/* --instr_upfill_hit_invalidate: class-C lines dropped because the line was delivered up
+   to the L1I. The other exit, and NOT an eviction -- no victim, no replacement. Zero on
+   every run with that knob off. */
+DEF_STAT(  L1_DELTA_RELEASE_NONE                       , DIST  , NO_RATIO                   )
+DEF_STAT(  L1_DELTA_RELEASE_OWNER                      , COUNT , NO_RATIO                   )
+DEF_STAT(  L1_DELTA_RELEASE_BACKUP                     , COUNT , NO_RATIO                   )
+DEF_STAT(  L1_DELTA_RELEASE_UPFILL                     , COUNT , NO_RATIO                   )
+DEF_STAT(  L1_DELTA_RELEASE_UPFILL_HIT                 , COUNT , NO_RATIO                   )
+DEF_STAT(  L1_DELTA_RELEASE_NO_PREF                    , COUNT , NO_RATIO                   )
+DEF_STAT(  L1_DELTA_RELEASE_LATE_PREF                  , DIST  , NO_RATIO                   )
+
+/* Resident class-C lines, summed once per fill over the set the fill lands in. The DIST
+   column is the class's share of CAPACITY, which the admission counts cannot give: a
+   class can take 2% of fills and hold 40% of the array, or the reverse. */
+DEF_STAT(  L1_DELTA_OCCUP_NONE                         , DIST  , NO_RATIO                   )
+DEF_STAT(  L1_DELTA_OCCUP_OWNER                        , COUNT , NO_RATIO                   )
+DEF_STAT(  L1_DELTA_OCCUP_BACKUP                       , COUNT , NO_RATIO                   )
+DEF_STAT(  L1_DELTA_OCCUP_UPFILL                       , COUNT , NO_RATIO                   )
+DEF_STAT(  L1_DELTA_OCCUP_UPFILL_HIT                   , COUNT , NO_RATIO                   )
+DEF_STAT(  L1_DELTA_OCCUP_NO_PREF                      , COUNT , NO_RATIO                   )
+DEF_STAT(  L1_DELTA_OCCUP_LATE_PREF                    , DIST  , NO_RATIO                   )
+

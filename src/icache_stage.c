@@ -146,6 +146,62 @@ static inline void icache_record_evict(void) {
     STAT_EVENT(ic->proc_id, ICACHE_EARLY_EVICT);
 }
 
+/* --delta_prio_stats: the L1I half of the per-class accounting. Same three hooks and the same
+   contract as the delta_prio_* helpers in memory.c -- see the chain documentation at the bottom
+   of memory.stat.def -- charged to the ICACHE_DELTA_* chains instead of MLC_/L1_.
+ *
+ * The L1I is where NO_PREF and LATE_PREF are STAMPED, by instr_place_l1i_class at each of the
+ * fills below, so this is the level that answers whether marking a line FDIP could not produce
+ * actually bought it a longer life here. The MLC/LLC chains see those same classes only once the
+ * demotion path has carried them outward.
+ *
+ * NOT the icache_line_info shadow. That cache is kept in lockstep with the icache purely so the
+ * two pick the same victim (see the staging note at the WP_COLLECT_STATS insert); counting its
+ * fills as well would double every number here. */
+static inline void icache_delta_snapshot(Addr addr) {
+  uns occ[DELTA_PRIO_NUM];
+  if (!DELTA_PRIO_STATS || !early_evict_in_roi())
+    return;
+  cache_delta_prio_set_occupancy(&ic->icache, addr, occ);
+  for (uns k = 0; k < DELTA_PRIO_NUM; k++) {
+    if (occ[k])
+      INC_STAT_EVENT(ic->proc_id, ICACHE_DELTA_OCCUP_NONE + k, occ[k]);
+  }
+}
+
+static inline void icache_delta_count_fill(void) {
+  uns8    fill_cls = 0, ev_cls = 0;
+  Counter hits = 0;
+  if (!DELTA_PRIO_STATS || !early_evict_in_roi())
+    return;
+
+  if (cache_last_fill_delta_prio(&ic->icache, &fill_cls) && fill_cls < DELTA_PRIO_NUM)
+    STAT_EVENT(ic->proc_id, ICACHE_DELTA_FILL_NONE + fill_cls);
+
+  if (!cache_last_evict_delta_prio(&ic->icache, &ev_cls, &hits))
+    return;  // the insert took a free way, so nothing was displaced
+  if (ev_cls >= DELTA_PRIO_NUM)
+    return;
+  STAT_EVENT(ic->proc_id, ICACHE_DELTA_EVICT_NONE + ev_cls);
+  INC_STAT_EVENT(ic->proc_id, ICACHE_DELTA_HITS_NONE + ev_cls, hits);
+  if (!hits)
+    STAT_EVENT(ic->proc_id, ICACHE_DELTA_NOREUSE_NONE + ev_cls);
+}
+
+static inline void icache_delta_count_hit(void) {
+  uns8 cls = 0;
+  if (!DELTA_PRIO_STATS || !early_evict_in_roi())
+    return;
+  /* FALSE here is the --perfect_icache case as much as the miss case: that knob synthesizes a hit
+     with INIT_CACHE_DATA_VALUE and no line behind it, so there is no class to charge and the
+     chains deliberately undercount rather than invent one. */
+  if (!cache_last_hit_delta_prio(&ic->icache, &cls))
+    return;
+  if (cls >= DELTA_PRIO_NUM)
+    return;
+  STAT_EVENT(ic->proc_id, ICACHE_DELTA_HIT_NONE + cls);
+}
+
 static inline Flag is_fetch_barrier_op(Op* op) {
   return (op->inst_info->table_info.bar_type & BAR_FETCH) || IS_CALLSYS(&op->inst_info->table_info);
 }
@@ -455,9 +511,11 @@ Inst_Info** lookup_icache() {
       STAT_EVENT(ic->proc_id, L2_IDEAL_FILL_ICACHE);
       // actually bring it into the L1 icache
       Addr dummy_repl_line_addr;
+      icache_delta_snapshot(ic->fetch_addr);  // --delta_prio_stats: before the insert
       line =
           (Inst_Info**)cache_insert(&ic->icache, ic->proc_id, ic->fetch_addr, &dummy_line_addr, &dummy_repl_line_addr);
-      icache_record_evict();  // --early_evict_stats
+      icache_record_evict();      // --early_evict_stats
+      icache_delta_count_fill();  // --delta_prio_stats
       icache_footprint_record(dummy_line_addr);
     } else
       STAT_EVENT(ic->proc_id, L2_IDEAL_MISS_ICACHE);
@@ -1238,8 +1296,10 @@ Flag icache_fill_line(Mem_Req* req)  // cmp FIXME maybe needed to be optimized
     Flag up_vinstr = FALSE;
     uns8 up_vclass = (uns8)DELTA_PRIO_NONE;
     cache_peek_victim(&ic->icache, ic->proc_id, ic->fetch_addr, &up_vaddr, &up_vinstr, &up_vclass);
+    icache_delta_snapshot(ic->fetch_addr);  // --delta_prio_stats: before the insert
     ic->line = (Inst_Info**)cache_insert(&ic->icache, ic->proc_id, ic->fetch_addr, &ic->line_addr, &repl_line_addr);
-    icache_record_evict();  // --early_evict_stats
+    icache_record_evict();      // --early_evict_stats
+    icache_delta_count_fill();  // --delta_prio_stats
     /* --instr_upfill: the line this fill displaced leaves the chip otherwise -- the L1I has no
        writeback path, so an instruction eviction is a silent drop. Demote it to the MLC instead.
        Read after the insert because that is when repl_line_addr is set; the line's data is not
@@ -1334,8 +1394,10 @@ Flag icache_fill_line(Mem_Req* req)  // cmp FIXME maybe needed to be optimized
     Flag pf_vinstr = FALSE;
     uns8 pf_vclass = (uns8)DELTA_PRIO_NONE;
     cache_peek_victim(&ic->icache, ic->proc_id, req->addr, &pf_vaddr, &pf_vinstr, &pf_vclass);
+    icache_delta_snapshot(req->addr);  // --delta_prio_stats: before the insert
     line = (Inst_Info**)cache_insert(&ic->icache, ic->proc_id, req->addr, &dummy_addr, &repl_line_addr);
-    icache_record_evict();  // --early_evict_stats
+    icache_record_evict();      // --early_evict_stats
+    icache_delta_count_fill();  // --delta_prio_stats
     instr_upfill_to_mlc(ic->proc_id, repl_line_addr, pf_vclass); /* --instr_upfill; see above */
     icache_footprint_record(dummy_addr);
 
@@ -1424,9 +1486,11 @@ Inst_Info** ic_pref_cache_access(void) {
   }
 
   if (line) {
+    icache_delta_snapshot(ic->fetch_addr);  // --delta_prio_stats: before the insert
     inserted_line =
         (Inst_Info**)cache_insert(&ic->icache, ic->proc_id, ic->fetch_addr, &ic->line_addr, &repl_line_addr);
-    icache_record_evict();  // --early_evict_stats
+    icache_record_evict();      // --early_evict_stats
+    icache_delta_count_fill();  // --delta_prio_stats
     icache_footprint_record(ic->line_addr);
     DEBUG(ic->proc_id, "ic_pref cache hit:fetch_addr:0x%s \n", hexstr64(ic->fetch_addr));
     STAT_EVENT(ic->proc_id, IC_PREF_MOVE_IC);
@@ -1604,6 +1668,10 @@ static inline void log_stats_ic_miss() {
 static inline void log_stats_ic_hit() {
   STAT_EVENT(ic->proc_id, ICACHE_HIT);
   STAT_EVENT(ic->proc_id, ICACHE_HIT_ONPATH + ic->off_path);
+  /* --delta_prio_stats: the hit lookup_icache just performed, charged to the line's placement
+     class. Reads state published by that cache_access, so it has to stay on the hit path and
+     ahead of any further access to ic->icache. */
+  icache_delta_count_hit();
 }
 
 void log_stats_mshr_hit(Addr line_addr) {

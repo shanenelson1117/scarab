@@ -67,6 +67,8 @@ typedef enum Delta_Prio_enum {
      in flight -- a timeliness failure rather than a prediction one. The front end still stalled,
      just for less than the full latency. */
   DELTA_PRIO_LATE_PREF,
+  /* Sentinel, for sizing the per-class stat chains. Must stay last. */
+  DELTA_PRIO_NUM,
 } Delta_Prio;
 
 typedef enum Repl_Policy_enum {
@@ -188,6 +190,14 @@ typedef struct Cache_Entry_struct {
      of the fill, so an owner never stops being one. DELTA_PRIO_NONE on all data traffic and on
      every line of a cache that neither owns nor backs up the line. */
   uns8 delta_prio;
+
+  /* --delta_prio_stats: hits this line has taken since its fill, for the per-class reuse
+     accounting. A counter of its own rather than a reuse of reuse_seen / reuse_count because
+     those two are gated on --reuse_dist_stats and --load_prio_stats respectively, and the latter
+     is REPL_MLP-only -- while the classes above are produced by --instr_upfill, which is
+     standalone and runs under REPL_TRUE_LRU. Zeroed beside delta_prio in consume_fill_bound, so
+     the count and the class it is attributed to always share one lifetime. */
+  Counter delta_hits;
 
   /* --mlp_lin_store_lambda: does this line carry WRITE traffic? Set when the fill was caused by
      a store (MRT_DSTORE) or was itself a writeback (MRT_WB), and set later by
@@ -562,6 +572,21 @@ typedef struct Cache_struct {
   uns8    last_evict_prio_level;      /* the victim's sticky priority level */
   Counter last_evict_residency_misses; /* its residency, in MISSES to the set */
   Counter last_evict_reuse_count;      /* how many times it was hit before being evicted */
+
+  /* --delta_prio_stats: the placement class (a Delta_Prio) of the line the most recent hit /
+     fill / eviction on this cache touched. Same publish-then-count split as the last_*_prio
+     fields above, but deliberately NOT gated on set_miss_ctr: --instr_upfill and
+     --fdip_delta_place produce these classes under ANY replacement policy, so gating their
+     accounting on the REPL_MLP priority axis would empty it on exactly the standalone
+     configurations it exists to measure. */
+  Flag    last_hit_delta_valid;
+  uns8    last_hit_delta_prio;
+  Flag    last_fill_delta_valid;
+  uns8    last_fill_delta_prio;
+  /* Read under last_evict_valid, like last_evict_reused -- that flag says whether there WAS a
+     victim, these describe it. */
+  uns8    last_evict_delta_prio;
+  Counter last_evict_delta_hits;
 } Cache;
 
 /**************************************************************************************/
@@ -813,6 +838,26 @@ Flag cache_last_fill_prio(Cache* cache, uns8* level);
  * level can raise that level's mean reuse distance purely by keeping hopeless lines resident
  * longer, which shows up as a rising count of reuse_count==0 evictions here and nowhere else. */
 Flag cache_last_evict_prio(Cache* cache, uns8* level, Counter* residency_misses, Counter* reuse_count);
+
+/* --delta_prio_stats: the placement class of the line the last hit / insert / eviction touched.
+ *
+ * Unlike the cache_last_*_prio trio above these work on EVERY cache -- there is no tracking flag
+ * to allocate and no priority axis to require, only a field the insert path already stamps. The
+ * returned Flag therefore means "there was a hit / a fill / a victim", not "this cache is
+ * tracked", and a cache in which nothing sets a class simply reports DELTA_PRIO_NONE throughout.
+ *
+ * cache_last_evict_delta_prio also returns how many hits the victim took, which is what makes a
+ * per-class hit RATE computable: hits/fill for a class is its evicted lines' summed delta_hits
+ * over its evictions, and a victim with delta_hits==0 was never asked for at all. */
+Flag cache_last_hit_delta_prio(Cache* cache, uns8* delta_prio);
+Flag cache_last_fill_delta_prio(Cache* cache, uns8* delta_prio);
+Flag cache_last_evict_delta_prio(Cache* cache, uns8* delta_prio, Counter* hits);
+
+/* --delta_prio_stats: fill `counts` (DELTA_PRIO_NUM entries) with the resident lines of each
+ * placement class in the set `addr` maps to. Valid ways only, so the total is the set's valid
+ * ways and not assoc. Ungated by policy; the caller owns the knob test. Call BEFORE the insert
+ * that is about to displace a line, like cache_load_prio_set_composition. */
+void cache_delta_prio_set_occupancy(Cache* cache, Addr addr, uns* counts);
 
 /* Walk the set `addr` maps to and report what it currently holds. Both are meant to be called at
  * a FILL, before the inserting line has displaced anything, so what they describe is the set the

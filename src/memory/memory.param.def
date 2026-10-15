@@ -1177,6 +1177,77 @@ DEF_PARAM(reuse_dist_stats, REUSE_DIST_STATS, Flag, Flag, FALSE, )
  * a line filled during warmup and hit inside the target window must still carry a level. */
 DEF_PARAM(load_prio_stats, LOAD_PRIO_STATS, Flag, Flag, FALSE, )
 
+/* --delta_prio_stats: per-PLACEMENT-CLASS hit/miss accounting for the L1I, the MLC and the LLC.
+ *
+ * The class is Cache_Entry.delta_prio, a Delta_Prio: NONE, OWNER, BACKUP, UPFILL, UPFILL_HIT,
+ * NO_PREF, LATE_PREF. Those classes are produced by --fdip_delta_place, --instr_upfill and the
+ * two miss-reason lambdas, and until this knob existed each was visible only through a single
+ * fill counter (MLC_NO_PREFETCH_FILL and friends) that said how many arrived and nothing about
+ * whether any of them paid off.
+ *
+ * WORKS UNDER ANY REPLACEMENT POLICY. Unlike --load_prio_stats, which needs REPL_MLP because a
+ * priority level is an index into that policy's boost table, a placement class is stamped by the
+ * insert path itself. --instr_upfill is standalone, so running it under REPL_TRUE_LRU and
+ * measuring it here is the intended baseline, not a degraded mode.
+ *
+ * THE FIVE CHAINS, per cache (MLC_DELTA_*, L1_DELTA_* for the LLC, ICACHE_DELTA_*):
+ *
+ *   FILL_<C>    lines of class C admitted.
+ *   HIT_<C>     accesses that hit a class-C line. Probes (update_repl FALSE: the oracle and
+ *               warmup lookups, --perfect_icache's synthesized hit) are NOT counted -- they are
+ *               not accesses the program issued, and including them would put traffic in the
+ *               numerator of a hit rate that the denominator knows nothing about.
+ *   EVICT_<C>   class-C lines replaced.
+ *   HITS_<C>    those victims' hits, SUMMED. Divided by EVICT_<C> (its ratio column) this is the
+ *               mean number of times a class-C line was used per completed residency, which is
+ *               the number the class exists to move.
+ *   NOREUSE_<C> victims that were never hit at all, as a fraction of EVICT_<C>. Read this BEFORE
+ *               HITS_<C>: a class can raise its mean hits purely by holding a few popular lines
+ *               longer while the rest die untouched, and only NOREUSE separates the two.
+ *   OCCUP_<C>   resident class-C lines, summed once per fill. Divided by the chain's total this
+ *               is the class's share of CAPACITY, which the admission counts cannot give --
+ *               a class can take 2% of fills and hold 40% of the array, or the reverse.
+ *
+ *   HIT + FILL is the natural per-class access denominator: every access that touches a class-C
+ *   line is either the fill that created it or a later hit on it. There is deliberately no
+ *   per-class MISS chain, because a line that is not resident has no class -- "the miss rate of
+ *   class C" is only answerable as 1 - HIT/(HIT+FILL).
+ *
+ * FILL AND EVICT DO NOT BALANCE, and the shortfall is intended. A line can also leave by
+ * --instr_upfill_hit_invalidate, which is not a replacement; those exits are counted separately
+ * as RELEASE_<C>. FILL == EVICT + RELEASE + (still resident at end of run), per class.
+ *
+ * A CLASS IS FILL HISTORY, not a live attribute, with two deliberate exceptions:
+ * cache_promote_upfill moves UPFILL to UPFILL_HIT and cache_mark_delta_owner installs OWNER, so
+ * a line can be FILLed as one class and EVICTed as another. The chains are charged at the moment
+ * each event happens, so that re-labelling shows up as an asymmetry between FILL_UPFILL and
+ * EVICT_UPFILL rather than being hidden.
+ *
+ * COST: four STAT_EVENTs per fill and one per hit, plus one O(assoc) walk per fill for OCCUP --
+ * the same shape and the same cost as --load_prio_stats' occupancy walk. Off by default.
+ *
+ * WHICH CLASSES A RUN CAN ACTUALLY SEE. This knob only reads classes; it does not create them,
+ * and each one needs its own mechanism on:
+ *   OWNER, BACKUP            --fdip_delta_place (BACKUP also needs --fdip_delta_l1i_backup_level)
+ *   UPFILL                   --instr_upfill
+ *   UPFILL_HIT               --instr_upfill plus --instr_upfill_promote_lambda, and NOT
+ *                            --instr_upfill_hit_invalidate -- those two are alternative answers
+ *                            to the same event and instr_upfill_note_hit yields to the release
+ *   NO_PREF                  --instr_nopref_lambda NONZERO
+ *   LATE_PREF                --instr_latepref_lambda NONZERO
+ * The last two are the trap: instr_miss_class self-gates on its lambda, so a run that leaves the
+ * lambda at 0 to measure the classes WITHOUT protecting them will find both chains empty. Set a
+ * small nonzero lambda to label the lines. That is not free of side effects -- the miss class
+ * OVERRIDES the placement class on a fill where both apply -- so it is behaviour-neutral only
+ * when --fdip_delta_place is off. With placement on, a labelling-only run is not available and
+ * the two mechanisms have to be compared at their real lambdas.
+ *
+ * WINDOW: TARGET-ONLY, on the early_evict_in_roi() gate, exactly like --load_prio_stats and
+ * --early_evict_stats. Divide by Periodic_Instructions, NEVER by Cumulative_*. The per-line
+ * delta_hits counter is NOT gated, so a line filled in warmup and hit inside the target window
+ * still reports its hits. */
+DEF_PARAM(delta_prio_stats, DELTA_PRIO_STATS, Flag, Flag, FALSE, )
+
 /* --mlp_cost_stats: accumulate the MLP-based cost of every demand MLC miss, per
  * "A Case for MLP-Aware Cache Replacement" (Qureshi et al., ISCA'06), Algorithm 1.
  *
