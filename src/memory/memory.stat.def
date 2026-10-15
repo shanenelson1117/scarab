@@ -881,6 +881,10 @@ DEF_STAT(  MLC_PREF_FILL,    DIST,  NO_RATIO  )
    both are on. */
 DEF_STAT(  MLC_INSTR_UPFILL_PREF_DECLINE         , COUNT , NO_RATIO  )
 DEF_STAT(  L1_INSTR_UPFILL_PREF_DECLINE          , COUNT , NO_RATIO  )
+/* --instr_upfill_demand_l1i_only: the DEMAND share of the declines above, broken out because the
+   two populations differ by two orders of magnitude and only this one has no prefetch behind it. */
+DEF_STAT(  MLC_INSTR_DEMAND_DECLINE              , COUNT , NO_RATIO  )
+DEF_STAT(  L1_INSTR_DEMAND_DECLINE               , COUNT , NO_RATIO  )
 
 /* --instr_nopref_lambda: MLC fills of a line FDIP never prefetched. Read against
    ICACHE_MISS_NOT_PREFETCHED, which counts the misses this is derived from. */

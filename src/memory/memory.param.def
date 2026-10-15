@@ -584,6 +584,23 @@ DEF_PARAM(instr_upfill, INSTR_UPFILL, Flag, Flag, FALSE, )
    speculative line in the L1I alone, and each L1I eviction would become a trip to memory. */
 DEF_PARAM(instr_upfill_pref_l1i_only, INSTR_UPFILL_PREF_L1I_ONLY, Flag, Flag, FALSE, )
 
+/* --instr_upfill_demand_l1i_only: the same rule for a DEMAND instruction fetch -- it fills the
+   L1I and nothing else. With --instr_upfill_pref_l1i_only this completes the hierarchy: no
+   instruction line enters the MLC or the LLC by a fill at all, and demotion is the only way in,
+   so a line's level is purely how long ago the L1I stopped wanting it.
+
+   Its own knob because the populations are nothing alike -- demand instruction fills are ~0.5%
+   of MLC insertions against ~71% for demotions -- and because these are exactly the lines FDIP
+   could not predict. Declining them removes the last direct route for the one population that
+   has no prefetch behind it, which may well be the wrong trade; it is worth being able to turn
+   off independently.
+
+   Note it also removes the direct application of --instr_nopref_lambda, since that class is
+   applied at a fill. The class still reaches the MLC, but only carried outward by the demotion,
+   so MLC_NO_PREFETCH_FILL goes to zero while the marking keeps working. Requires
+   --instr_upfill. */
+DEF_PARAM(instr_upfill_demand_l1i_only, INSTR_UPFILL_DEMAND_L1I_ONLY, Flag, Flag, FALSE, )
+
 /* --instr_nopref_lambda: boost, in LRU stack positions, for a line FDIP NEVER PREFETCHED.
 
    The icache classifies every demand miss: a prefetch still in flight (timeliness failure), a

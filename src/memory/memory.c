@@ -1989,10 +1989,18 @@ static void instr_upfill_to_llc(uns8 proc_id, Addr line_addr, uns8 carried) {
    REQUIRES --instr_upfill, and is asserted to: without the demotion path, declining these fills
    would mean a prefetched line could never reach the MLC or LLC at all, and every L1I eviction
    would be a trip to memory. */
-static inline Flag instr_upfill_pref_declines(Mem_Req* req) {
-  if (!INSTR_UPFILL_PREF_L1I_ONLY)
-    return FALSE;
-  return mem_req_type_is_instr_prefetch(req->type);
+static inline Flag instr_upfill_l1i_only_declines(Mem_Req* req) {
+  if (INSTR_UPFILL_PREF_L1I_ONLY && mem_req_type_is_instr_prefetch(req->type))
+    return TRUE;
+  /* --instr_upfill_demand_l1i_only: the same treatment for a demand instruction fetch. With both
+     flags on, NO instruction line enters the MLC or the LLC by a fill -- demotion becomes the
+     sole path in, and a line's level is purely a function of how long ago the L1I stopped
+     wanting it. Separate knobs because the two populations differ by two orders of magnitude
+     here (demand instruction fills are 0.48% of MLC insertions) and because declining the demand
+     path removes the last direct route for a line FDIP could not predict. */
+  if (INSTR_UPFILL_DEMAND_L1I_ONLY && req->type == MRT_IFETCH)
+    return TRUE;
+  return FALSE;
 }
 
 
@@ -2119,6 +2127,10 @@ void init_memory() {
   ASSERTM(0, !(INSTR_UPFILL_HIT_INVALIDATE && !INSTR_UPFILL),
           "--instr_upfill_hit_invalidate requires --instr_upfill: releasing the copy on a hit "
           "without a demotion path to put it back would drop the line off the chip\n");
+
+  ASSERTM(0, !(INSTR_UPFILL_DEMAND_L1I_ONLY && !INSTR_UPFILL),
+          "--instr_upfill_demand_l1i_only requires --instr_upfill: without demotion a demand "
+          "instruction line declined by both outer levels could never reach them at all\n");
 
   ASSERTM(0, !(INSTR_UPFILL_PREF_L1I_ONLY && !INSTR_UPFILL),
           "--instr_upfill_pref_l1i_only requires --instr_upfill: without demotion a speculative "
@@ -6258,9 +6270,11 @@ Flag l1_fill_line(Mem_Req* req) {
 
   /* --fdip_delta_place: owned by another level, so the LLC does not allocate it. Same shape and
      the same obligations as the Mockingjay bypass immediately above. */
-  if (instr_place_declines(req, INSTR_PLACE_LLC) || instr_upfill_pref_declines(req)) {
+  if (instr_place_declines(req, INSTR_PLACE_LLC) || instr_upfill_l1i_only_declines(req)) {
     STAT_EVENT(req->proc_id,
-               instr_upfill_pref_declines(req) ? L1_INSTR_UPFILL_PREF_DECLINE : L1_INSTR_PLACE_DECLINE);
+               instr_upfill_l1i_only_declines(req) ? L1_INSTR_UPFILL_PREF_DECLINE : L1_INSTR_PLACE_DECLINE);
+    if (req->type == MRT_IFETCH)
+      STAT_EVENT(req->proc_id, L1_INSTR_DEMAND_DECLINE); /* the demand share of the above */
     req->l1_miss_satisfied = TRUE;
     req->l1_miss_cycle = MAX_CTR;
     if (TRACK_L1_MISS_DEPS || MARK_L1_MISSES)
@@ -6790,9 +6804,11 @@ Flag mlc_fill_line(Mem_Req* req) {
      before get_next_repl_line: no victim may be chosen and no writeback scheduled for a fill
      that is not going to happen. The request still completes and still fills the core-side
      caches, so the only effect is that a later access to this line misses in the MLC. */
-  if (instr_place_declines(req, INSTR_PLACE_MLC) || instr_upfill_pref_declines(req)) {
+  if (instr_place_declines(req, INSTR_PLACE_MLC) || instr_upfill_l1i_only_declines(req)) {
     STAT_EVENT(req->proc_id,
-               instr_upfill_pref_declines(req) ? MLC_INSTR_UPFILL_PREF_DECLINE : MLC_INSTR_PLACE_DECLINE);
+               instr_upfill_l1i_only_declines(req) ? MLC_INSTR_UPFILL_PREF_DECLINE : MLC_INSTR_PLACE_DECLINE);
+    if (req->type == MRT_IFETCH)
+      STAT_EVENT(req->proc_id, MLC_INSTR_DEMAND_DECLINE); /* the demand share of the above */
     ASSERT(req->proc_id, req->mlc_miss_cycle != MAX_CTR);
     ASSERT(req->proc_id, req->mlc_miss);
     mlp_cost_finalize(req); /* declined, but the miss was still paid for */
