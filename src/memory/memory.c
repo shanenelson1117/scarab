@@ -952,6 +952,12 @@ static inline Delta_Prio instr_place_class(Mem_Req* req, Instr_Place level) {
    lives in icache_stage.c, which cannot see the classifier above. The L1I is never a backup --
    backups exist to keep an L1I-owned line somewhere further out -- so this is OWNER or NONE. */
 uns8 instr_place_l1i_class(Mem_Req* req) {
+  /* --fdip_delta_l1i_prio 0: the L1I holds the line but never prioritises it. Returning NONE
+     here is the whole implementation -- the icache stages an empty class, and with no boosted
+     lines its REPL_MLP ordering is exactly recency. Allocation at the MLC and LLC is untouched,
+     because that is decided by instr_place_declines, which never consults this. */
+  if (!FDIP_DELTA_L1I_PRIO)
+    return (uns8)DELTA_PRIO_NONE;
   return (uns8)instr_place_class(req, INSTR_PLACE_L1I);
 }
 

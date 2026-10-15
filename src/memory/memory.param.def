@@ -616,6 +616,25 @@ DEF_PARAM(fdip_delta_lambda, FDIP_DELTA_LAMBDA, float, float, 0.0, )
    down, which is two mechanisms aimed at one population. */
 DEF_PARAM(fdip_delta_unmerged_pref_bypass_llc, FDIP_DELTA_UNMERGED_PREF_BYPASS_LLC, Flag, Flag, FALSE, )
 
+/* --fdip_delta_l1i_prio: does the L1I apply the placement priority, or only hold the line?
+
+     1 (DEFAULT)  the icache runs REPL_MLP so an L1I-owned line takes --fdip_delta_lambda there.
+     0            the icache keeps its ordinary policy and stages no class; placement still
+                  decides ALLOCATION at the MLC and LLC exactly as before, and the L1I still
+                  receives every line. Only the L1I's ordering is left alone.
+
+   WHY YOU WANT 0. The icache is 8-way here, so a lambda at or above 8 makes the boost dominate
+   recency outright: every unboosted line -- which is every timely prefetch, since those are
+   LLC-owned and unprioritised in the L1I -- ranks below every boosted one regardless of age, and
+   is evicted before the demand that would have used it. Measured: ICACHE misses go from 2.45 to
+   ~6.0 per 1K instructions, and that single effect accounts for most of the arm's IPC loss. At
+   lambda 4 (below associativity) the boost biases instead of dominating and the icache stays
+   healthy. This knob removes the risk entirely rather than relying on the lambda staying small.
+
+   It also frees --td_fe_rrip_mark to run alongside placement, since the two no longer contend
+   for the L1I policy. */
+DEF_PARAM(fdip_delta_l1i_prio, FDIP_DELTA_L1I_PRIO, Flag, Flag, TRUE, )
+
 /* --fdip_delta_hit_pins: an unmerged instruction prefetch that HITS a resident line pins that
    line to the level that served it -- it becomes DELTA_PRIO_OWNER there and takes
    --fdip_delta_lambda, on top of the recency update the access already performs.

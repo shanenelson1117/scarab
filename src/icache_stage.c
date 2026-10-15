@@ -185,9 +185,14 @@ void init_icache_stage(uns8 proc_id, const char* name) {
      "LRU, plus a flat bonus for owned lines" -- which is exactly the intended ordering, LRU
      within each priority class. Takes precedence over td_fe_rrip_mark's marked-RRIP, which
      cannot express the boost; setting both is a configuration error rather than a blend. */
-  Repl_Policy icache_repl = FDIP_DELTA_PLACE ? REPL_MLP : (TD_FE_RRIP_MARK ? REPL_MARKED_RRIP : REPL_TRUE_LRU);
-  ASSERTM(proc_id, !(FDIP_DELTA_PLACE && TD_FE_RRIP_MARK),
-          "--fdip_delta_place and --td_fe_rrip_mark both claim the L1I replacement policy\n");
+  /* Only --fdip_delta_l1i_prio makes placement claim the L1I policy. With it off, the icache
+     keeps whatever policy it would otherwise have run, and placement confines itself to
+     allocation at the MLC and LLC -- which also lets td_fe_rrip_mark coexist with the arm. */
+  const Flag delta_owns_l1i = FDIP_DELTA_PLACE && FDIP_DELTA_L1I_PRIO;
+  Repl_Policy icache_repl = delta_owns_l1i ? REPL_MLP : (TD_FE_RRIP_MARK ? REPL_MARKED_RRIP : REPL_TRUE_LRU);
+  ASSERTM(proc_id, !(delta_owns_l1i && TD_FE_RRIP_MARK),
+          "--fdip_delta_place with --fdip_delta_l1i_prio and --td_fe_rrip_mark both claim the L1I "
+          "replacement policy; set --fdip_delta_l1i_prio 0 to run them together\n");
   init_cache(&ic->icache, "ICACHE", ICACHE_SIZE, ICACHE_ASSOC, ICACHE_LINE_SIZE, 0, icache_repl);
 
   /* init icache_line_info struct - this struct keeps data about corresponding
