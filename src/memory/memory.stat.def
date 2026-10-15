@@ -872,7 +872,9 @@ DEF_STAT(  MLC_PREF_FILL,    DIST,  NO_RATIO  )
    elsewhere. */
 /* --instr_upfill: demotions that happened, and the two reasons one did not. PRESENT means the
    next level already had the line, which is the healthy case and not a loss. SKIP_DIRTY is the
-   best-effort give-up: making room would have needed a writeback. Read the two skips against the
+   best-effort give-up, which now means only that the writeback request could not be ALLOCATED --
+   a dirty victim is written back rather than refused, so this should be rare. *_WB counts the
+   writebacks the demotion forced, traffic that would not exist without it. Read the two skips against the
    demotions to know how much of the mechanism the traces actually let you have. */
 /* --instr_upfill_pref_l1i_only: fills a level refused because the line arrived on an instruction
    prefetch. Counted apart from the placement declines so the two mechanisms stay separable when
@@ -883,9 +885,11 @@ DEF_STAT(  L1_INSTR_UPFILL_PREF_DECLINE          , COUNT , NO_RATIO  )
 DEF_STAT(  INSTR_UPFILL_MLC                      , COUNT , NO_RATIO  )
 DEF_STAT(  INSTR_UPFILL_MLC_PRESENT              , COUNT , NO_RATIO  )
 DEF_STAT(  INSTR_UPFILL_MLC_SKIP_DIRTY           , COUNT , NO_RATIO  )
+DEF_STAT(  INSTR_UPFILL_MLC_WB                   , COUNT , NO_RATIO  )
 DEF_STAT(  INSTR_UPFILL_LLC                      , COUNT , NO_RATIO  )
 DEF_STAT(  INSTR_UPFILL_LLC_PRESENT              , COUNT , NO_RATIO  )
 DEF_STAT(  INSTR_UPFILL_LLC_SKIP_DIRTY           , COUNT , NO_RATIO  )
+DEF_STAT(  INSTR_UPFILL_LLC_WB                   , COUNT , NO_RATIO  )
 
 DEF_STAT(  MLC_INSTR_PLACE_DECLINE               , COUNT , NO_RATIO  )
 DEF_STAT(  L1_INSTR_PLACE_DECLINE                , COUNT , NO_RATIO  )
