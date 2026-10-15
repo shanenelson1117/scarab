@@ -600,28 +600,45 @@ static void load_prio_levels_init(Cache* cache) {
   if (!cache->set_miss_ctr)
     return;  /* not tracked; set_miss_ctr is the single enable test */
 
-  /* --mlp_lin_dyn_lambda moves the lambdas while the run is in flight, and the table built just
-     below is an EXACT-MATCH table of the boosts reachable from the lambdas as they are right
-     now. The first fill after the first adjustment would compute a boost that is not in it and
-     die in load_prio_level_of. Refuse the combination here, where the message can say why,
-     instead of 2^20 instructions into the run with an assert about a float not being found. */
-  /* --instr_upfill's two classes add boosts the level table does not enumerate either -- but only
-     when their lambdas are nonzero. A demotion run with both at 0 (the usual standalone
-     measurement) contributes boost 0, which IS in the table, so it stays compatible. */
-  ASSERTM(0, !(INSTR_UPFILL && (INSTR_UPFILL_LAMBDA != 0.0 || INSTR_UPFILL_PROMOTE_LAMBDA != 0.0)),
-          "--load_prio_stats cannot be combined with a nonzero --instr_upfill_lambda or "
-          "--instr_upfill_promote_lambda: the priority level table for cache '%s' enumerates the "
-          "cost and boundness terms only. Run the demotion with both lambdas at 0 to plot levels.\n",
-          cache->name);
+  /* EVERY live PLACEMENT-CLASS lambda adds a third sticky term to the boost, multiplying the
+     reachable combinations past what prio_boost[] enumerates -- 8 costq x 3 bound x 7 classes,
+     against a 24-entry table and 24-wide stat chains. The level half therefore cannot coexist
+     with the delta term.
+   *
+     DECLINED, NOT REFUSED. This used to abort the run, which was the wrong trade: the LEVEL half
+     is what the delta term breaks, while the COMPOSITION half of --load_prio_stats reads only
+     fill_traffic and is perfectly valid alongside it -- and composition is what has to be on to
+     combine with the --delta_prio_stats occupancy chains (see the note at the load_prio_snapshot_set
+     call in instr_upfill_insert). So the level axis switches itself off, the *_PRIO_* chains come
+     out empty, and the run proceeds. prio_num_levels == 0 is already the documented "no priority
+     axis" state that every LRU baseline is in, and every reader handles it.
+   *
+     Listed individually rather than tested through mlp_lin_delta_term so the message can name the
+     knob that did it. Each is self-gating at 0, so a demotion run with all the lambdas at 0 --
+     the usual standalone measurement -- contributes boost 0, which IS in the table, and keeps the
+     level axis. */
+  const Flag delta_term_live = (INSTR_UPFILL && (INSTR_UPFILL_LAMBDA != 0.0 || INSTR_UPFILL_PROMOTE_LAMBDA != 0.0)) ||
+                               FDIP_DELTA_PLACE || INSTR_NOPREF_LAMBDA != 0.0 || INSTR_LATEPREF_LAMBDA != 0.0;
+  if (delta_term_live) {
+    WARNINGU(0,
+             "--load_prio_stats: cache '%s' has a live placement-class lambda "
+             "(--fdip_delta_place %d, --instr_upfill_lambda %f, --instr_upfill_promote_lambda %f, "
+             "--instr_nopref_lambda %f, --instr_latepref_lambda %f), whose boosts the priority "
+             "level table cannot enumerate. The LEVEL half is disabled: every *_PRIO_* chain will "
+             "be empty. The COMPOSITION half (*_COMP_*) is unaffected and still valid, which is "
+             "what --delta_prio_stats needs to be combined with.\n",
+             cache->name, (int)FDIP_DELTA_PLACE, INSTR_UPFILL_LAMBDA, INSTR_UPFILL_PROMOTE_LAMBDA,
+             INSTR_NOPREF_LAMBDA, INSTR_LATEPREF_LAMBDA);
+    return; /* prio_num_levels stays 0; set_miss_ctr stays allocated but publishes nothing */
+  }
 
-  /* --fdip_delta_place adds a third sticky term to the boost, which multiplies the reachable
-     combinations past what prio_boost[] enumerates. Same failure as a moving lambda, same
-     refusal. */
-  ASSERTM(0, !FDIP_DELTA_PLACE,
-          "--load_prio_stats cannot be combined with --fdip_delta_place: the priority level table "
-          "for cache '%s' enumerates boosts over the cost and boundness terms only, and the "
-          "placement bonus produces boosts that are not in it.\n",
-          cache->name);
+  /* --mlp_lin_dyn_lambda moves the lambdas while the run is in flight, and the table built just
+     below is an EXACT-MATCH table of the boosts reachable from the lambdas as they are right now.
+     The first fill after the first adjustment would compute a boost that is not in it and die in
+     load_prio_level_of. A HARD refusal, unlike the placement-class case above, because there is
+     no stable level axis to fall back to: the boosts move for the whole run, so disabling the
+     level half would silently discard the arm's entire reason for existing rather than one
+     auxiliary chain. Refused here, where the message can say why. */
   ASSERTM(0, !MLP_LIN_DYN_INSTR && !MLP_LIN_DYN_DATA,
           "--load_prio_stats cannot be combined with --mlp_lin_dyn_instr / --mlp_lin_dyn_data: "
           "the priority level table for cache '%s' is built once from the lambdas in force at "
@@ -848,7 +865,10 @@ static inline void load_prio_on_hit(Cache* cache, Cache_Entry* line, uns set) {
      to a guard is a 2^64 outlier in the histogram. */
   cache->last_hit_reuse_misses = (now > line->last_access_miss_count) ? now - line->last_access_miss_count : 0;
   cache->last_hit_prio_level = line->prio_level;
-  cache->last_hit_prio_valid = TRUE;
+  /* No level axis (a live placement-class lambda switched it off -- see load_prio_levels_init)
+     means there is no level to charge. Publishing level 0 instead would pile the whole run into
+     PRIO_HIT_L0 and read as a real distribution. */
+  cache->last_hit_prio_valid = cache->prio_num_levels ? TRUE : FALSE;
   line->last_access_miss_count = now;
   line->reuse_count++;
 }
@@ -867,12 +887,15 @@ static inline void stamp_load_prio(Cache* cache, Cache_Entry* line, uns set) {
     cache->last_fill_prio_valid = FALSE;
     return;
   }
-  line->prio_level = load_prio_level_of(cache, mlp_lin_prio_boost(cache, line));
+  /* The lookup is what aborts on an unenumerated boost, so it is skipped entirely when the level
+     axis is off -- the miss clock and reuse counters below are still wanted and are independent
+     of it. */
+  line->prio_level = cache->prio_num_levels ? load_prio_level_of(cache, mlp_lin_prio_boost(cache, line)) : 0;
   line->fill_miss_count = cache->set_miss_ctr[set];
   line->last_access_miss_count = cache->set_miss_ctr[set];
   line->reuse_count = 0;
   cache->last_fill_prio_level = line->prio_level;
-  cache->last_fill_prio_valid = TRUE;
+  cache->last_fill_prio_valid = cache->prio_num_levels ? TRUE : FALSE;
 }
 
 static inline void record_evict_age(Cache* cache, Cache_Entry* victim) {
@@ -980,7 +1003,9 @@ Flag cache_last_fill_prio(Cache* cache, uns8* level) {
    under it are not, so returning TRUE here would hand the caller a level of 0 for every
    eviction. */
 Flag cache_last_evict_prio(Cache* cache, uns8* level, Counter* residency_misses, Counter* reuse_count) {
-  if (!cache->set_miss_ctr || !cache->last_evict_valid)
+  /* prio_num_levels, like the two readers above: with no level axis the victim has no level, and
+     reporting 0 would charge every eviction in the run to PRIO_EVICT_L0. */
+  if (!cache->set_miss_ctr || !cache->prio_num_levels || !cache->last_evict_valid)
     return FALSE;
   *level = cache->last_evict_prio_level;
   *residency_misses = cache->last_evict_residency_misses;
@@ -1009,6 +1034,22 @@ Flag cache_last_evict_delta_prio(Cache* cache, uns8* delta_prio, Counter* hits) 
     return FALSE;
   *delta_prio = cache->last_evict_delta_prio;
   *hits = cache->last_evict_delta_hits;
+  return TRUE;
+}
+
+Flag cache_note_delta_hit(Cache* cache) {
+  Cache_Entry* e = cache->last_hit_entry;
+  if (!e)
+    return FALSE;  // the last access was a miss, or a probe, or this is a second call
+  /* The generation check. valid alone is not enough: the way may have been evicted AND refilled
+     since the hit, in which case it is valid, holds a different line, and incrementing it would
+     charge this reference to the wrong class. base guards the address, fill_cycle the instance. */
+  if (!e->valid || e->fill_cycle != cache->last_hit_entry_fill_cycle || e->base != cache->last_hit_entry_base)
+    return FALSE;
+  e->delta_hits++;
+  /* One reference per published hit. Cleared so a caller that counts the same access twice -- or
+     a retry that reaches here without an intervening cache_access -- cannot charge it again. */
+  cache->last_hit_entry = NULL;
   return TRUE;
 }
 
@@ -1253,6 +1294,9 @@ void init_cache(Cache* cache, const char* name, uns cache_size, uns assoc, uns l
      unwritten byte here would be read as a real class. */
   cache->last_hit_delta_valid = FALSE;
   cache->last_hit_delta_prio = (uns8)DELTA_PRIO_NONE;
+  cache->last_hit_entry = NULL;
+  cache->last_hit_entry_fill_cycle = 0;
+  cache->last_hit_entry_base = 0;
   cache->last_fill_delta_valid = FALSE;
   cache->last_fill_delta_prio = (uns8)DELTA_PRIO_NONE;
   cache->last_evict_delta_prio = (uns8)DELTA_PRIO_NONE;
@@ -1435,6 +1479,7 @@ void* cache_access(Cache* cache, Addr addr, Addr* line_addr, Flag update_repl) {
   cache->last_hit_reuse_valid = FALSE;
   cache->last_hit_prio_valid = FALSE;   // --load_prio_stats
   cache->last_hit_delta_valid = FALSE;  // --delta_prio_stats
+  cache->last_hit_entry = NULL;         // --delta_prio_stats
 
   /* --reuse_dist_stats: count this access against the set BEFORE the lookup, so the distance a
      hit reports includes the hit itself and the minimum distance is 1. Ticked here rather than
@@ -1495,12 +1540,15 @@ void* cache_access(Cache* cache, Addr addr, Addr* line_addr, Flag update_repl) {
         /* --delta_prio_stats: inside the update_repl guard, unlike the last_hit_membound publish
            above. The membound counters are a property of how a resident line was brought in and a
            probe that finds it has genuinely found it; a HIT RATE is not -- the oracle and warmup
-           lookups in memory.c probe the MLC and LLC with update_repl FALSE, and counting those
-           would put accesses in the numerator that the program never issued. Published and
-           counted on one population, so hits/fill divides cleanly. */
-        line->delta_hits++;
+           lookups in memory.c probe the MLC and LLC with update_repl FALSE, and FDIP probes the
+           icache with update_repl TRUE but delivers nothing to the pipeline. Only the HANDLE is
+           published here; the reference itself is charged by cache_note_delta_hit at the counting
+           site, which is past the retry point. */
         cache->last_hit_delta_prio = line->delta_prio;
         cache->last_hit_delta_valid = TRUE;
+        cache->last_hit_entry = line;
+        cache->last_hit_entry_fill_cycle = line->fill_cycle;
+        cache->last_hit_entry_base = line->base;
         update_repl_policy(cache, line, set, ii, FALSE);
         DEBUG(0, "(%s, %d) [0x%x, 0x%x]: in access\n\n", cache->name, cache->repl_policy, cache->num_sets,
               cache->assoc);
@@ -2724,9 +2772,11 @@ void* cache_access_strategy(Cache* cache, Addr addr, Addr* line_addr, Flag updat
            below REPL_VOID and so never reaches this function, while a placement class is stamped
            by every policy's insert path -- including SRRIP, Mockingjay and marked-RRIP, which
            only ever take THIS path. */
-        line->delta_hits++;
         cache->last_hit_delta_prio = line->delta_prio;
         cache->last_hit_delta_valid = TRUE;
+        cache->last_hit_entry = line;
+        cache->last_hit_entry_fill_cycle = line->fill_cycle;
+        cache->last_hit_entry_base = line->base;
         repl_policy_func_table[policy].update_hit(cache, set, ii, NULL);
       }
 

@@ -587,6 +587,25 @@ typedef struct Cache_struct {
      victim, these describe it. */
   uns8    last_evict_delta_prio;
   Counter last_evict_delta_hits;
+
+  /* --delta_prio_stats: a HANDLE on the line the last hit landed on, so delta_hits can be bumped
+     at the counting site rather than inside cache_access.
+   *
+     That deferral is the whole point. cache_access is re-run on retry -- mem_complete_mlc_access
+     and mem_complete_l1_access return FALSE and are driven again on a later cycle whenever the
+     access cannot complete -- so anything incremented there fires once per RETRY, which is the
+     exact hazard the comment beside L1_MEMBOUND_HIT warns about. It also fires on prefetch
+     accesses and on FDIP's icache probe, none of which belong in a reuse count.
+   *
+     A raw pointer is not enough, because between the access and the counting site the hit line
+     can be gone: mem_process_mlc_hit_access runs done_func FIRST, which fills the L1I, which can
+     demote an L1I victim straight back into this cache and evict the very way we hit. So the
+     handle carries the two fields needed to prove identity -- exactly the generation check
+     cache_rrpv_fixup already uses, and for the same reason: a refill restamps fill_cycle, so a
+     way that has turned over cannot be mistaken for the line that was hit. */
+  Cache_Entry* last_hit_entry;
+  Counter      last_hit_entry_fill_cycle;
+  Addr         last_hit_entry_base;
 } Cache;
 
 /**************************************************************************************/
@@ -846,12 +865,23 @@ Flag cache_last_evict_prio(Cache* cache, uns8* level, Counter* residency_misses,
  * returned Flag therefore means "there was a hit / a fill / a victim", not "this cache is
  * tracked", and a cache in which nothing sets a class simply reports DELTA_PRIO_NONE throughout.
  *
- * cache_last_evict_delta_prio also returns how many hits the victim took, which is what makes a
- * per-class hit RATE computable: hits/fill for a class is its evicted lines' summed delta_hits
- * over its evictions, and a victim with delta_hits==0 was never asked for at all. */
+ * cache_last_evict_delta_prio also returns how many DEMAND references the victim took -- the
+ * count cache_note_delta_hit maintains, so the same population the per-class HIT chain counts.
+ * Summed over a class's evictions and divided by them it is mean uses per completed residency,
+ * and a victim with 0 was never asked for at all. It is NOT a hit rate: for that, pair the HIT
+ * chain with the DEMAND-caused fills (the DFILL chains), never with total fills. */
 Flag cache_last_hit_delta_prio(Cache* cache, uns8* delta_prio);
 Flag cache_last_fill_delta_prio(Cache* cache, uns8* delta_prio);
 Flag cache_last_evict_delta_prio(Cache* cache, uns8* delta_prio, Counter* hits);
+
+/* --delta_prio_stats: charge one REFERENCE to the line the last hit landed on.
+ *
+ * Call from the same place, and on the same population, as the per-class HIT chain -- once per
+ * COMPLETED access, past the retry point. Returns FALSE and does nothing when the way has since
+ * turned over (see Cache.last_hit_entry), which is a deliberate undercount of a line that was hit
+ * and then immediately evicted by the demotion its own hit triggered; the alternative is charging
+ * the reference to whatever line took the way, which would be wrong rather than missing. */
+Flag cache_note_delta_hit(Cache* cache);
 
 /* --delta_prio_stats: fill `counts` (DELTA_PRIO_NUM entries) with the resident lines of each
  * placement class in the set `addr` maps to. Valid ways only, so the total is the set's valid

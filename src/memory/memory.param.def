@@ -1190,32 +1190,76 @@ DEF_PARAM(load_prio_stats, LOAD_PRIO_STATS, Flag, Flag, FALSE, )
  * insert path itself. --instr_upfill is standalone, so running it under REPL_TRUE_LRU and
  * measuring it here is the intended baseline, not a degraded mode.
  *
+ * COMBINE WITH --load_prio_stats 1 TO GET THE WHOLE PICTURE OF WHAT THE CACHE HOLDS. That knob's
+ * composition chains (*_COMP_<traffic class>_<n>) and the OCCUP_<class> chains here are two
+ * marginals of the SAME fill-sampled occupancy -- same trigger point, same ROI gate, and since
+ * instr_upfill_insert now drives both walks, the same sample set. Because every delta_prio setter
+ * is instruction-gated, a non-NONE class is an instruction line BY CONSTRUCTION, and the joint
+ * breakdown follows:
+ *     instruction ways        = COMP_ALL_INSTR / SAMPLES
+ *     marked instruction ways = sum(OCCUP_C, C != NONE) / SAMPLES
+ *     unmarked instruction    = instruction - marked        (must be >= 0; a validity check)
+ *     data ways               = OCCUP_NONE / SAMPLES - unmarked instruction
+ *     untagged (OTHER) ways   = sum(OCCUP_*) - sum(COMP over the 6 disjoint classes)
+ * That last line is otherwise unobtainable: OTHER has no chain of its own. And COMP_LOAD + DPREF
+ * + STORE + WB is an INDEPENDENT estimate of the data ways, so the two can be cross-checked.
+ *
+ * ONE CAVEAT ON THE TRAFFIC-CLASS SPLIT: instr_upfill_insert stages demoted lines as
+ * LOAD_PRIO_TC_IFETCH, so under --instr_upfill, COMP_IFETCH at the MLC and LLC is demand ifetch
+ * PLUS demotions and the IFETCH/IPREF split is no longer provenance. COMP_ALL_INSTR is still the
+ * correct total, so the arithmetic above is unaffected -- but do not read that split as
+ * demand-versus-prefetch. Use DFILL for that.
+ *
+ * WHAT COMBINING COSTS: a live placement-class lambda (--fdip_delta_place, --instr_upfill_lambda,
+ * --instr_upfill_promote_lambda, --instr_nopref_lambda, --instr_latepref_lambda) adds a third
+ * sticky term to the REPL_MLP boost, which the priority level table cannot enumerate. On such a
+ * run --load_prio_stats keeps its composition half and DISABLES its level half: every *_PRIO_*
+ * chain comes out empty and a WARNING at init says so. Composition and these chains are
+ * unaffected. With every placement lambda at 0 -- labelling only -- the level half survives.
+ *
  * THE FIVE CHAINS, per cache (MLC_DELTA_*, L1_DELTA_* for the LLC, ICACHE_DELTA_*):
  *
- *   FILL_<C>    lines of class C admitted.
- *   HIT_<C>     accesses that hit a class-C line. Probes (update_repl FALSE: the oracle and
- *               warmup lookups, --perfect_icache's synthesized hit) are NOT counted -- they are
- *               not accesses the program issued, and including them would put traffic in the
- *               numerator of a hit rate that the denominator knows nothing about.
+ *   FILL_<C>    lines of class C admitted, by ANY route -- demand, prefetch or demotion.
+ *   DFILL_<C>   the DEMAND-caused subset of those: the allocating access was MRT_IFETCH,
+ *               MRT_DFETCH or MRT_DSTORE. Exactly the population HIT_<C> counts.
+ *   HIT_<C>     DEMAND accesses that hit a class-C line. The guard is the same three types the
+ *               L1_HIT / MLC_HIT counters use, so these are comparable with them. Prefetch hits
+ *               are NOT here -- read RELEASE_<C> for those. Probes are not here either: the
+ *               oracle and warmup lookups pass update_repl FALSE, --perfect_icache synthesizes a
+ *               hit with no line behind it, and FDIP's icache probe never satisfies a fetch.
  *   EVICT_<C>   class-C lines replaced.
- *   HITS_<C>    those victims' hits, SUMMED. Divided by EVICT_<C> (its ratio column) this is the
- *               mean number of times a class-C line was used per completed residency, which is
- *               the number the class exists to move.
- *   NOREUSE_<C> victims that were never hit at all, as a fraction of EVICT_<C>. Read this BEFORE
- *               HITS_<C>: a class can raise its mean hits purely by holding a few popular lines
+ *   HITS_<C>    those victims' DEMAND references, SUMMED -- same population as HIT_<C>. Divided
+ *               by EVICT_<C> (its ratio column) this is the mean number of times a class-C line
+ *               was used per completed residency.
+ *   NOREUSE_<C> victims never referenced at all, as a fraction of EVICT_<C>. Read this BEFORE
+ *               HITS_<C>: a class can raise its mean purely by holding a few popular lines
  *               longer while the rest die untouched, and only NOREUSE separates the two.
  *   OCCUP_<C>   resident class-C lines, summed once per fill. Divided by the chain's total this
  *               is the class's share of CAPACITY, which the admission counts cannot give --
  *               a class can take 2% of fills and hold 40% of the array, or the reverse.
  *
- *   HIT + FILL is the natural per-class access denominator: every access that touches a class-C
- *   line is either the fill that created it or a later hit on it. There is deliberately no
- *   per-class MISS chain, because a line that is not resident has no class -- "the miss rate of
- *   class C" is only answerable as 1 - HIT/(HIT+FILL).
+ *   THE PER-CLASS DEMAND HIT RATE IS HIT_C / (HIT_C + DFILL_C), NOT HIT_C / (HIT_C + FILL_C).
+ *   FILL_C counts prefetch fills and demotions, which no demand access asked for; pairing it
+ *   with a demand-only numerator mixes populations and understates every class that is mostly
+ *   prefetched -- which, on instruction traffic, is all of them. FILL_C - DFILL_C is the
+ *   speculative-plus-demoted share of admissions and is worth reading on its own.
+ *
+ *   There is deliberately no per-class MISS chain, because a line that is not resident has no
+ *   class -- "the miss rate of class C" is only answerable as 1 - HIT_C/(HIT_C + DFILL_C).
  *
  * FILL AND EVICT DO NOT BALANCE, and the shortfall is intended. A line can also leave by
  * --instr_upfill_hit_invalidate, which is not a replacement; those exits are counted separately
- * as RELEASE_<C>. FILL == EVICT + RELEASE + (still resident at end of run), per class.
+ * as RELEASE_<C>. FILL == EVICT + RELEASE + (still resident at end of run), per class. Check it:
+ * (EVICT_C + RELEASE_C) / FILL_C should sit at 1.00 for every class, and a departure from that
+ * means a route into or out of the level is not hooked.
+ *
+ * RELEASE_<C> / FILL_<C> IS THE PER-CLASS PAYOFF under hit-invalidate, and it is the one reuse
+ * number here that does not depend on delta_hits at all. A released line is one that was asked
+ * for -- by a demand OR a prefetch -- and delivered up to the L1I. Its complement, EVICT_C /
+ * FILL_C, is the share that died in place. Prefer this over HITS/NOREUSE when both are available,
+ * and note that under hit-invalidate NOREUSE_C is 100% for every instruction class BY
+ * CONSTRUCTION: a referenced line leaves through RELEASE, so anything still around to be evicted
+ * was never referenced.
  *
  * A CLASS IS FILL HISTORY, not a live attribute, with two deliberate exceptions:
  * cache_promote_upfill moves UPFILL to UPFILL_HIT and cache_mark_delta_owner installs OWNER, so
@@ -1223,8 +1267,17 @@ DEF_PARAM(load_prio_stats, LOAD_PRIO_STATS, Flag, Flag, FALSE, )
  * each event happens, so that re-labelling shows up as an asymmetry between FILL_UPFILL and
  * EVICT_UPFILL rather than being hidden.
  *
- * COST: four STAT_EVENTs per fill and one per hit, plus one O(assoc) walk per fill for OCCUP --
- * the same shape and the same cost as --load_prio_stats' occupancy walk. Off by default.
+ * COST: up to five STAT_EVENTs per fill and one per hit, plus one O(assoc) walk per fill for
+ * OCCUP -- the same shape and the same cost as --load_prio_stats' occupancy walk. Off by default.
+ *
+ * WHERE THE PER-LINE REFERENCE COUNT IS CHARGED, and why it matters. Cache_Entry.delta_hits is
+ * bumped by cache_note_delta_hit at the COUNTING site, not inside cache_access. cache_access is
+ * re-run on retry (mem_complete_mlc_access / mem_complete_l1_access return FALSE and are driven
+ * again on a later cycle whenever the access cannot complete), so an increment there fires once
+ * per retry -- the same hazard the comment beside L1_MEMBOUND_HIT documents. It would also catch
+ * prefetch accesses and FDIP's icache probe. Deferring it costs one generation check: if the way
+ * turned over between the access and the count (done_func can demote an L1I victim straight back
+ * into this cache), the reference is DROPPED rather than charged to the wrong line.
  *
  * WHICH CLASSES A RUN CAN ACTUALLY SEE. This knob only reads classes; it does not create them,
  * and each one needs its own mechanism on:

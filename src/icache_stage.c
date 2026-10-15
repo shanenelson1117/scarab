@@ -163,20 +163,28 @@ static inline void icache_delta_snapshot(Addr addr) {
   if (!DELTA_PRIO_STATS || !early_evict_in_roi())
     return;
   cache_delta_prio_set_occupancy(&ic->icache, addr, occ);
+  STAT_EVENT(ic->proc_id, ICACHE_DELTA_SAMPLES);
   for (uns k = 0; k < DELTA_PRIO_NUM; k++) {
     if (occ[k])
       INC_STAT_EVENT(ic->proc_id, ICACHE_DELTA_OCCUP_NONE + k, occ[k]);
   }
 }
 
-static inline void icache_delta_count_fill(void) {
+/* `demand` splits out the fills a demand fetch caused, so HIT/(HIT+DFILL) is a ratio of like to
+   like -- see the DFILL chain note in memory.stat.def. On the L1I that is the MRT_IFETCH test: a
+   merged FDIP prefetch keeps its prefetch type across the merge, so it reads as speculative here,
+   which is what it is -- the line was fetched before the demand that later wanted it. */
+static inline void icache_delta_count_fill(Flag demand) {
   uns8    fill_cls = 0, ev_cls = 0;
   Counter hits = 0;
   if (!DELTA_PRIO_STATS || !early_evict_in_roi())
     return;
 
-  if (cache_last_fill_delta_prio(&ic->icache, &fill_cls) && fill_cls < DELTA_PRIO_NUM)
+  if (cache_last_fill_delta_prio(&ic->icache, &fill_cls) && fill_cls < DELTA_PRIO_NUM) {
     STAT_EVENT(ic->proc_id, ICACHE_DELTA_FILL_NONE + fill_cls);
+    if (demand)
+      STAT_EVENT(ic->proc_id, ICACHE_DELTA_DFILL_NONE + fill_cls);
+  }
 
   if (!cache_last_evict_delta_prio(&ic->icache, &ev_cls, &hits))
     return;  // the insert took a free way, so nothing was displaced
@@ -200,6 +208,12 @@ static inline void icache_delta_count_hit(void) {
   if (cls >= DELTA_PRIO_NUM)
     return;
   STAT_EVENT(ic->proc_id, ICACHE_DELTA_HIT_NONE + cls);
+  /* Charge the reference HERE, which is what keeps FDIP out of it. fdip.cc probes the icache with
+     cache_access(..., TRUE) -- update_repl TRUE, so the probe really does promote the line -- but
+     it never reaches log_stats_ic_hit, because no fetch was satisfied. A probe that moves LRU and
+     delivers nothing to the pipeline is not a use of the line, and counting it would inflate every
+     class's references by the whole FDIP probe-hit population. */
+  cache_note_delta_hit(&ic->icache);
 }
 
 static inline Flag is_fetch_barrier_op(Op* op) {
@@ -514,8 +528,8 @@ Inst_Info** lookup_icache() {
       icache_delta_snapshot(ic->fetch_addr);  // --delta_prio_stats: before the insert
       line =
           (Inst_Info**)cache_insert(&ic->icache, ic->proc_id, ic->fetch_addr, &dummy_line_addr, &dummy_repl_line_addr);
-      icache_record_evict();      // --early_evict_stats
-      icache_delta_count_fill();  // --delta_prio_stats
+      icache_record_evict();          // --early_evict_stats
+      icache_delta_count_fill(TRUE);  // --delta_prio_stats: driven by the demand fetch that missed
       icache_footprint_record(dummy_line_addr);
     } else
       STAT_EVENT(ic->proc_id, L2_IDEAL_MISS_ICACHE);
@@ -1298,8 +1312,8 @@ Flag icache_fill_line(Mem_Req* req)  // cmp FIXME maybe needed to be optimized
     cache_peek_victim(&ic->icache, ic->proc_id, ic->fetch_addr, &up_vaddr, &up_vinstr, &up_vclass);
     icache_delta_snapshot(ic->fetch_addr);  // --delta_prio_stats: before the insert
     ic->line = (Inst_Info**)cache_insert(&ic->icache, ic->proc_id, ic->fetch_addr, &ic->line_addr, &repl_line_addr);
-    icache_record_evict();      // --early_evict_stats
-    icache_delta_count_fill();  // --delta_prio_stats
+    icache_record_evict();                                       // --early_evict_stats
+    icache_delta_count_fill(req->type == MRT_IFETCH);             // --delta_prio_stats
     /* --instr_upfill: the line this fill displaced leaves the chip otherwise -- the L1I has no
        writeback path, so an instruction eviction is a silent drop. Demote it to the MLC instead.
        Read after the insert because that is when repl_line_addr is set; the line's data is not
@@ -1396,8 +1410,8 @@ Flag icache_fill_line(Mem_Req* req)  // cmp FIXME maybe needed to be optimized
     cache_peek_victim(&ic->icache, ic->proc_id, req->addr, &pf_vaddr, &pf_vinstr, &pf_vclass);
     icache_delta_snapshot(req->addr);  // --delta_prio_stats: before the insert
     line = (Inst_Info**)cache_insert(&ic->icache, ic->proc_id, req->addr, &dummy_addr, &repl_line_addr);
-    icache_record_evict();      // --early_evict_stats
-    icache_delta_count_fill();  // --delta_prio_stats
+    icache_record_evict();                            // --early_evict_stats
+    icache_delta_count_fill(req->type == MRT_IFETCH);  // --delta_prio_stats
     instr_upfill_to_mlc(ic->proc_id, repl_line_addr, pf_vclass); /* --instr_upfill; see above */
     icache_footprint_record(dummy_addr);
 
@@ -1489,8 +1503,8 @@ Inst_Info** ic_pref_cache_access(void) {
     icache_delta_snapshot(ic->fetch_addr);  // --delta_prio_stats: before the insert
     inserted_line =
         (Inst_Info**)cache_insert(&ic->icache, ic->proc_id, ic->fetch_addr, &ic->line_addr, &repl_line_addr);
-    icache_record_evict();      // --early_evict_stats
-    icache_delta_count_fill();  // --delta_prio_stats
+    icache_record_evict();          // --early_evict_stats
+    icache_delta_count_fill(TRUE);  // --delta_prio_stats: a fetch lookup promoted this line
     icache_footprint_record(ic->line_addr);
     DEBUG(ic->proc_id, "ic_pref cache hit:fetch_addr:0x%s \n", hexstr64(ic->fetch_addr));
     STAT_EVENT(ic->proc_id, IC_PREF_MOVE_IC);

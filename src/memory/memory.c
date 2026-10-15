@@ -647,20 +647,36 @@ static inline void delta_prio_count_hit(uns8 proc_id, Cache* cache, Flag is_mlc)
   if (cls >= DELTA_PRIO_NUM)
     return;
   STAT_EVENT(proc_id, (is_mlc ? MLC_DELTA_HIT_NONE : L1_DELTA_HIT_NONE) + cls);
+  /* Charge the reference to the LINE here too, not in cache_access. This site runs once per
+     completed access, so a retried access -- which re-runs cache_access -- cannot bump it twice,
+     and the population is identical to the HIT chain above. */
+  cache_note_delta_hit(cache);
 }
 
 /* The fill just made and the line it displaced, on their own classes -- the arriving line and its
    victim are counted independently for the same reason load_prio_count_fill does it: the question
    is which classes displace which. Call immediately after the insert, inside the same validity
    window as the *_EARLY_EVICT read. */
-static inline void delta_prio_count_fill(uns8 proc_id, Cache* cache, Flag is_mlc) {
+/* Was the access that caused this fill a demand? EXACTLY the three types the HIT chains are
+   guarded on (see the L1_HIT / MLC_HIT blocks), so DFILL and HIT share one population and the
+   per-class demand hit rate HIT/(HIT+DFILL) is a ratio of like to like. A merged instruction
+   prefetch reads as a PREFETCH here, because req->type stays MRT_FDIPPRFON across the merge --
+   op is NULL for ifetch, so the type promotion in mem_req_match_reqbuf never runs for it. */
+static inline Flag delta_prio_is_demand(Mem_Req* req) {
+  return req->type == MRT_IFETCH || req->type == MRT_DFETCH || req->type == MRT_DSTORE;
+}
+
+static inline void delta_prio_count_fill(uns8 proc_id, Cache* cache, Flag is_mlc, Flag demand) {
   uns8    fill_cls = 0, ev_cls = 0;
   Counter hits = 0;
   if (!DELTA_PRIO_STATS || !early_evict_in_roi())
     return;
 
-  if (cache_last_fill_delta_prio(cache, &fill_cls) && fill_cls < DELTA_PRIO_NUM)
+  if (cache_last_fill_delta_prio(cache, &fill_cls) && fill_cls < DELTA_PRIO_NUM) {
     STAT_EVENT(proc_id, (is_mlc ? MLC_DELTA_FILL_NONE : L1_DELTA_FILL_NONE) + fill_cls);
+    if (demand)
+      STAT_EVENT(proc_id, (is_mlc ? MLC_DELTA_DFILL_NONE : L1_DELTA_DFILL_NONE) + fill_cls);
+  }
 
   if (!cache_last_evict_delta_prio(cache, &ev_cls, &hits))
     return;  // the insert took a free way, so nothing was displaced
@@ -682,6 +698,7 @@ static inline void delta_prio_snapshot_set(uns8 proc_id, Cache* cache, Addr addr
   if (!DELTA_PRIO_STATS || !early_evict_in_roi())
     return;
   cache_delta_prio_set_occupancy(cache, addr, occ);
+  STAT_EVENT(proc_id, is_mlc ? MLC_DELTA_SAMPLES : L1_DELTA_SAMPLES);
   const int base = is_mlc ? MLC_DELTA_OCCUP_NONE : L1_DELTA_OCCUP_NONE;
   for (uns k = 0; k < DELTA_PRIO_NUM; k++) {
     if (occ[k])
@@ -1974,9 +1991,24 @@ static inline void instr_upfill_insert(Cache* cache, uns8 proc_id, Addr line_add
      and can evict, so it is counted on the same footing as the ordinary fill paths -- without
      this the arrivals that the whole mechanism exists to create are counted nowhere. */
   delta_prio_snapshot_set(proc_id, cache, line_addr, is_mlc);
+  /* --load_prio_stats: the composition walk samples HERE TOO, and it must, for two reasons.
+     First on its own terms: a demotion is a fill, and leaving it out biased the composition
+     chains away from exactly the sets the demotion mechanism touches.
+     Second, and the reason it is load-bearing: the two walks are only combinable while they
+     share one sample set. OCCUP_<class> and COMP_<traffic class> are two marginals of the SAME
+     fill-sampled occupancy, which is what lets
+         unmarked instruction ways = COMP_ALL_INSTR - sum(non-NONE OCCUP classes)
+         data ways                 = OCCUP_NONE - unmarked instruction ways
+     be derived at all -- every non-NONE class is instruction traffic by construction, since
+     every delta_prio setter is instruction-gated. Sampling one walk on demotions and not the
+     other silently put the two on different denominators and made that arithmetic wrong. */
+  load_prio_snapshot_set(proc_id, cache, line_addr, is_mlc);
   L1_Data* data = (L1_Data*)cache_insert(cache, proc_id, line_addr, &ins_line_addr, &repl_line_addr);
   cache_restore_fill_stage(&saved);
-  delta_prio_count_fill(proc_id, cache, is_mlc);
+  /* FALSE: a demotion is not a demand fill. No access asked for this line -- the level below
+     stopped wanting it. Counting it as one would put the whole demoted population into the
+     denominator of a demand hit rate. */
+  delta_prio_count_fill(proc_id, cache, is_mlc, FALSE);
 
   /* INITIALISE THE PAYLOAD. cache_insert allocates the way and returns its data area, but does
      NOT clear it -- as mlc_fill_line puts it, "the data area still contains values from the
@@ -6775,7 +6807,7 @@ Flag l1_fill_line(Mem_Req* req) {
      validity window as the two reads above -- before any further insert on this cache. */
   load_prio_count_fill(req->proc_id, &L1(req->proc_id)->cache, FALSE);
   /* --delta_prio_stats: same fill, same victim, same window, keyed on placement class. */
-  delta_prio_count_fill(req->proc_id, &L1(req->proc_id)->cache, FALSE);
+  delta_prio_count_fill(req->proc_id, &L1(req->proc_id)->cache, FALSE, delta_prio_is_demand(req));
 
   /* --td_load_rrip_fixup: record where this fill landed, for the correction at window close. */
   td_rrip_fixup_record(l1_fixup_op, TD_RRIP_FIXUP_L1, line_addr, l1_fix_depth, l1_fix_thresh, l1_fix_basic);
@@ -7347,7 +7379,7 @@ Flag mlc_fill_line(Mem_Req* req) {
   /* --load_prio_stats: see the matching call in the L1 fill. */
   load_prio_count_fill(req->proc_id, &MLC(req->proc_id)->cache, TRUE);
   /* --delta_prio_stats: see the matching call in l1_fill_line. */
-  delta_prio_count_fill(req->proc_id, &MLC(req->proc_id)->cache, TRUE);
+  delta_prio_count_fill(req->proc_id, &MLC(req->proc_id)->cache, TRUE, delta_prio_is_demand(req));
 
   /* --td_load_rrip_fixup: the line is in now, so its fill_cycle is this cycle. `line_addr` is
      the one the insert above reported for THIS cache, which is what the correction must look
@@ -7698,7 +7730,7 @@ L1_Data* l1_pref_cache_access(Mem_Req* req) {
     /* --load_prio_stats: same population, same reason. */
     load_prio_count_fill(req->proc_id, &L1(req->proc_id)->cache, FALSE);
     /* --delta_prio_stats: same population, same reason. */
-    delta_prio_count_fill(req->proc_id, &L1(req->proc_id)->cache, FALSE);
+    delta_prio_count_fill(req->proc_id, &L1(req->proc_id)->cache, FALSE, delta_prio_is_demand(req));
 
     STAT_EVENT(req->proc_id, L1_DATA_EVICT);
     STAT_EVENT(req->proc_id, L1_PREF_MOVE_L1);

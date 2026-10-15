@@ -4790,15 +4790,28 @@ DEF_STAT(  L1_COMP_ALL_DATA_NONLOAD_16               , DIST  , NO_RATIO         
    empty -- that is the control, not a bug.
 
    WHAT DIVIDES INTO WHAT:
-     per-class hit rate      = HIT_C / (HIT_C + FILL_C)
+     demand hit rate         = HIT_C / (HIT_C + DFILL_C)   <-- DFILL, never FILL; see below
+     per-class payoff        = RELEASE_C / FILL_C          (asked for and pulled up to the L1I)
+     died-in-place share     = EVICT_C / FILL_C
      mean uses per residency = HITS_C / EVICT_C          (its ratio column)
      never-used share        = NOREUSE_C / EVICT_C       (its ratio column)
      share of capacity       = OCCUP_C / sum(OCCUP_*)    (its DIST column)
      share of admissions     = FILL_C  / sum(FILL_*)     (its DIST column)
+     speculative admissions  = FILL_C - DFILL_C
+
+   HIT_C / (HIT_C + FILL_C) IS NOT A HIT RATE. HIT_C is demand-only (it shares the L1_HIT /
+   MLC_HIT guard) while FILL_C counts prefetch fills and demotions too, so the two are different
+   populations. Use DFILL_C, which is the demand-caused subset of FILL_C and therefore the
+   matching denominator.
 
    FILL_C does NOT equal EVICT_C + NOREUSE_C or anything like it. The exits are
    EVICT_C + RELEASE_C + still-resident; RELEASE is --instr_upfill_hit_invalidate, which removes
-   a line without replacing it and is therefore not an eviction.
+   a line without replacing it and is therefore not an eviction. Use
+   (EVICT_C + RELEASE_C) / FILL_C == 1.00 as the validity check on these chains.
+
+   UNDER --instr_upfill_hit_invalidate, NOREUSE_C IS 100% FOR EVERY INSTRUCTION CLASS BY
+   CONSTRUCTION, and that is not a finding. A referenced line is released on the spot, so the only
+   lines left to be evicted are the ones nothing ever asked for. Read RELEASE_C / FILL_C instead.
 
    FILL AND EVICT CAN DISAGREE ON CLASS FOR THE SAME LINE, deliberately. cache_promote_upfill
    relabels UPFILL as UPFILL_HIT and cache_mark_delta_owner installs OWNER, both after the fill,
@@ -4814,6 +4827,15 @@ DEF_STAT(  L1_COMP_ALL_DATA_NONLOAD_16               , DIST  , NO_RATIO         
    Periodic_Instructions, never by Cumulative_*. */
 /**************************************************************************************/
 
+/* The number of fill-sampled sets each OCCUP chain was accumulated over -- one event per call of
+   the occupancy walk. OCCUP_C / SAMPLES is the MEAN NUMBER OF WAYS class C held in a sampled set,
+   directly comparable against associativity, where OCCUP_C / sum(OCCUP_*) only gives a share.
+   Without this the chain cannot be converted to ways except by borrowing a denominator from the
+   --load_prio_stats composition chains, which requires that knob to be on. */
+DEF_STAT(  ICACHE_DELTA_SAMPLES                        , COUNT , NO_RATIO                   )
+DEF_STAT(  MLC_DELTA_SAMPLES                           , COUNT , NO_RATIO                   )
+DEF_STAT(  L1_DELTA_SAMPLES                            , COUNT , NO_RATIO                   )
+
 /* ---------- L1I ---------- */
 /* Lines of each class ADMITTED. The DIST column is the class's share of admissions. */
 DEF_STAT(  ICACHE_DELTA_FILL_NONE                      , DIST  , NO_RATIO                   )
@@ -4823,6 +4845,20 @@ DEF_STAT(  ICACHE_DELTA_FILL_UPFILL                    , COUNT , NO_RATIO       
 DEF_STAT(  ICACHE_DELTA_FILL_UPFILL_HIT                , COUNT , NO_RATIO                   )
 DEF_STAT(  ICACHE_DELTA_FILL_NO_PREF                   , COUNT , NO_RATIO                   )
 DEF_STAT(  ICACHE_DELTA_FILL_LATE_PREF                 , DIST  , NO_RATIO                   )
+
+/* The DEMAND-caused subset of the fills above: the access that allocated the line was an
+   MRT_IFETCH / MRT_DFETCH / MRT_DSTORE. EXACTLY the population the HIT chain counts, which is
+   what makes a per-class demand hit rate computable: HIT_C / (HIT_C + DFILL_C). Do NOT put
+   FILL_C in that denominator -- it includes prefetch fills and demotions, which no demand
+   access asked for, so the ratio would mix populations. FILL_C - DFILL_C is the speculative
+   and demoted share of admissions, which is its own useful number. */
+DEF_STAT(  ICACHE_DELTA_DFILL_NONE                     , DIST  , NO_RATIO                   )
+DEF_STAT(  ICACHE_DELTA_DFILL_OWNER                    , COUNT , NO_RATIO                   )
+DEF_STAT(  ICACHE_DELTA_DFILL_BACKUP                   , COUNT , NO_RATIO                   )
+DEF_STAT(  ICACHE_DELTA_DFILL_UPFILL                   , COUNT , NO_RATIO                   )
+DEF_STAT(  ICACHE_DELTA_DFILL_UPFILL_HIT               , COUNT , NO_RATIO                   )
+DEF_STAT(  ICACHE_DELTA_DFILL_NO_PREF                  , COUNT , NO_RATIO                   )
+DEF_STAT(  ICACHE_DELTA_DFILL_LATE_PREF                , DIST  , NO_RATIO                   )
 
 /* Accesses that HIT a line of each class. Demand/prefetch accesses only -- no probes. */
 DEF_STAT(  ICACHE_DELTA_HIT_NONE                       , DIST  , NO_RATIO                   )
@@ -4896,6 +4932,20 @@ DEF_STAT(  MLC_DELTA_FILL_UPFILL_HIT                   , COUNT , NO_RATIO       
 DEF_STAT(  MLC_DELTA_FILL_NO_PREF                      , COUNT , NO_RATIO                   )
 DEF_STAT(  MLC_DELTA_FILL_LATE_PREF                    , DIST  , NO_RATIO                   )
 
+/* The DEMAND-caused subset of the fills above: the access that allocated the line was an
+   MRT_IFETCH / MRT_DFETCH / MRT_DSTORE. EXACTLY the population the HIT chain counts, which is
+   what makes a per-class demand hit rate computable: HIT_C / (HIT_C + DFILL_C). Do NOT put
+   FILL_C in that denominator -- it includes prefetch fills and demotions, which no demand
+   access asked for, so the ratio would mix populations. FILL_C - DFILL_C is the speculative
+   and demoted share of admissions, which is its own useful number. */
+DEF_STAT(  MLC_DELTA_DFILL_NONE                        , DIST  , NO_RATIO                   )
+DEF_STAT(  MLC_DELTA_DFILL_OWNER                       , COUNT , NO_RATIO                   )
+DEF_STAT(  MLC_DELTA_DFILL_BACKUP                      , COUNT , NO_RATIO                   )
+DEF_STAT(  MLC_DELTA_DFILL_UPFILL                      , COUNT , NO_RATIO                   )
+DEF_STAT(  MLC_DELTA_DFILL_UPFILL_HIT                  , COUNT , NO_RATIO                   )
+DEF_STAT(  MLC_DELTA_DFILL_NO_PREF                     , COUNT , NO_RATIO                   )
+DEF_STAT(  MLC_DELTA_DFILL_LATE_PREF                   , DIST  , NO_RATIO                   )
+
 /* Accesses that HIT a line of each class. Demand/prefetch accesses only -- no probes. */
 DEF_STAT(  MLC_DELTA_HIT_NONE                          , DIST  , NO_RATIO                   )
 DEF_STAT(  MLC_DELTA_HIT_OWNER                         , COUNT , NO_RATIO                   )
@@ -4967,6 +5017,20 @@ DEF_STAT(  L1_DELTA_FILL_UPFILL                        , COUNT , NO_RATIO       
 DEF_STAT(  L1_DELTA_FILL_UPFILL_HIT                    , COUNT , NO_RATIO                   )
 DEF_STAT(  L1_DELTA_FILL_NO_PREF                       , COUNT , NO_RATIO                   )
 DEF_STAT(  L1_DELTA_FILL_LATE_PREF                     , DIST  , NO_RATIO                   )
+
+/* The DEMAND-caused subset of the fills above: the access that allocated the line was an
+   MRT_IFETCH / MRT_DFETCH / MRT_DSTORE. EXACTLY the population the HIT chain counts, which is
+   what makes a per-class demand hit rate computable: HIT_C / (HIT_C + DFILL_C). Do NOT put
+   FILL_C in that denominator -- it includes prefetch fills and demotions, which no demand
+   access asked for, so the ratio would mix populations. FILL_C - DFILL_C is the speculative
+   and demoted share of admissions, which is its own useful number. */
+DEF_STAT(  L1_DELTA_DFILL_NONE                         , DIST  , NO_RATIO                   )
+DEF_STAT(  L1_DELTA_DFILL_OWNER                        , COUNT , NO_RATIO                   )
+DEF_STAT(  L1_DELTA_DFILL_BACKUP                       , COUNT , NO_RATIO                   )
+DEF_STAT(  L1_DELTA_DFILL_UPFILL                       , COUNT , NO_RATIO                   )
+DEF_STAT(  L1_DELTA_DFILL_UPFILL_HIT                   , COUNT , NO_RATIO                   )
+DEF_STAT(  L1_DELTA_DFILL_NO_PREF                      , COUNT , NO_RATIO                   )
+DEF_STAT(  L1_DELTA_DFILL_LATE_PREF                    , DIST  , NO_RATIO                   )
 
 /* Accesses that HIT a line of each class. Demand/prefetch accesses only -- no probes. */
 DEF_STAT(  L1_DELTA_HIT_NONE                           , DIST  , NO_RATIO                   )
