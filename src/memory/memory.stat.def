@@ -886,6 +886,11 @@ DEF_STAT(  INSTR_UPFILL_MLC                      , COUNT , NO_RATIO  )
 DEF_STAT(  INSTR_UPFILL_MLC_PRESENT              , COUNT , NO_RATIO  )
 DEF_STAT(  INSTR_UPFILL_MLC_SKIP_DIRTY           , COUNT , NO_RATIO  )
 DEF_STAT(  INSTR_UPFILL_MLC_WB                   , COUNT , NO_RATIO  )
+/* --instr_upfill_hit_invalidate: copies released because the line was delivered up to the L1I.
+   Read against INSTR_UPFILL_*_PRESENT: with the release on, a demotion should rarely find the
+   line still resident, because the hit that brought it up removed it. */
+DEF_STAT(  INSTR_UPFILL_MLC_HIT_RELEASE          , COUNT , NO_RATIO  )
+DEF_STAT(  L1_INSTR_UPFILL_HIT_RELEASE           , COUNT , NO_RATIO  )
 DEF_STAT(  INSTR_UPFILL_LLC                      , COUNT , NO_RATIO  )
 DEF_STAT(  INSTR_UPFILL_LLC_PRESENT              , COUNT , NO_RATIO  )
 DEF_STAT(  INSTR_UPFILL_LLC_SKIP_DIRTY           , COUNT , NO_RATIO  )

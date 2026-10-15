@@ -584,6 +584,26 @@ DEF_PARAM(instr_upfill, INSTR_UPFILL, Flag, Flag, FALSE, )
    speculative line in the L1I alone, and each L1I eviction would become a trip to memory. */
 DEF_PARAM(instr_upfill_pref_l1i_only, INSTR_UPFILL_PREF_L1I_ONLY, Flag, Flag, FALSE, )
 
+/* --instr_upfill_hit_invalidate: when an instruction request HITS in the MLC or the LLC and the
+   line is delivered to the L1I, that level RELEASES its copy.
+
+   The line moved up. Under an exclusive hierarchy it should exist at exactly one level, and a
+   copy left behind holds a way for a line that is resident closer to the core and cannot be
+   needed from here until the L1I evicts it -- at which point the demotion path puts it back.
+   Without this, a prefetch hit leaves a duplicate AND (under --instr_upfill_promote_lambda)
+   pins it, which spends MLC capacity on lines the icache already has.
+
+   This is the other half of --instr_upfill_pref_l1i_only. That flag stops a line entering the
+   outer levels on the way IN; this one stops it lingering there on the way BACK UP. Together the
+   level a line occupies is exactly "how long ago the L1I stopped wanting it".
+
+   Supersedes --instr_upfill_promote_lambda: with the copy released there is nothing left to
+   promote, so the promotion is skipped rather than applied to a line about to disappear.
+
+   Releases only on CONFIRMED delivery (the hit access returned TRUE; a retry would otherwise ask
+   for a line that had just been destroyed) and never a dirty line. Requires --instr_upfill. */
+DEF_PARAM(instr_upfill_hit_invalidate, INSTR_UPFILL_HIT_INVALIDATE, Flag, Flag, FALSE, )
+
 /* Boost for a demoted line, in LRU stack positions. 0 (the default) is the honest starting point:
    a line that was just evicted has no claim on protection. REPL_MLP only. */
 DEF_PARAM(instr_upfill_lambda, INSTR_UPFILL_LAMBDA, float, float, 0.0, )

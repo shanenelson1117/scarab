@@ -997,7 +997,37 @@ static inline Flag instr_place_declines(Mem_Req* req, Instr_Place level) {
 static inline void instr_upfill_note_hit(Cache* cache, Mem_Req* req) {
   if (!INSTR_UPFILL || !mem_req_type_is_instr_prefetch(req->type))
     return;
+  /* With --instr_upfill_hit_invalidate the copy here is about to be released, so promoting it
+     would set a class on a line that is seconds from being invalidated. The two are alternative
+     answers to the same event and only one can be in force. */
+  if (INSTR_UPFILL_HIT_INVALIDATE)
+    return;
   cache_promote_upfill(cache, req->addr);
+}
+
+/* --instr_upfill_hit_invalidate: an instruction request HIT here and the line has now been
+   delivered to the L1I, so this level releases its copy. The line moved UP; under an exclusive
+   hierarchy it should exist at exactly one level, and keeping a copy here would hold a way for a
+   line that is resident closer to the core and cannot be needed from here until the L1I evicts
+   it -- at which point the demotion path puts it back.
+ *
+ * ONLY ON CONFIRMED DELIVERY. Called from the branch where the hit access returned TRUE: if it
+ * had returned FALSE the access is retried next cycle, and invalidating first would destroy the
+ * only copy of a line the retry is about to ask for.
+ *
+ * NEVER A DIRTY LINE. Instruction lines are clean by construction, so this costs nothing in the
+ * ordinary case -- but if an instruction fetch ever hits a line carrying modified data, dropping
+ * it would lose that data. Guarded rather than assumed. */
+static inline void instr_upfill_hit_release(Cache* cache, Mem_Req* req, void* line_data) {
+  Addr     dummy = 0;
+  L1_Data* d = (L1_Data*)line_data;
+  if (!INSTR_UPFILL || !INSTR_UPFILL_HIT_INVALIDATE)
+    return;
+  if (!mem_req_type_is_instr(req->type))
+    return; /* only traffic that actually delivers the line to the L1I */
+  if (!d || d->dirty)
+    return;
+  cache_invalidate(cache, req->addr, &dummy);
 }
 
 
@@ -2035,6 +2065,10 @@ void init_memory() {
      instruction line in the L1I alone: declined by both outer levels on the way in, and with no
      way to reach them on the way out. Every L1I eviction would then be a trip to memory. Refuse
      the combination here rather than let it read as a catastrophic policy result. */
+  ASSERTM(0, !(INSTR_UPFILL_HIT_INVALIDATE && !INSTR_UPFILL),
+          "--instr_upfill_hit_invalidate requires --instr_upfill: releasing the copy on a hit "
+          "without a demotion path to put it back would drop the line off the chip\n");
+
   ASSERTM(0, !(INSTR_UPFILL_PREF_L1I_ONLY && !INSTR_UPFILL),
           "--instr_upfill_pref_l1i_only requires --instr_upfill: without demotion a speculative "
           "line declined by the MLC and LLC can never reach them at all\n");
@@ -3554,6 +3588,11 @@ static Flag mem_complete_l1_access(Mem_Req* req, Mem_Queue_Entry* l1_queue_entry
     if (!l1_hit_access)
       access_done = FALSE;
     else {
+      /* --instr_upfill_hit_invalidate: see the MLC counterpart. */
+      if (INSTR_UPFILL_HIT_INVALIDATE && INSTR_UPFILL && mem_req_type_is_instr(req->type) && data && !data->dirty) {
+        instr_upfill_hit_release(&L1(req->proc_id)->cache, req, data);
+        STAT_EVENT(req->proc_id, L1_INSTR_UPFILL_HIT_RELEASE);
+      }
       if (!PREF_ORACLE_TRAIN_ON &&
           ((req->type == MRT_DFETCH) || (req->type == MRT_DSTORE) || (PREF_I_TOGETHER && req->type == MRT_IFETCH) ||
            (PREF_TRAIN_ON_PREF_MISSES && req->type == MRT_DPRF))) {
@@ -3779,6 +3818,11 @@ static Flag mem_complete_mlc_access(Mem_Req* req, Mem_Queue_Entry* mlc_queue_ent
     if (!mlc_hit_access) {
       return FALSE;
     } else {
+      /* --instr_upfill_hit_invalidate: delivery is confirmed here, so release the MLC copy. */
+      if (INSTR_UPFILL_HIT_INVALIDATE && INSTR_UPFILL && mem_req_type_is_instr(req->type) && data && !data->dirty) {
+        instr_upfill_hit_release(&MLC(req->proc_id)->cache, req, data);
+        STAT_EVENT(req->proc_id, INSTR_UPFILL_MLC_HIT_RELEASE);
+      }
       if (!PREF_ORACLE_TRAIN_ON &&
           ((req->type == MRT_DFETCH) || (req->type == MRT_DSTORE) || (PREF_I_TOGETHER && req->type == MRT_IFETCH) ||
            (PREF_TRAIN_ON_PREF_MISSES && req->type == MRT_DPRF))) {
