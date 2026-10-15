@@ -1088,6 +1088,34 @@ static void instr_upfill_to_llc(uns8 proc_id, Addr line_addr) {
   STAT_EVENT(proc_id, INSTR_UPFILL_LLC);
 }
 
+/* --instr_upfill_pref_l1i_only: an instruction PREFETCH fills the L1I and nothing else. Both
+   outer levels decline it, whether it was served by memory, by the LLC, or (vacuously) by the
+   MLC -- so a prefetched line enters the shared hierarchy ONLY by being demoted into it.
+
+   This is what makes the hierarchy exclusive BY RECENCY for prefetched instruction traffic: a
+   line sits in the L1I while it is being used, drops to the MLC when the L1I stops wanting it,
+   and to the LLC when the MLC does. Its level then means "how long ago was this last useful",
+   which a fill-on-miss hierarchy cannot express, because a prefetch deposits a copy at every
+   level the moment it is speculated about -- before anything has used it even once.
+
+   EVERY PREFETCH, MERGED OR NOT. The merge bit says a demand was waiting, which is a fact about
+   one access; it says nothing about how long the line stays useful, and that is what level is
+   supposed to encode here. A late prefetch therefore takes the same route as a timely one: into
+   the L1I, and outward only as the L1I stops wanting it.
+
+   DEMAND-CREATED requests are untouched and fill normally. Those are the lines FDIP failed to
+   predict at all, so there is no prefetch history to place them by -- and they are rare, about
+   1.5% of MLC instruction traffic on these traces.
+
+   REQUIRES --instr_upfill, and is asserted to: without the demotion path, declining these fills
+   would mean a prefetched line could never reach the MLC or LLC at all, and every L1I eviction
+   would be a trip to memory. */
+static inline Flag instr_upfill_pref_declines(Mem_Req* req) {
+  if (!INSTR_UPFILL_PREF_L1I_ONLY)
+    return FALSE;
+  return mem_req_type_is_instr_prefetch(req->type);
+}
+
 /* --instr_upfill: an FDIP prefetch hit a line somewhere. If that line is a demoted one, this is
    the ask that promotes it out of the demoted class -- the line is no longer "evicted once and
    not wanted since". Applies to instruction prefetches of every kind, merged or not: the evidence
@@ -1972,6 +2000,14 @@ void init_memory() {
   /* --mlp_lin_bound_signal: an out-of-range value would fall back to MEMBOUND inside
      membound_classify_fill, i.e. a typo would silently run the control arm and look like a real
      data point. Reject it here instead. */
+  /* --instr_upfill_pref_l1i_only without the demotion path would strand every speculative
+     instruction line in the L1I alone: declined by both outer levels on the way in, and with no
+     way to reach them on the way out. Every L1I eviction would then be a trip to memory. Refuse
+     the combination here rather than let it read as a catastrophic policy result. */
+  ASSERTM(0, !(INSTR_UPFILL_PREF_L1I_ONLY && !INSTR_UPFILL),
+          "--instr_upfill_pref_l1i_only requires --instr_upfill: without demotion a speculative "
+          "line declined by the MLC and LLC can never reach them at all\n");
+
   ASSERTM(0, MLP_LIN_BOUND_SIGNAL < NUM_BOUND_SIGNALS,
           "--mlp_lin_bound_signal %u is out of range; valid values are 0 (MEMBOUND, the default), "
           "1 (FU0) and 2 (FU_WAIT). See the Bound_Signal enum in memory.h.\n",
@@ -6092,8 +6128,9 @@ Flag l1_fill_line(Mem_Req* req) {
 
   /* --fdip_delta_place: owned by another level, so the LLC does not allocate it. Same shape and
      the same obligations as the Mockingjay bypass immediately above. */
-  if (instr_place_declines(req, INSTR_PLACE_LLC)) {
-    STAT_EVENT(req->proc_id, L1_INSTR_PLACE_DECLINE);
+  if (instr_place_declines(req, INSTR_PLACE_LLC) || instr_upfill_pref_declines(req)) {
+    STAT_EVENT(req->proc_id,
+               instr_upfill_pref_declines(req) ? L1_INSTR_UPFILL_PREF_DECLINE : L1_INSTR_PLACE_DECLINE);
     req->l1_miss_satisfied = TRUE;
     req->l1_miss_cycle = MAX_CTR;
     if (TRACK_L1_MISS_DEPS || MARK_L1_MISSES)
@@ -6623,8 +6660,9 @@ Flag mlc_fill_line(Mem_Req* req) {
      before get_next_repl_line: no victim may be chosen and no writeback scheduled for a fill
      that is not going to happen. The request still completes and still fills the core-side
      caches, so the only effect is that a later access to this line misses in the MLC. */
-  if (instr_place_declines(req, INSTR_PLACE_MLC)) {
-    STAT_EVENT(req->proc_id, MLC_INSTR_PLACE_DECLINE);
+  if (instr_place_declines(req, INSTR_PLACE_MLC) || instr_upfill_pref_declines(req)) {
+    STAT_EVENT(req->proc_id,
+               instr_upfill_pref_declines(req) ? MLC_INSTR_UPFILL_PREF_DECLINE : MLC_INSTR_PLACE_DECLINE);
     ASSERT(req->proc_id, req->mlc_miss_cycle != MAX_CTR);
     ASSERT(req->proc_id, req->mlc_miss);
     mlp_cost_finalize(req); /* declined, but the miss was still paid for */

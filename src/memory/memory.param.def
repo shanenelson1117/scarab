@@ -567,6 +567,23 @@ DEF_PARAM(mlp_lin_dyn_step, MLP_LIN_DYN_STEP, float, float, 1.0, )
    feedback the lead-time rule never had: evidence about the line rather than about one fill. */
 DEF_PARAM(instr_upfill, INSTR_UPFILL, Flag, Flag, FALSE, )
 
+/* --instr_upfill_pref_l1i_only: an instruction PREFETCH fills the L1I and NOTHING else; the MLC
+   and the LLC both decline it. Prefetched lines then enter the shared hierarchy only by
+   demotion, which is what makes a line's LEVEL mean "how recently was it useful" rather than
+   "how recently was it speculated about". A fill-on-miss hierarchy cannot express that: a
+   prefetch plants a copy at every level before anything has used the line once.
+
+   APPLIES TO EVERY INSTRUCTION PREFETCH, merged or not. Whether a demand was waiting is a fact
+   about one access, not about how long the line stays useful -- so a late prefetch takes the
+   same route as a timely one, in via the L1I and outward by demotion.
+
+   DEMAND-CREATED fetches are unaffected and fill normally. Those are the lines FDIP failed to
+   predict at all, and they are only ~1.5% of MLC instruction traffic on these traces.
+
+   Requires --instr_upfill (asserted at init). Without the demotion path this would strand every
+   speculative line in the L1I alone, and each L1I eviction would become a trip to memory. */
+DEF_PARAM(instr_upfill_pref_l1i_only, INSTR_UPFILL_PREF_L1I_ONLY, Flag, Flag, FALSE, )
+
 /* Boost for a demoted line, in LRU stack positions. 0 (the default) is the honest starting point:
    a line that was just evicted has no claim on protection. REPL_MLP only. */
 DEF_PARAM(instr_upfill_lambda, INSTR_UPFILL_LAMBDA, float, float, 0.0, )
