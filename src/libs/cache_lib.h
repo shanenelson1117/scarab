@@ -59,6 +59,14 @@ typedef enum Delta_Prio_enum {
   /* ... and an FDIP prefetch has since hit it here, which is the ask that promotes it:
      --instr_upfill_promote_lambda. */
   DELTA_PRIO_UPFILL_HIT,
+  /* --instr_nopref_lambda: FDIP never prefetched this line, so its miss was paid in full. Its own
+     class because the evidence is of a different kind from the others here -- not where the line
+     came from or how long it had been wanted, but that the prefetcher could not produce it. */
+  DELTA_PRIO_NO_PREF,
+  /* --instr_latepref_lambda: a prefetch WAS issued for this line but the demand caught it still
+     in flight -- a timeliness failure rather than a prediction one. The front end still stalled,
+     just for less than the full latency. */
+  DELTA_PRIO_LATE_PREF,
 } Delta_Prio;
 
 typedef enum Repl_Policy_enum {
@@ -651,7 +659,8 @@ void cache_set_next_fill_instr(Flag is_instr);
    and not cache_access to probe from inside another access. */
 Flag cache_line_present(Cache* cache, Addr addr);
 
-Flag cache_peek_victim(Cache* cache, uns8 proc_id, Addr addr, Addr* victim_addr, Flag* victim_is_instr);
+Flag cache_peek_victim(Cache* cache, uns8 proc_id, Addr addr, Addr* victim_addr, Flag* victim_is_instr,
+                       uns8* victim_delta_prio);
 
 /* --instr_upfill: an FDIP prefetch hit a resident DEMOTED line here, so it stops being a demoted
    line and becomes one worth protecting. Promotes DELTA_PRIO_UPFILL to DELTA_PRIO_UPFILL_HIT and

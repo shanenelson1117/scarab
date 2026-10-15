@@ -882,6 +882,11 @@ DEF_STAT(  MLC_PREF_FILL,    DIST,  NO_RATIO  )
 DEF_STAT(  MLC_INSTR_UPFILL_PREF_DECLINE         , COUNT , NO_RATIO  )
 DEF_STAT(  L1_INSTR_UPFILL_PREF_DECLINE          , COUNT , NO_RATIO  )
 
+/* --instr_nopref_lambda: MLC fills of a line FDIP never prefetched. Read against
+   ICACHE_MISS_NOT_PREFETCHED, which counts the misses this is derived from. */
+DEF_STAT(  MLC_NO_PREFETCH_FILL                  , COUNT , NO_RATIO  )
+DEF_STAT(  MLC_LATE_PREFETCH_FILL                , COUNT , NO_RATIO  )
+
 DEF_STAT(  INSTR_UPFILL_MLC                      , COUNT , NO_RATIO  )
 DEF_STAT(  INSTR_UPFILL_MLC_PRESENT              , COUNT , NO_RATIO  )
 DEF_STAT(  INSTR_UPFILL_MLC_SKIP_DIRTY           , COUNT , NO_RATIO  )

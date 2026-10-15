@@ -310,7 +310,8 @@ Flag cache_line_present(Cache* cache, Addr addr) {
   return FALSE;
 }
 
-Flag cache_peek_victim(Cache* cache, uns8 proc_id, Addr addr, Addr* victim_addr, Flag* victim_is_instr) {
+Flag cache_peek_victim(Cache* cache, uns8 proc_id, Addr addr, Addr* victim_addr, Flag* victim_is_instr,
+                       uns8* victim_delta_prio) {
   Addr line_tag = 0, line_addr = 0;
   uns  way = 0;
   const uns set = cache_index(cache, addr, &line_tag, &line_addr);
@@ -323,6 +324,11 @@ Flag cache_peek_victim(Cache* cache, uns8 proc_id, Addr addr, Addr* victim_addr,
     *victim_addr = victim->base;
   if (victim_is_instr)
     *victim_is_instr = victim->instr_line;
+  /* --instr_nopref_lambda: the victim's class, so a demotion can CARRY it to the next level
+     instead of resetting the line to "merely demoted". Read here because after the insert that
+     displaces it the entry describes a different line. */
+  if (victim_delta_prio)
+    *victim_delta_prio = victim->delta_prio;
   return TRUE;
 }
 
@@ -538,6 +544,10 @@ static inline double mlp_lin_delta_term(const Cache_Entry* entry) {
       return (double)INSTR_UPFILL_LAMBDA;
     case DELTA_PRIO_UPFILL_HIT:
       return (double)INSTR_UPFILL_PROMOTE_LAMBDA;
+    case DELTA_PRIO_NO_PREF:
+      return (double)INSTR_NOPREF_LAMBDA;
+    case DELTA_PRIO_LATE_PREF:
+      return (double)INSTR_LATEPREF_LAMBDA;
     default:
       return 0.0;
   }

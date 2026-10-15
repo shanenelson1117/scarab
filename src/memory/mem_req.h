@@ -120,6 +120,12 @@ struct Mem_Req_struct {
      arriving in the same cycle the prefetch was sent is a legitimate zero-lead merge. Written
      once, at the first merge, in mem_adjust_matching_request. */
   Counter instr_merge_delta;
+
+  /* --instr_nopref_lambda: FDIP never prefetched this line -- the icache miss that created this
+     request was classified IMISS_NOT_PREFETCHED, i.e. a prediction failure rather than a
+     timeliness or capacity failure. Staged by the icache before new_mem_req and consumed at the
+     fill, because the reason is known at the MISS and the class is applied at the FILL. */
+  Flag fdip_no_prefetch;
   struct Mem_Queue_struct* queue;      /* Pointer to the queue this entry is in */
   Counter priority;                    /* priority of the miss */
   Addr addr;                           /* address to fetch */

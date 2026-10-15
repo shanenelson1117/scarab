@@ -951,15 +951,45 @@ static inline Delta_Prio instr_place_class(Mem_Req* req, Instr_Place level) {
 /* --fdip_delta_place: the class the L1I holds this line as. Exported because the icache fill
    lives in icache_stage.c, which cannot see the classifier above. The L1I is never a backup --
    backups exist to keep an L1I-owned line somewhere further out -- so this is OWNER or NONE. */
+/* --instr_nopref_lambda: the class this fill carries, which is DELTA_PRIO_NO_PREF when FDIP
+   never prefetched the line and `base` otherwise.
+
+   TAKES PRECEDENCE over the placement class on the fills where both could apply. They answer
+   different questions -- placement asks which level should own the line, this asks whether the
+   prefetcher failed on it -- but a line carries one class, and "the prefetcher cannot produce
+   this line" is the stronger statement: it will be a full-cost miss again next time, whereas a
+   placement class only predicts where the line is cheapest to keep.
+
+   Self-gating on the lambda, like the --mlp_lin_* terms: at 0 the class is never applied, so a
+   run that does not ask for this term is bit-identical to one built without it. */
+static inline uns8 instr_miss_class(Mem_Req* req, uns8 base) {
+  /* A PREDICTION failure: FDIP never produced the line, so the miss was paid in full. */
+  if (INSTR_NOPREF_LAMBDA != 0.0 && req->fdip_no_prefetch)
+    return (uns8)DELTA_PRIO_NO_PREF;
+  /* A TIMELINESS failure: a prefetch existed but the demand caught it in flight. The request was
+     created by the prefetch and carries the MRT_IFETCH bit because a demand merged into it --
+     the same test the lead-time classifier uses, and the only evidence of lateness available at
+     a fill. Mutually exclusive with the case above: a demand-created request has no prefetch to
+     have been late, and a prefetch-created one is never a prediction failure. */
+  if (INSTR_LATEPREF_LAMBDA != 0.0 && mem_req_type_is_instr_prefetch(req->type) &&
+      mem_req_is_type(req, MRT_IFETCH))
+    return (uns8)DELTA_PRIO_LATE_PREF;
+  return base;
+}
+
+/* Also applies the no-prefetch class, so an icache line REMEMBERS that FDIP could not produce
+   it and the demotion can carry that outward. Harmless to the icache's own ordering under any
+   policy that does not read delta_prio, which is every policy but REPL_MLP. */
 uns8 instr_place_l1i_class(Mem_Req* req) {
   /* --fdip_delta_l1i_prio 0: the L1I holds the line but never prioritises it. Returning NONE
      here is the whole implementation -- the icache stages an empty class, and with no boosted
      lines its REPL_MLP ordering is exactly recency. Allocation at the MLC and LLC is untouched,
      because that is decided by instr_place_declines, which never consults this. */
   if (!FDIP_DELTA_L1I_PRIO)
-    return (uns8)DELTA_PRIO_NONE;
-  return (uns8)instr_place_class(req, INSTR_PLACE_L1I);
+    return instr_miss_class(req, (uns8)DELTA_PRIO_NONE);
+  return instr_miss_class(req, (uns8)instr_place_class(req, INSTR_PLACE_L1I));
 }
+
 
 /* --fdip_delta_hit_pins: should a HIT by this request pin the line to the level that served it?
    Only for an instruction prefetch with no demand waiting on it -- the case placement otherwise
@@ -1036,6 +1066,15 @@ static inline void instr_upfill_hit_release(Cache* cache, Mem_Req* req, void* li
 
 FILE* l1_plot_file;
 FILE* mem_plot_file;
+/* --instr_nopref_lambda: one-shot, set by the icache between classifying a miss and issuing the
+   request for it. A global rather than a parameter because new_mem_req's signature is shared by
+   every requester and only this one path has the information. */
+static Flag g_next_req_no_prefetch = FALSE;
+
+void mem_set_next_req_no_prefetch(Flag no_prefetch) {
+  g_next_req_no_prefetch = no_prefetch;
+}
+
 static Counter order_num = 1;
 Counter mem_seq_num = 1;
 static Counter l1_seq_num = 1;
@@ -1812,17 +1851,28 @@ static Flag new_mem_l1_wb_req(Mem_Req_Type type, uns8 proc_id, Addr addr, uns si
  * stages its own class, inserts, and restores -- which is exactly what cache_save_fill_stage and
  * friends exist for. Without that, a demotion mid-fill would eat the cost and boundness values the
  * real fill had staged and leave the filled line carrying zeros. */
-static void instr_upfill_to_llc(uns8 proc_id, Addr line_addr);
+static void instr_upfill_to_llc(uns8 proc_id, Addr line_addr, uns8 carried);
 
 /* Install `line_addr` into `cache` as a demoted line. The caller has already established that the
    line is absent and that displacing the victim is acceptable. */
-static inline void instr_upfill_insert(Cache* cache, uns8 proc_id, Addr line_addr) {
+/* --instr_nopref_lambda: which class a demoted line arrives with. A line FDIP could not prefetch
+   KEEPS that class as it moves outward, because the fact travels with the line, not with the
+   level: wherever it ends up, the next miss on it will again be one no prefetch covered. Any
+   other class becomes DELTA_PRIO_UPFILL -- having been evicted is a property of this demotion,
+   not something inherited. */
+static inline uns8 instr_upfill_carry(uns8 carried) {
+  if (carried == (uns8)DELTA_PRIO_NO_PREF || carried == (uns8)DELTA_PRIO_LATE_PREF)
+    return carried;
+  return (uns8)DELTA_PRIO_UPFILL;
+}
+
+static inline void instr_upfill_insert(Cache* cache, uns8 proc_id, Addr line_addr, uns8 carried) {
   Cache_Fill_Stage saved;
   Addr             ins_line_addr = 0, repl_line_addr = 0;
   cache_save_fill_stage(&saved);
   cache_clear_fill_stage();
   cache_set_next_fill_instr(TRUE);
-  cache_set_next_fill_delta_prio(DELTA_PRIO_UPFILL);
+  cache_set_next_fill_delta_prio(instr_upfill_carry(carried));
   L1_Data* data = (L1_Data*)cache_insert(cache, proc_id, line_addr, &ins_line_addr, &repl_line_addr);
   cache_restore_fill_stage(&saved);
 
@@ -1843,7 +1893,7 @@ static inline void instr_upfill_insert(Cache* cache, uns8 proc_id, Addr line_add
 }
 
 /* Demote an L1I victim into the MLC. */
-void instr_upfill_to_mlc(uns8 proc_id, Addr line_addr) {
+void instr_upfill_to_mlc(uns8 proc_id, Addr line_addr, uns8 carried) {
   Addr      victim_addr = 0;
   Flag      victim_is_instr = FALSE;
   MLC_Data* victim = NULL;
@@ -1852,7 +1902,7 @@ void instr_upfill_to_mlc(uns8 proc_id, Addr line_addr) {
   if (!INSTR_UPFILL || !line_addr)
     return;
   if (!MLC_PRESENT) {
-    instr_upfill_to_llc(proc_id, line_addr); /* no MLC to land in; the LLC is the next level out */
+    instr_upfill_to_llc(proc_id, line_addr, carried); /* no MLC to land in; LLC is next */
     return;
   }
   Cache* mlc = &MLC(proc_id)->cache;
@@ -1883,14 +1933,15 @@ void instr_upfill_to_mlc(uns8 proc_id, Addr line_addr) {
   /* Cascade BEFORE the insert, while the victim is still readable: if the line we are about to
      displace is itself an instruction line, it gets the same treatment one level out. Bounded at
      two levels, because the LLC demotes to nothing. */
-  if (cache_peek_victim(mlc, proc_id, line_addr, &victim_addr, &victim_is_instr) && victim_is_instr)
-    instr_upfill_to_llc(proc_id, victim_addr);
-  instr_upfill_insert(mlc, proc_id, line_addr);
+  uns8 victim_class = (uns8)DELTA_PRIO_NONE;
+  if (cache_peek_victim(mlc, proc_id, line_addr, &victim_addr, &victim_is_instr, &victim_class) && victim_is_instr)
+    instr_upfill_to_llc(proc_id, victim_addr, victim_class); /* carries its class one level further */
+  instr_upfill_insert(mlc, proc_id, line_addr, carried);
   STAT_EVENT(proc_id, INSTR_UPFILL_MLC);
 }
 
 /* Demote an MLC victim into the LLC. */
-static void instr_upfill_to_llc(uns8 proc_id, Addr line_addr) {
+static void instr_upfill_to_llc(uns8 proc_id, Addr line_addr, uns8 carried) {
   Addr     victim_addr = 0;
   L1_Data* victim = NULL;
   Flag     victim_valid = FALSE;
@@ -1912,7 +1963,7 @@ static void instr_upfill_to_llc(uns8 proc_id, Addr line_addr) {
     STAT_EVENT(proc_id, INSTR_UPFILL_LLC_WB);
     STAT_EVENT(proc_id, L1_FILL_DIRTY);
   }
-  instr_upfill_insert(llc, proc_id, line_addr);
+  instr_upfill_insert(llc, proc_id, line_addr, carried);
   STAT_EVENT(proc_id, INSTR_UPFILL_LLC);
 }
 
@@ -5370,6 +5421,10 @@ static void mem_init_new_req(Mem_Req* new_req, Mem_Req_Type type, Mem_Queue_Type
   new_req->types = 0;
   new_req->emitted_cycle = cycle_count;
   new_req->instr_merge_delta = 0;
+  /* --instr_nopref_lambda: consume the one-shot the icache staged for this miss. Cleared here so
+     the next request cannot inherit it -- every other creation path leaves it FALSE. */
+  new_req->fdip_no_prefetch = g_next_req_no_prefetch;
+  g_next_req_no_prefetch = FALSE;
   if (type == MRT_IFETCH) {
     new_req->demand_icache_emitted_cycle = cycle_count;
     new_req->fdip_emitted_cycle = 0;
@@ -6474,7 +6529,7 @@ Flag l1_fill_line(Mem_Req* req) {
        its backup -- anything else returned above. Staged unconditionally so the class never
        goes stale on a fill placement is not steering (arm off, or data traffic), where it is
        DELTA_PRIO_NONE. */
-    cache_set_next_fill_delta_prio(instr_place_class(req, INSTR_PLACE_LLC));
+    cache_set_next_fill_delta_prio(instr_miss_class(req, (uns8)instr_place_class(req, INSTR_PLACE_LLC)));
     /* --instr_upfill: remember what kind of line this is, so a later eviction knows whether to
        demote it. Staged on every fill, with no knob, because the eviction that reads it may
        happen in a run where only the demotion is enabled. */
@@ -6823,9 +6878,11 @@ Flag mlc_fill_line(Mem_Req* req) {
   if (INSTR_UPFILL) {
     Addr up_victim = 0;
     Flag up_is_instr = FALSE;
-    if (cache_peek_victim(&MLC(req->proc_id)->cache, req->proc_id, req->addr, &up_victim, &up_is_instr) &&
+    uns8 up_class = (uns8)DELTA_PRIO_NONE;
+    if (cache_peek_victim(&MLC(req->proc_id)->cache, req->proc_id, req->addr, &up_victim, &up_is_instr,
+                          &up_class) &&
         up_is_instr)
-      instr_upfill_to_llc(req->proc_id, up_victim);
+      instr_upfill_to_llc(req->proc_id, up_victim, up_class);
   }
 
   data = (MLC_Data*)get_next_repl_line(&MLC(req->proc_id)->cache, req->proc_id, req->addr, &repl_line_addr,
@@ -7019,8 +7076,12 @@ Flag mlc_fill_line(Mem_Req* req) {
        its backup -- anything else returned above. Staged unconditionally so the class never
        goes stale on a fill placement is not steering (arm off, or data traffic), where it is
        DELTA_PRIO_NONE. */
-    cache_set_next_fill_delta_prio(instr_place_class(req, INSTR_PLACE_MLC));
+    cache_set_next_fill_delta_prio(instr_miss_class(req, (uns8)instr_place_class(req, INSTR_PLACE_MLC)));
     cache_set_next_fill_instr(mem_req_type_is_instr(req->type)); /* --instr_upfill; see the LLC fill */
+    if (req->fdip_no_prefetch)
+      STAT_EVENT(req->proc_id, MLC_NO_PREFETCH_FILL);
+    if (mem_req_type_is_instr_prefetch(req->type) && mem_req_is_type(req, MRT_IFETCH))
+      STAT_EVENT(req->proc_id, MLC_LATE_PREFETCH_FILL);
     /* --mlp_lin_store_lambda: write traffic. A store miss, or a writeback which by definition
        carries modified data. A writeback that HITS an already-resident line is handled
        separately by cache_mark_written, since that happens long after the fill. */

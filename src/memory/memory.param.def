@@ -584,6 +584,40 @@ DEF_PARAM(instr_upfill, INSTR_UPFILL, Flag, Flag, FALSE, )
    speculative line in the L1I alone, and each L1I eviction would become a trip to memory. */
 DEF_PARAM(instr_upfill_pref_l1i_only, INSTR_UPFILL_PREF_L1I_ONLY, Flag, Flag, FALSE, )
 
+/* --instr_nopref_lambda: boost, in LRU stack positions, for a line FDIP NEVER PREFETCHED.
+
+   The icache classifies every demand miss: a prefetch still in flight (timeliness failure), a
+   prefetch that arrived and was evicted too early (capacity failure), or no prefetch at all
+   (IMISS_NOT_PREFETCHED -- a PREDICTION failure). Only the last says the prefetcher could not
+   produce the line, and those misses are the ones no amount of prefetch tuning will remove: the
+   front end pays the full latency every time, with nothing hiding it.
+
+   That makes them the lines most worth keeping close. Everything else in this file protects
+   lines by where they came from or how long they stayed wanted; this protects them by the
+   prefetcher's demonstrated inability to cover them.
+
+   ON-PATH ONLY -- an off-path miss is not a failure to predict, it is a path that should not
+   have been fetched. REPL_MLP only, like the other lambdas, and 0 (the default) means the class
+   is never even applied, so a run without it is bit-identical to one built without the term. */
+DEF_PARAM(instr_nopref_lambda, INSTR_NOPREF_LAMBDA, float, float, 0.0, )
+
+/* --instr_latepref_lambda: boost for a line whose prefetch was UNTIMELY -- issued, but still in
+   flight when the demand arrived. The companion to --instr_nopref_lambda, and the other half of
+   the icache's miss classification: that one is a PREDICTION failure, this is a TIMELINESS one.
+
+   Both stalled the front end, so both are worth keeping close, but they are separate lambdas
+   because the populations differ by an order of magnitude on these traces (late prefetches are
+   ~1.7 icache misses per 1K instructions against ~0.3 never-prefetched) and because the remedies
+   differ: a late prefetch becomes timely if the line is simply nearer next time, while a line
+   FDIP cannot predict will cost full latency however close it is kept.
+
+   Detected at the fill as "prefetch-created request carrying the MRT_IFETCH bit" -- a demand
+   merged into it, which is exactly what being caught in flight means. Mutually exclusive with
+   the no-prefetch class. Carried outward by --instr_upfill demotions, which matters because
+   --instr_upfill_pref_l1i_only declines these fills at the MLC: the class is applied at the L1I
+   and travels out with the line. REPL_MLP only; 0 (the default) never applies the class. */
+DEF_PARAM(instr_latepref_lambda, INSTR_LATEPREF_LAMBDA, float, float, 0.0, )
+
 /* --instr_upfill_hit_invalidate: when an instruction request HITS in the MLC or the LLC and the
    line is delivered to the L1I, that level RELEASES its copy.
 

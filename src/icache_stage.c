@@ -512,6 +512,9 @@ Flag mem_req_on_icache_miss() {
       ASSERTM(ic->proc_id, ic->line_addr, "ic fetch addr: %llu\n", ic->fetch_addr);
     ASSERT_PROC_ID_IN_ADDR(ic->proc_id, ic->line_addr)
     Flag success = FALSE;
+    /* --instr_nopref_lambda: hand the classification to the request this miss is about to
+       create, so the fill can mark the line with it. */
+    mem_set_next_req_no_prefetch(ic->miss_not_prefetched);
     success = new_mem_req(MRT_IFETCH, ic->proc_id, ic->line_addr, ICACHE_LINE_SIZE, 0, NULL, instr_fill_line,
                           unique_count, 0);
     if (success) {  // CMP maybe unique_count_per_core[proc_id]?
@@ -1228,13 +1231,20 @@ Flag icache_fill_line(Mem_Req* req)  // cmp FIXME maybe needed to be optimized
       }
       cache_set_marked_next_insert(td_fe_have_rrpv, td_fe_rrpv);
     }
+    /* --instr_nopref_lambda: read the victim's class BEFORE the insert overwrites the way, so
+       the demotion below can carry it outward. Afterwards the entry describes the line just
+       filled, not the one evicted. */
+    Addr up_vaddr = 0;
+    Flag up_vinstr = FALSE;
+    uns8 up_vclass = (uns8)DELTA_PRIO_NONE;
+    cache_peek_victim(&ic->icache, ic->proc_id, ic->fetch_addr, &up_vaddr, &up_vinstr, &up_vclass);
     ic->line = (Inst_Info**)cache_insert(&ic->icache, ic->proc_id, ic->fetch_addr, &ic->line_addr, &repl_line_addr);
     icache_record_evict();  // --early_evict_stats
     /* --instr_upfill: the line this fill displaced leaves the chip otherwise -- the L1I has no
        writeback path, so an instruction eviction is a silent drop. Demote it to the MLC instead.
        Read after the insert because that is when repl_line_addr is set; the line's data is not
        needed, only its address. */
-    instr_upfill_to_mlc(ic->proc_id, repl_line_addr);
+    instr_upfill_to_mlc(ic->proc_id, repl_line_addr, up_vclass);
     DEBUG(ic->proc_id, "Got line switch into ic fetch %llx\n", ic->line_addr);
     STAT_EVENT(ic->proc_id, ICACHE_FILL);
     icache_footprint_record(ic->line_addr);
@@ -1320,9 +1330,13 @@ Flag icache_fill_line(Mem_Req* req)  // cmp FIXME maybe needed to be optimized
        can arrive this way when the merging demand has already been served. Staged for each
        insert separately because the first consumes it. */
     cache_set_next_fill_delta_prio(instr_place_l1i_class(req));
+    Addr pf_vaddr = 0;
+    Flag pf_vinstr = FALSE;
+    uns8 pf_vclass = (uns8)DELTA_PRIO_NONE;
+    cache_peek_victim(&ic->icache, ic->proc_id, req->addr, &pf_vaddr, &pf_vinstr, &pf_vclass);
     line = (Inst_Info**)cache_insert(&ic->icache, ic->proc_id, req->addr, &dummy_addr, &repl_line_addr);
     icache_record_evict();  // --early_evict_stats
-    instr_upfill_to_mlc(ic->proc_id, repl_line_addr); /* --instr_upfill; see the demand-fill path */
+    instr_upfill_to_mlc(ic->proc_id, repl_line_addr, pf_vclass); /* --instr_upfill; see above */
     icache_footprint_record(dummy_addr);
 
     if (WP_COLLECT_STATS) {  // cmp IGNORE
@@ -1631,6 +1645,12 @@ void log_stats_mshr_hit(Addr line_addr) {
   if (!icache_off_path())
     inc_icache_miss(ic->line_addr);
   Imiss_Reason imiss_reason = get_miss_reason(line_addr);
+  /* --instr_nopref_lambda: remember a PREDICTION failure, distinct from a timeliness failure
+     (the prefetch was in flight) or a capacity one (it was prefetched and evicted early). Only
+     this class says FDIP could not produce the line at all, which is the population whose misses
+     no amount of prefetch tuning will remove. Recorded on-path only: an off-path miss is not a
+     failure to predict, it is a path that should not have been fetched. */
+  ic->miss_not_prefetched = (imiss_reason == IMISS_NOT_PREFETCHED) && !icache_off_path();
   DEBUG_FDIP(ic->proc_id, "miss reason: %d, req: %d\n", imiss_reason, req ? 1 : 0);
   if (!req) {
     if (!icache_off_path()) {

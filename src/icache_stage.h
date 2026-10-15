@@ -113,6 +113,12 @@ typedef struct Icache_Stage_struct {
   Counter fe_miss_window_cycles;
   Counter fe_miss_bound_cycles;
   Counter fe_miss_commit_cycles;
+
+  /* --instr_nopref_lambda: the demand miss currently being serviced was classified
+     IMISS_NOT_PREFETCHED -- FDIP never prefetched this line. Set when the miss is classified and
+     consumed when the request for it is issued, both of which happen in the same cycle for the
+     same line. */
+  Flag miss_not_prefetched;
   Flag icache_miss_fulfilled;
   Flag icache_stage_resteer_signaled;
   Flag fetch_barrier_pending;
