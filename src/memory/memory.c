@@ -1793,8 +1793,23 @@ static inline void instr_upfill_insert(Cache* cache, uns8 proc_id, Addr line_add
   cache_clear_fill_stage();
   cache_set_next_fill_instr(TRUE);
   cache_set_next_fill_delta_prio(DELTA_PRIO_UPFILL);
-  cache_insert(cache, proc_id, line_addr, &ins_line_addr, &repl_line_addr);
+  L1_Data* data = (L1_Data*)cache_insert(cache, proc_id, line_addr, &ins_line_addr, &repl_line_addr);
   cache_restore_fill_stage(&saved);
+
+  /* INITIALISE THE PAYLOAD. cache_insert allocates the way and returns its data area, but does
+     NOT clear it -- as mlc_fill_line puts it, "the data area still contains values from the
+     evicted line until we update them", and every ordinary fill path writes the fields itself
+     afterwards. A demotion that skipped this inherited the evicted line's state wholesale, and
+     the field that matters most is `dirty`: a clean instruction line would take over a dirty
+     data line's bit and then be WRITTEN BACK on its own eviction -- traffic for data that was
+     never modified here and had already been written back when the real dirty line left.
+     Zero everything, so a field added to L1_Data later cannot quietly become stale here too. */
+  if (data) {
+    memset(data, 0, sizeof(L1_Data));
+    data->proc_id = proc_id;
+    data->fetch_cycle = cycle_count;
+    /* dirty stays FALSE: an instruction line carries no modified data, by construction. */
+  }
 }
 
 /* Demote an L1I victim into the MLC. */
