@@ -635,6 +635,26 @@ DEF_PARAM(instr_nopref_lambda, INSTR_NOPREF_LAMBDA, float, float, 0.0, )
    and travels out with the line. REPL_MLP only; 0 (the default) never applies the class. */
 DEF_PARAM(instr_latepref_lambda, INSTR_LATEPREF_LAMBDA, float, float, 0.0, )
 
+/* --instr_upfill_carry_on_hit: when a hit at the MLC or LLC releases a line up to the L1I, the
+   line's CLASS travels with it instead of dying with the copy.
+
+   Without this, --instr_upfill_hit_invalidate makes every mark one-shot: a line classed
+   NO_PREF or LATE_PREF is released the first time anything touches it, cache_invalidate clears
+   delta_prio with the rest of the entry, and when the line is demoted back it returns as a plain
+   demoted line. A boost can therefore protect a line only until it is next used -- which is
+   precisely when the line has proved itself, so the protection is cancelled by its own success.
+
+   With this on, the class is read off the serving level before the release, parked on the
+   request, and staged onto the L1I fill; the next demotion carries it back out. The line is
+   STILL released, so exclusivity is unchanged -- only the fact about the line survives the trip.
+
+   DELTA_PRIO_UPFILL is not carried: "was demoted once" is a property of a demotion and is
+   re-derived at the next one anyway. Only the earned classes travel.
+
+   Requires --instr_upfill. Does nothing without --instr_upfill_hit_invalidate, since without a
+   release there is no copy being destroyed and the MLC line keeps its class directly. */
+DEF_PARAM(instr_upfill_carry_on_hit, INSTR_UPFILL_CARRY_ON_HIT, Flag, Flag, FALSE, )
+
 /* --instr_upfill_hit_invalidate: when an instruction request HITS in the MLC or the LLC and the
    line is delivered to the L1I, that level RELEASES its copy.
 

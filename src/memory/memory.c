@@ -985,6 +985,11 @@ uns8 instr_place_l1i_class(Mem_Req* req) {
      here is the whole implementation -- the icache stages an empty class, and with no boosted
      lines its REPL_MLP ordering is exactly recency. Allocation at the MLC and LLC is untouched,
      because that is decided by instr_place_declines, which never consults this. */
+  /* A class rescued from the level that served this hit outranks anything derived from the
+     request: it is what the line was already known to be, carried rather than re-inferred. */
+  if (INSTR_UPFILL_CARRY_ON_HIT && req->instr_carried_class != (uns8)DELTA_PRIO_NONE &&
+      req->instr_carried_class != (uns8)DELTA_PRIO_UPFILL)
+    return req->instr_carried_class;
   if (!FDIP_DELTA_L1I_PRIO)
     return instr_miss_class(req, (uns8)DELTA_PRIO_NONE);
   return instr_miss_class(req, (uns8)instr_place_class(req, INSTR_PLACE_L1I));
@@ -2127,6 +2132,10 @@ void init_memory() {
   ASSERTM(0, !(INSTR_UPFILL_HIT_INVALIDATE && !INSTR_UPFILL),
           "--instr_upfill_hit_invalidate requires --instr_upfill: releasing the copy on a hit "
           "without a demotion path to put it back would drop the line off the chip\n");
+
+  ASSERTM(0, !(INSTR_UPFILL_CARRY_ON_HIT && !INSTR_UPFILL),
+          "--instr_upfill_carry_on_hit requires --instr_upfill: without demotion there is no "
+          "path that would carry the rescued class back out\n");
 
   ASSERTM(0, !(INSTR_UPFILL_DEMAND_L1I_ONLY && !INSTR_UPFILL),
           "--instr_upfill_demand_l1i_only requires --instr_upfill: without demotion a demand "
@@ -3599,6 +3608,8 @@ static Flag mem_complete_l1_access(Mem_Req* req, Mem_Queue_Entry* l1_queue_entry
     cache_mark_delta_owner(&L1(req->proc_id)->cache, req->addr);
   if (data)
     instr_upfill_note_hit(&L1(req->proc_id)->cache, req);
+  if (data && INSTR_UPFILL_CARRY_ON_HIT && INSTR_UPFILL && mem_req_type_is_instr(req->type))
+    req->instr_carried_class = cache_line_delta_prio(&L1(req->proc_id)->cache, req->addr);
   if (mj_l1_staged)
     cache_set_mockingjay_next_access(FALSE, 0, FALSE, FALSE, 0);
   req->l1_hit = data ? TRUE : FALSE;
@@ -3847,6 +3858,12 @@ static Flag mem_complete_mlc_access(Mem_Req* req, Mem_Queue_Entry* mlc_queue_ent
     cache_mark_delta_owner(&MLC(req->proc_id)->cache, req->addr);
   if (data)
     instr_upfill_note_hit(&MLC(req->proc_id)->cache, req);
+  /* --instr_upfill_carry_on_hit: capture the class BEFORE mem_process_mlc_hit_access below,
+     because that call runs done_func and so fills the L1I -- after it, the icache line already
+     has whatever class it was going to get. The line is still released; only the class is
+     rescued, so exclusivity is unchanged and the mark survives the trip up and back. */
+  if (data && INSTR_UPFILL_CARRY_ON_HIT && INSTR_UPFILL && mem_req_type_is_instr(req->type))
+    req->instr_carried_class = cache_line_delta_prio(&MLC(req->proc_id)->cache, req->addr);
   if (mj_mlc_staged)
     cache_set_mockingjay_next_access(FALSE, 0, FALSE, FALSE, 0);
   if (td_mlc_pred_staged)
@@ -5436,6 +5453,7 @@ static void mem_init_new_req(Mem_Req* new_req, Mem_Req_Type type, Mem_Queue_Type
   /* --instr_nopref_lambda: consume the one-shot the icache staged for this miss. Cleared here so
      the next request cannot inherit it -- every other creation path leaves it FALSE. */
   new_req->fdip_no_prefetch = g_next_req_no_prefetch;
+  new_req->instr_carried_class = (uns8)DELTA_PRIO_NONE;
   g_next_req_no_prefetch = FALSE;
   if (type == MRT_IFETCH) {
     new_req->demand_icache_emitted_cycle = cycle_count;

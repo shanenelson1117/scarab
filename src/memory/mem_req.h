@@ -126,6 +126,11 @@ struct Mem_Req_struct {
      timeliness or capacity failure. Staged by the icache before new_mem_req and consumed at the
      fill, because the reason is known at the MISS and the class is applied at the FILL. */
   Flag fdip_no_prefetch;
+
+  /* --instr_upfill_carry_on_hit: the class the line held at the level that just served this hit,
+     captured before the release invalidates it so the L1I copy can inherit it and the next
+     demotion can put it back. DELTA_PRIO_NONE when nothing was carried. */
+  uns8 instr_carried_class;
   struct Mem_Queue_struct* queue;      /* Pointer to the queue this entry is in */
   Counter priority;                    /* priority of the miss */
   Addr addr;                           /* address to fetch */

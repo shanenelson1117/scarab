@@ -659,6 +659,10 @@ void cache_set_next_fill_instr(Flag is_instr);
    and not cache_access to probe from inside another access. */
 Flag cache_line_present(Cache* cache, Addr addr);
 
+/* --instr_upfill_carry_on_hit: a resident line's placement class, DELTA_PRIO_NONE if absent.
+   Pure; safe to call from inside another access. */
+uns8 cache_line_delta_prio(Cache* cache, Addr addr);
+
 Flag cache_peek_victim(Cache* cache, uns8 proc_id, Addr addr, Addr* victim_addr, Flag* victim_is_instr,
                        uns8* victim_delta_prio);
 

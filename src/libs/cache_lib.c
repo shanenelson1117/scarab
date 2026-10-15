@@ -310,6 +310,20 @@ Flag cache_line_present(Cache* cache, Addr addr) {
   return FALSE;
 }
 
+/* --instr_upfill_carry_on_hit: the placement class of a RESIDENT line, or DELTA_PRIO_NONE when
+   the line is not here. Pure, like cache_line_present -- it is called from inside another
+   access, so it must not touch recency or the last_hit_* group. */
+uns8 cache_line_delta_prio(Cache* cache, Addr addr) {
+  Addr      tag = 0, line_addr = 0;
+  const uns set = ext_cache_index(cache, addr, &tag, &line_addr);
+  for (uns ii = 0; ii < (uns)cache->assoc; ii++) {
+    const Cache_Entry* e = &cache->entries[set][ii];
+    if (e->valid && e->tag == tag)
+      return e->delta_prio;
+  }
+  return (uns8)DELTA_PRIO_NONE;
+}
+
 Flag cache_peek_victim(Cache* cache, uns8 proc_id, Addr addr, Addr* victim_addr, Flag* victim_is_instr,
                        uns8* victim_delta_prio) {
   Addr line_tag = 0, line_addr = 0;
