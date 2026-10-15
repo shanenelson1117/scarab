@@ -276,6 +276,26 @@ void cache_clear_offpath(Cache* cache, Addr addr) {
   }
 }
 
+/* --fdip_delta_hit_pins: a prefetch hit this resident line, so the level holding it has proved
+   itself the right place -- promote it to OWNER here. The counterpart to cache_mark_written: a
+   sticky bit set on a line long after its fill, costing one tag lookup, so the caller gates it on
+   the knob being on.
+
+   Only ever promotes. A line already OWNER stays OWNER, and a BACKUP copy becomes an owner in its
+   own right, because the evidence is the same either way: something asked for this line while it
+   was here. Nothing demotes, so a line cannot oscillate between classes as traffic shifts. */
+void cache_mark_delta_owner(Cache* cache, Addr addr) {
+  Addr tag = 0, line_addr = 0;
+  uns  set = ext_cache_index(cache, addr, &tag, &line_addr);
+  for (uns ii = 0; ii < (uns)cache->assoc; ii++) {
+    Cache_Entry* e = &cache->entries[set][ii];
+    if (e->valid && e->tag == tag) {
+      e->delta_prio = DELTA_PRIO_OWNER;
+      return;
+    }
+  }
+}
+
 void cache_mark_written(Cache* cache, Addr addr) {
   Addr tag = 0, line_addr = 0;
   uns  set = ext_cache_index(cache, addr, &tag, &line_addr);

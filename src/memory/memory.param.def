@@ -616,6 +616,23 @@ DEF_PARAM(fdip_delta_lambda, FDIP_DELTA_LAMBDA, float, float, 0.0, )
    down, which is two mechanisms aimed at one population. */
 DEF_PARAM(fdip_delta_unmerged_pref_bypass_llc, FDIP_DELTA_UNMERGED_PREF_BYPASS_LLC, Flag, Flag, FALSE, )
 
+/* --fdip_delta_hit_pins: an unmerged instruction prefetch that HITS a resident line pins that
+   line to the level that served it -- it becomes DELTA_PRIO_OWNER there and takes
+   --fdip_delta_lambda, on top of the recency update the access already performs.
+
+   WHY. Ownership is otherwise decided once, at fill, from a single lead-time measurement, and
+   nothing ever revisits it. A hit is the feedback that rule never collects: this level held the
+   line and something wanted it. It is also the only evidence available for an unmerged prefetch,
+   which by definition stalled nobody and so has no lead time to classify.
+
+   PROMOTE-ONLY, so a line cannot oscillate. A line already OWNER stays put; a BACKUP copy is
+   promoted to an owner in its own right, since the evidence is identical.
+
+   NOTE A HIT PRODUCES NO FILL, so without this the hit changes nothing about placement -- the
+   line simply keeps whatever class its fill gave it and ages out on recency. That is the
+   behaviour at 0, and it is what every run before this knob did. */
+DEF_PARAM(fdip_delta_hit_pins, FDIP_DELTA_HIT_PINS, Flag, Flag, FALSE, )
+
 /* --fdip_delta_l1i_backup_level: the level that ALSO keeps an L1I-owned line, so it is not the
    only copy on chip.
 

@@ -955,6 +955,17 @@ uns8 instr_place_l1i_class(Mem_Req* req) {
   return (uns8)instr_place_class(req, INSTR_PLACE_L1I);
 }
 
+/* --fdip_delta_hit_pins: should a HIT by this request pin the line to the level that served it?
+   Only for an instruction prefetch with no demand waiting on it -- the case placement otherwise
+   has no evidence about. A merged prefetch already carries a lead time and gets a real placement
+   decision at its fill; an unmerged one is pure speculation UNTIL it hits something, and a hit on
+   a resident line is the one piece of feedback the lead-time rule never collects: this level was
+   the right place, demonstrated rather than predicted. */
+static inline Flag instr_place_hit_pins(Mem_Req* req) {
+  return FDIP_DELTA_PLACE && FDIP_DELTA_HIT_PINS && mem_req_type_is_instr_prefetch(req->type) &&
+         !mem_req_is_type(req, MRT_IFETCH);
+}
+
 /* Does `level` have to decline this fill? Only when placement is steering the line and this
    level is neither its owner nor its backup. */
 static inline Flag instr_place_declines(Mem_Req* req, Instr_Place level) {
@@ -3302,6 +3313,11 @@ static Flag mem_complete_l1_access(Mem_Req* req, Mem_Queue_Entry* l1_queue_entry
   Flag mj_l1_staged = update_l1_lru ? mockingjay_stage_access(&L1(req->proc_id)->cache, req) : FALSE;
   data = (L1_Data*)cache_access(&L1(req->proc_id)->cache, req->addr, &line_addr,
                                 update_l1_lru);  // access L2
+  /* --fdip_delta_hit_pins: the line was already here and a prefetch asked for it again, so this
+     level keeps it. The recency update is the cache_access above (--prefetch_update_lru_l1,
+     default on); this adds the placement class the fill-time rule would not have given it. */
+  if (data && instr_place_hit_pins(req))
+    cache_mark_delta_owner(&L1(req->proc_id)->cache, req->addr);
   if (mj_l1_staged)
     cache_set_mockingjay_next_access(FALSE, 0, FALSE, FALSE, 0);
   req->l1_hit = data ? TRUE : FALSE;
@@ -3540,6 +3556,9 @@ static Flag mem_complete_mlc_access(Mem_Req* req, Mem_Queue_Entry* mlc_queue_ent
   // clears it below so it cannot leak into an unrelated later access).
   Flag mj_mlc_staged = update_mlc_lru ? mockingjay_stage_access(&MLC(req->proc_id)->cache, req) : FALSE;
   data = (MLC_Data*)cache_access(&MLC(req->proc_id)->cache, req->addr, &line_addr, update_mlc_lru);  // access MLC
+  /* --fdip_delta_hit_pins: see the matching block in the LLC path. */
+  if (data && instr_place_hit_pins(req))
+    cache_mark_delta_owner(&MLC(req->proc_id)->cache, req->addr);
   if (mj_mlc_staged)
     cache_set_mockingjay_next_access(FALSE, 0, FALSE, FALSE, 0);
   if (td_mlc_pred_staged)

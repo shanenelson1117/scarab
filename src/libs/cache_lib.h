@@ -666,6 +666,9 @@ void cache_clear_fill_stage(void);
 void cache_set_next_fill_store(Flag is_store);
 Flag cache_get_fill_store(void);
 void cache_mark_written(Cache* cache, Addr addr);
+/* --fdip_delta_hit_pins: promote a resident line to DELTA_PRIO_OWNER because a prefetch hit it
+   here. Promote-only; see cache_lib.c. */
+void cache_mark_delta_owner(Cache* cache, Addr addr);
 /* --mlp_lin_offpath_lambda: an on-path demand hit vindicates a wrong-path fill; drop the flag. */
 void cache_clear_offpath(Cache* cache, Addr addr);
 /* REPL_MLP / SBAR: pin this cache's LIN lambdas (ATD candidate, or the MTD's selection). */
