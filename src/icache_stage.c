@@ -1230,6 +1230,11 @@ Flag icache_fill_line(Mem_Req* req)  // cmp FIXME maybe needed to be optimized
     }
     ic->line = (Inst_Info**)cache_insert(&ic->icache, ic->proc_id, ic->fetch_addr, &ic->line_addr, &repl_line_addr);
     icache_record_evict();  // --early_evict_stats
+    /* --instr_upfill: the line this fill displaced leaves the chip otherwise -- the L1I has no
+       writeback path, so an instruction eviction is a silent drop. Demote it to the MLC instead.
+       Read after the insert because that is when repl_line_addr is set; the line's data is not
+       needed, only its address. */
+    instr_upfill_to_mlc(ic->proc_id, repl_line_addr);
     DEBUG(ic->proc_id, "Got line switch into ic fetch %llx\n", ic->line_addr);
     STAT_EVENT(ic->proc_id, ICACHE_FILL);
     icache_footprint_record(ic->line_addr);
@@ -1317,6 +1322,7 @@ Flag icache_fill_line(Mem_Req* req)  // cmp FIXME maybe needed to be optimized
     cache_set_next_fill_delta_prio(instr_place_l1i_class(req));
     line = (Inst_Info**)cache_insert(&ic->icache, ic->proc_id, req->addr, &dummy_addr, &repl_line_addr);
     icache_record_evict();  // --early_evict_stats
+    instr_upfill_to_mlc(ic->proc_id, repl_line_addr); /* --instr_upfill; see the demand-fill path */
     icache_footprint_record(dummy_addr);
 
     if (WP_COLLECT_STATS) {  // cmp IGNORE

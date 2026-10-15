@@ -545,6 +545,38 @@ DEF_PARAM(mlp_lin_dyn_step, MLP_LIN_DYN_STEP, float, float, 1.0, )
    policy -- a "boost" that evicts the lines it is supposed to protect -- which cache_lib refuses
    for the static params too. The ceiling stops an unbounded drift over a long run; at assoc 16
    anything past ~16 already outranks recency entirely, so 64 is slack, not a target. */
+/* ================== --instr_upfill: demote instruction victims one level out ==================
+   An instruction line evicted from the L1I is installed into the MLC, and one evicted from the
+   MLC into the LLC, unless it is already there. Scarab otherwise drops instruction victims
+   silently -- they are clean, so there is no writeback -- which means the last copy leaving a
+   level takes the line off the chip entirely.
+
+   STANDS ALONE. This is a placement change, not a policy: it works under REPL_TRUE_LRU exactly as
+   under REPL_MLP, and is not gated on --mlc_cache_repl_policy 9 or on --fdip_delta_place, so its
+   effect can be measured by itself. The two lambdas below are read only by REPL_MLP's value
+   function; under any other policy a demoted line just takes its ordinary place in recency order.
+
+   BEST EFFORT. A demotion that would displace a DIRTY line is skipped, because making room would
+   need a writeback request that can fail, and an eviction cannot be retried the way a fill can.
+   Skipping is always safe -- dropping a clean instruction line is today's behaviour.
+
+   A DEMOTED LINE IS NOT A FILLED LINE, and carries its own class so the two are separable: it was
+   evicted once and has not been asked for since, so by default it gets no protection at all
+   (--instr_upfill_lambda 0) and competes on recency. If an instruction prefetch later HITS it, it
+   has been asked for, and is promoted to --instr_upfill_promote_lambda. That promotion is the
+   feedback the lead-time rule never had: evidence about the line rather than about one fill. */
+DEF_PARAM(instr_upfill, INSTR_UPFILL, Flag, Flag, FALSE, )
+
+/* Boost for a demoted line, in LRU stack positions. 0 (the default) is the honest starting point:
+   a line that was just evicted has no claim on protection. REPL_MLP only. */
+DEF_PARAM(instr_upfill_lambda, INSTR_UPFILL_LAMBDA, float, float, 0.0, )
+
+/* Boost once an instruction prefetch has hit the demoted line. Keep it below the receiving
+   cache's associativity -- at or above it the boost outranks recency outright, which is what
+   drove the icache from 2.45 to 6.0 misses per 1K instructions in the placement runs. REPL_MLP
+   only. */
+DEF_PARAM(instr_upfill_promote_lambda, INSTR_UPFILL_PROMOTE_LAMBDA, float, float, 0.0, )
+
 /* ============ LEAD-TIME DIRECTED INSTRUCTION PLACEMENT (--fdip_delta_place) ============
    ONE LEVEL OWNS EACH INSTRUCTION LINE. When a demand instruction fetch merges into an
    in-flight instruction prefetch, the gap between the prefetch being sent and the demand

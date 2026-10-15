@@ -990,6 +990,115 @@ static inline Flag instr_place_declines(Mem_Req* req, Instr_Place level) {
 #define MLC(proc_id) (mem->uncores[proc_id].mlc)
 #define L1(proc_id) (mem->uncores[proc_id].l1)
 
+/* ===================== --instr_upfill: demote a victim to the next level out =====================
+ *
+ * When a level evicts an INSTRUCTION line, install it in the level beyond, if it is not already
+ * there. Nothing else in Scarab does this: instruction lines are clean, so an eviction is a silent
+ * drop and the line leaves the chip entirely once the last copy goes. That makes an L1I eviction
+ * unrecoverable even though the line may be fetched again within a few thousand cycles.
+ *
+ * INDEPENDENT OF ANY REPLACEMENT POLICY. The demotion is a cache_insert, so it works under
+ * REPL_TRUE_LRU exactly as under REPL_MLP; --instr_upfill alone changes where lines live and
+ * nothing else, which is what makes its effect measurable on its own. The two lambdas below are
+ * read only by REPL_MLP's value function, so under any other policy they are inert and the
+ * demoted line simply takes its ordinary place in the recency order.
+ *
+ * BEST EFFORT, NEVER BLOCKING. A fill that must evict a DIRTY line has to schedule a writeback
+ * first and can fail doing so -- mlc_fill_line answers FAILURE and the whole fill is retried. An
+ * eviction has no such retry: cache_insert has already happened by the time we see the victim. So
+ * a demotion that would displace a dirty line is simply skipped. Dropping a clean instruction line
+ * is always legal -- it is what happens today -- so skipping costs nothing but the opportunity.
+ *
+ * THE STAGING MUST BE SAVED. These inserts happen in the middle of somebody else's fill, and
+ * cache_insert consumes the staged fill state. Each demotion therefore saves the stage, clears it,
+ * stages its own class, inserts, and restores -- which is exactly what cache_save_fill_stage and
+ * friends exist for. Without that, a demotion mid-fill would eat the cost and boundness values the
+ * real fill had staged and leave the filled line carrying zeros. */
+static void instr_upfill_to_llc(uns8 proc_id, Addr line_addr);
+
+/* Install `line_addr` into `cache` as a demoted line. The caller has already established that the
+   line is absent and that displacing the victim is acceptable. */
+static inline void instr_upfill_insert(Cache* cache, uns8 proc_id, Addr line_addr) {
+  Cache_Fill_Stage saved;
+  Addr             ins_line_addr = 0, repl_line_addr = 0;
+  cache_save_fill_stage(&saved);
+  cache_clear_fill_stage();
+  cache_set_next_fill_instr(TRUE);
+  cache_set_next_fill_delta_prio(DELTA_PRIO_UPFILL);
+  cache_insert(cache, proc_id, line_addr, &ins_line_addr, &repl_line_addr);
+  cache_restore_fill_stage(&saved);
+}
+
+/* Demote an L1I victim into the MLC. */
+void instr_upfill_to_mlc(uns8 proc_id, Addr line_addr) {
+  Addr      victim_addr = 0;
+  Flag      victim_is_instr = FALSE;
+  MLC_Data* victim = NULL;
+  Flag      victim_valid = FALSE;
+
+  if (!INSTR_UPFILL || !line_addr)
+    return;
+  if (!MLC_PRESENT) {
+    instr_upfill_to_llc(proc_id, line_addr); /* no MLC to land in; the LLC is the next level out */
+    return;
+  }
+  Cache* mlc = &MLC(proc_id)->cache;
+  /* ALREADY HERE -> leave it completely alone. Returning before the insert is what guarantees a
+     demotion never overwrites a resident line's class: re-inserting would stamp DELTA_PRIO_UPFILL
+     over whatever that line had earned (OWNER, BACKUP, or an ordinary fill's NONE) and reset its
+     fill history, turning a line the level chose to keep into one that was merely evicted from
+     below. The probe itself is side-effect free. */
+  if (cache_line_present(mlc, line_addr)) {
+    STAT_EVENT(proc_id, INSTR_UPFILL_MLC_PRESENT);
+    return;
+  }
+  victim = (MLC_Data*)get_next_repl_line(mlc, proc_id, line_addr, &victim_addr, &victim_valid);
+  if (victim_valid && victim && victim->dirty && !MLC_WRITE_THROUGH) {
+    STAT_EVENT(proc_id, INSTR_UPFILL_MLC_SKIP_DIRTY);
+    return; /* would need a writeback we cannot retry; see the header comment */
+  }
+  /* Cascade BEFORE the insert, while the victim is still readable: if the line we are about to
+     displace is itself an instruction line, it gets the same treatment one level out. Bounded at
+     two levels, because the LLC demotes to nothing. */
+  if (cache_peek_victim(mlc, proc_id, line_addr, &victim_addr, &victim_is_instr) && victim_is_instr)
+    instr_upfill_to_llc(proc_id, victim_addr);
+  instr_upfill_insert(mlc, proc_id, line_addr);
+  STAT_EVENT(proc_id, INSTR_UPFILL_MLC);
+}
+
+/* Demote an MLC victim into the LLC. */
+static void instr_upfill_to_llc(uns8 proc_id, Addr line_addr) {
+  Addr     victim_addr = 0;
+  L1_Data* victim = NULL;
+  Flag     victim_valid = FALSE;
+
+  if (!INSTR_UPFILL || !line_addr)
+    return;
+  Cache* llc = &L1(proc_id)->cache;
+  if (cache_line_present(llc, line_addr)) { /* resident -> untouched; see the MLC path */
+    STAT_EVENT(proc_id, INSTR_UPFILL_LLC_PRESENT);
+    return;
+  }
+  victim = (L1_Data*)get_next_repl_line(llc, proc_id, line_addr, &victim_addr, &victim_valid);
+  if (victim_valid && victim && victim->dirty) {
+    STAT_EVENT(proc_id, INSTR_UPFILL_LLC_SKIP_DIRTY);
+    return;
+  }
+  instr_upfill_insert(llc, proc_id, line_addr);
+  STAT_EVENT(proc_id, INSTR_UPFILL_LLC);
+}
+
+/* --instr_upfill: an FDIP prefetch hit a line somewhere. If that line is a demoted one, this is
+   the ask that promotes it out of the demoted class -- the line is no longer "evicted once and
+   not wanted since". Applies to instruction prefetches of every kind, merged or not: the evidence
+   is the hit, not the merge. */
+static inline void instr_upfill_note_hit(Cache* cache, Mem_Req* req) {
+  if (!INSTR_UPFILL || !mem_req_type_is_instr_prefetch(req->type))
+    return;
+  cache_promote_upfill(cache, req->addr);
+}
+
+
 /**************************************************************************************/
 /* Global Variables */
 
@@ -3324,6 +3433,8 @@ static Flag mem_complete_l1_access(Mem_Req* req, Mem_Queue_Entry* l1_queue_entry
      default on); this adds the placement class the fill-time rule would not have given it. */
   if (data && instr_place_hit_pins(req))
     cache_mark_delta_owner(&L1(req->proc_id)->cache, req->addr);
+  if (data)
+    instr_upfill_note_hit(&L1(req->proc_id)->cache, req);
   if (mj_l1_staged)
     cache_set_mockingjay_next_access(FALSE, 0, FALSE, FALSE, 0);
   req->l1_hit = data ? TRUE : FALSE;
@@ -3565,6 +3676,8 @@ static Flag mem_complete_mlc_access(Mem_Req* req, Mem_Queue_Entry* mlc_queue_ent
   /* --fdip_delta_hit_pins: see the matching block in the LLC path. */
   if (data && instr_place_hit_pins(req))
     cache_mark_delta_owner(&MLC(req->proc_id)->cache, req->addr);
+  if (data)
+    instr_upfill_note_hit(&MLC(req->proc_id)->cache, req);
   if (mj_mlc_staged)
     cache_set_mockingjay_next_access(FALSE, 0, FALSE, FALSE, 0);
   if (td_mlc_pred_staged)
@@ -6250,6 +6363,10 @@ Flag l1_fill_line(Mem_Req* req) {
        goes stale on a fill placement is not steering (arm off, or data traffic), where it is
        DELTA_PRIO_NONE. */
     cache_set_next_fill_delta_prio(instr_place_class(req, INSTR_PLACE_LLC));
+    /* --instr_upfill: remember what kind of line this is, so a later eviction knows whether to
+       demote it. Staged on every fill, with no knob, because the eviction that reads it may
+       happen in a run where only the demotion is enabled. */
+    cache_set_next_fill_instr(mem_req_type_is_instr(req->type));
     /* --mlp_lin_store_lambda: write traffic. A store miss, or a writeback which by definition
        carries modified data. A writeback that HITS an already-resident line is handled
        separately by cache_mark_written, since that happens long after the fill. */
@@ -6586,6 +6703,18 @@ Flag mlc_fill_line(Mem_Req* req) {
      that we won't be able to insert the writeback into the
      memory system. */
   Flag repl_line_valid;
+  /* --instr_upfill: this fill is about to displace a way. If the occupant is an instruction line
+     it is demoted to the LLC first, while it is still readable. Placed before the writeback
+     handling below for the same reason that block is placed before the insert: everything that
+     needs the victim must read it before it is gone. */
+  if (INSTR_UPFILL) {
+    Addr up_victim = 0;
+    Flag up_is_instr = FALSE;
+    if (cache_peek_victim(&MLC(req->proc_id)->cache, req->proc_id, req->addr, &up_victim, &up_is_instr) &&
+        up_is_instr)
+      instr_upfill_to_llc(req->proc_id, up_victim);
+  }
+
   data = (MLC_Data*)get_next_repl_line(&MLC(req->proc_id)->cache, req->proc_id, req->addr, &repl_line_addr,
                                        &repl_line_valid);
 
@@ -6778,6 +6907,7 @@ Flag mlc_fill_line(Mem_Req* req) {
        goes stale on a fill placement is not steering (arm off, or data traffic), where it is
        DELTA_PRIO_NONE. */
     cache_set_next_fill_delta_prio(instr_place_class(req, INSTR_PLACE_MLC));
+    cache_set_next_fill_instr(mem_req_type_is_instr(req->type)); /* --instr_upfill; see the LLC fill */
     /* --mlp_lin_store_lambda: write traffic. A store miss, or a writeback which by definition
        carries modified data. A writeback that HITS an already-resident line is handled
        separately by cache_mark_written, since that happens long after the fill. */

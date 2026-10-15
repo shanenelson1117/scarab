@@ -870,6 +870,17 @@ DEF_STAT(  MLC_PREF_FILL,    DIST,  NO_RATIO  )
    still reaches the core-side caches, so these are capacity NOT spent, not lost fills. Read
    against that level's total fills to see how much of the instruction stream placement moved
    elsewhere. */
+/* --instr_upfill: demotions that happened, and the two reasons one did not. PRESENT means the
+   next level already had the line, which is the healthy case and not a loss. SKIP_DIRTY is the
+   best-effort give-up: making room would have needed a writeback. Read the two skips against the
+   demotions to know how much of the mechanism the traces actually let you have. */
+DEF_STAT(  INSTR_UPFILL_MLC                      , COUNT , NO_RATIO  )
+DEF_STAT(  INSTR_UPFILL_MLC_PRESENT              , COUNT , NO_RATIO  )
+DEF_STAT(  INSTR_UPFILL_MLC_SKIP_DIRTY           , COUNT , NO_RATIO  )
+DEF_STAT(  INSTR_UPFILL_LLC                      , COUNT , NO_RATIO  )
+DEF_STAT(  INSTR_UPFILL_LLC_PRESENT              , COUNT , NO_RATIO  )
+DEF_STAT(  INSTR_UPFILL_LLC_SKIP_DIRTY           , COUNT , NO_RATIO  )
+
 DEF_STAT(  MLC_INSTR_PLACE_DECLINE               , COUNT , NO_RATIO  )
 DEF_STAT(  L1_INSTR_PLACE_DECLINE                , COUNT , NO_RATIO  )
 

@@ -51,6 +51,14 @@ typedef enum Delta_Prio_enum {
   DELTA_PRIO_NONE = 0, /* placement is not steering this line in this cache */
   DELTA_PRIO_OWNER,    /* this cache owns it: --fdip_delta_lambda */
   DELTA_PRIO_BACKUP,   /* L1I owns it, this cache keeps a copy: --fdip_delta_l1i_backup_lambda */
+  /* --instr_upfill: this line was DEMOTED here from the level below when that level evicted it.
+     Its own class so it can be left unprotected (the default) while still being distinguishable
+     from an ordinary fill -- a demoted line has already been evicted once and has not been asked
+     for since, so it has not earned what a fill earns. */
+  DELTA_PRIO_UPFILL,
+  /* ... and an FDIP prefetch has since hit it here, which is the ask that promotes it:
+     --instr_upfill_promote_lambda. */
+  DELTA_PRIO_UPFILL_HIT,
 } Delta_Prio;
 
 typedef enum Repl_Policy_enum {
@@ -160,6 +168,12 @@ typedef struct Cache_Entry_struct {
      off (--pref_framework_on 0, --pref_stream_on 0) -- so on those traces this flag means
      "FDIP instruction line". */
   Flag fill_was_prefetch;
+
+  /* --instr_upfill: is this an INSTRUCTION line? Needed when this cache evicts it, to decide
+     whether the victim is demoted to the next level out. Staged at fill from the request type,
+     unconditionally, so it is available with any replacement policy and with every stats knob
+     off -- unlike fill_traffic, which load_prio_stage_fill only writes under --load_prio_stats. */
+  Flag instr_line;
 
   /* --fdip_delta_place: which placement class this line holds IN THIS CACHE -- a Delta_Prio.
      Sticky fill history like the flags above: the lead time that chose the owner was a property
@@ -626,6 +640,23 @@ void cache_put_fill_stage(Flag membound, Flag fe_bound, double bound_frac, doubl
 /* --mlp_lin_pref_lambda: stage / read the prefetch flag for the next fill. */
 void cache_set_next_fill_prefetch(Flag is_prefetch);
 void cache_set_next_fill_delta_prio(uns8 delta_prio);
+/* --instr_upfill: tag the next fill as an instruction line. */
+void cache_set_next_fill_instr(Flag is_instr);
+
+/* --instr_upfill: peek the line an insert of `addr` would displace, WITHOUT changing any state.
+   Returns TRUE only when that way currently holds a valid line, and then reports its address and
+   whether it is an instruction line. Used to decide whether a victim is worth demoting before the
+   insert that destroys it. */
+/* --instr_upfill: pure residency test -- no recency update, no last_hit_* state touched. Use this
+   and not cache_access to probe from inside another access. */
+Flag cache_line_present(Cache* cache, Addr addr);
+
+Flag cache_peek_victim(Cache* cache, uns8 proc_id, Addr addr, Addr* victim_addr, Flag* victim_is_instr);
+
+/* --instr_upfill: an FDIP prefetch hit a resident DEMOTED line here, so it stops being a demoted
+   line and becomes one worth protecting. Promotes DELTA_PRIO_UPFILL to DELTA_PRIO_UPFILL_HIT and
+   touches nothing else -- a line in any other class keeps the class it has. */
+void cache_promote_upfill(Cache* cache, Addr addr);
 
 /* --mlp_lin_dyn_lambda: the live boundness lambdas of REPL_MLP's adaptive arm. The controller
    (topdown.c, once per 2^N retired instructions) writes them; lin_lam_instr / lin_lam_data read
@@ -653,6 +684,7 @@ typedef struct Cache_Fill_Stage_struct {
   double mlp_cost;
   Flag   prefetch;
   uns8   delta_prio; /* --fdip_delta_place: a Delta_Prio */
+  Flag   instr_line; /* --instr_upfill */
   Flag   store;
   Flag   offpath;
   uns8   traffic; /* --load_prio_stats: a Load_Prio_Traffic */

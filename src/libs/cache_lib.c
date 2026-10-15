@@ -106,6 +106,7 @@ static double g_next_fill_bound_frac = 0.0;
 static double g_next_fill_mlp_cost = 0.0;
 static Flag   g_next_fill_prefetch = FALSE;
 static uns8   g_next_fill_delta_prio = DELTA_PRIO_NONE;
+static Flag   g_next_fill_instr = FALSE;
 static Flag   g_next_fill_store = FALSE;
 static Flag   g_next_fill_offpath = FALSE;
 /* --load_prio_stats: the traffic class of the next fill. Defaults to LOAD_PRIO_TC_OTHER rather
@@ -155,6 +156,10 @@ void cache_set_next_fill_prefetch(Flag is_prefetch) {
 /* --fdip_delta_place: the placement class the next fill carries in this cache. */
 void cache_set_next_fill_delta_prio(uns8 delta_prio) {
   g_next_fill_delta_prio = delta_prio;
+}
+
+void cache_set_next_fill_instr(Flag is_instr) {
+  g_next_fill_instr = is_instr;
 }
 
 /* --mlp_lin_dyn_lambda: the live lambdas of the adaptive arm. ONE pair for the whole policy,
@@ -225,6 +230,7 @@ void cache_save_fill_stage(Cache_Fill_Stage* out) {
   out->mlp_cost = g_next_fill_mlp_cost;
   out->prefetch = g_next_fill_prefetch;
   out->delta_prio = g_next_fill_delta_prio;
+  out->instr_line = g_next_fill_instr;
   out->store = g_next_fill_store;
   out->offpath = g_next_fill_offpath;
   out->traffic = g_next_fill_traffic;
@@ -237,13 +243,14 @@ void cache_restore_fill_stage(const Cache_Fill_Stage* in) {
   g_next_fill_mlp_cost = in->mlp_cost;
   g_next_fill_prefetch = in->prefetch;
   g_next_fill_delta_prio = in->delta_prio;
+  g_next_fill_instr = in->instr_line;
   g_next_fill_store = in->store;
   g_next_fill_offpath = in->offpath;
   g_next_fill_traffic = in->traffic;
 }
 
 void cache_clear_fill_stage(void) {
-  /* Designated initialisers, not positional: this struct has nine fields now and a positional
+  /* Designated initialisers, not positional: this struct has ten fields now and a positional
      list silently shifts every value when one is inserted. The cleared traffic class is OTHER,
      not 0 -- 0 is IFETCH, which would attribute an unstaged fill to real instruction traffic. */
   Cache_Fill_Stage z = {.membound = FALSE,
@@ -252,6 +259,7 @@ void cache_clear_fill_stage(void) {
                         .mlp_cost = 0.0,
                         .prefetch = FALSE,
                         .delta_prio = DELTA_PRIO_NONE,
+                        .instr_line = FALSE,
                         .store = FALSE,
                         .offpath = FALSE,
                         .traffic = LOAD_PRIO_TC_OTHER};
@@ -284,6 +292,53 @@ void cache_clear_offpath(Cache* cache, Addr addr) {
    Only ever promotes. A line already OWNER stays OWNER, and a BACKUP copy becomes an owner in its
    own right, because the evidence is the same either way: something asked for this line while it
    was here. Nothing demotes, so a line cannot oscillate between classes as traffic shifts. */
+/* --instr_upfill: is this line resident here? A PURE tag walk, deliberately not cache_access:
+   that function clears the whole last_hit_* group (sb_last_hit, last_hit_mlp_cost,
+   last_hit_bound_frac, last_hit_fe_bound, last_hit_reuse_valid, last_hit_prio_valid) even when
+   update_repl is FALSE, so probing with it mid-fill would wipe state the surrounding access is
+   about to read. This touches nothing, which is what a probe from inside someone else's access
+   has to do. Indexes the same way cache_insert does -- ext_cache_index is a passthrough to
+   cache_index -- so "present" here and "present" there cannot disagree. */
+Flag cache_line_present(Cache* cache, Addr addr) {
+  Addr      tag = 0, line_addr = 0;
+  const uns set = ext_cache_index(cache, addr, &tag, &line_addr);
+  for (uns ii = 0; ii < (uns)cache->assoc; ii++) {
+    const Cache_Entry* e = &cache->entries[set][ii];
+    if (e->valid && e->tag == tag)
+      return TRUE;
+  }
+  return FALSE;
+}
+
+Flag cache_peek_victim(Cache* cache, uns8 proc_id, Addr addr, Addr* victim_addr, Flag* victim_is_instr) {
+  Addr line_tag = 0, line_addr = 0;
+  uns  way = 0;
+  const uns set = cache_index(cache, addr, &line_tag, &line_addr);
+  /* find_repl_entry is documented not to change state, which is what makes this a peek: the
+     caller may still decide not to insert, and must walk away having changed nothing. */
+  const Cache_Entry* victim = find_repl_entry(cache, proc_id, set, &way);
+  if (!victim || !victim->valid)
+    return FALSE;
+  if (victim_addr)
+    *victim_addr = victim->base;
+  if (victim_is_instr)
+    *victim_is_instr = victim->instr_line;
+  return TRUE;
+}
+
+void cache_promote_upfill(Cache* cache, Addr addr) {
+  Addr tag = 0, line_addr = 0;
+  uns  set = ext_cache_index(cache, addr, &tag, &line_addr);
+  for (uns ii = 0; ii < (uns)cache->assoc; ii++) {
+    Cache_Entry* e = &cache->entries[set][ii];
+    if (e->valid && e->tag == tag) {
+      if (e->delta_prio == DELTA_PRIO_UPFILL)
+        e->delta_prio = DELTA_PRIO_UPFILL_HIT;
+      return;
+    }
+  }
+}
+
 void cache_mark_delta_owner(Cache* cache, Addr addr) {
   Addr tag = 0, line_addr = 0;
   uns  set = ext_cache_index(cache, addr, &tag, &line_addr);
@@ -319,6 +374,7 @@ static inline void consume_fill_bound(Cache_Entry* line) {
   line->mlp_cost = g_next_fill_mlp_cost;
   line->fill_was_prefetch = g_next_fill_prefetch;
   line->delta_prio = g_next_fill_delta_prio;
+  line->instr_line = g_next_fill_instr;
   line->was_written = g_next_fill_store;
   line->offpath_unproven = g_next_fill_offpath;
   line->fill_traffic = g_next_fill_traffic;  // --load_prio_stats
@@ -328,6 +384,7 @@ static inline void consume_fill_bound(Cache_Entry* line) {
   g_next_fill_mlp_cost = 0.0;
   g_next_fill_prefetch = FALSE;
   g_next_fill_delta_prio = DELTA_PRIO_NONE;
+  g_next_fill_instr = FALSE;
   g_next_fill_store = FALSE;
   g_next_fill_offpath = FALSE;
   /* OTHER, not 0: 0 is LOAD_PRIO_TC_IFETCH, so clearing to it would charge every unstaged fill to
@@ -477,6 +534,10 @@ static inline double mlp_lin_delta_term(const Cache_Entry* entry) {
       return (double)FDIP_DELTA_LAMBDA;
     case DELTA_PRIO_BACKUP:
       return (double)FDIP_DELTA_L1I_BACKUP_LAMBDA;
+    case DELTA_PRIO_UPFILL:
+      return (double)INSTR_UPFILL_LAMBDA;
+    case DELTA_PRIO_UPFILL_HIT:
+      return (double)INSTR_UPFILL_PROMOTE_LAMBDA;
     default:
       return 0.0;
   }
@@ -514,6 +575,15 @@ static void load_prio_levels_init(Cache* cache) {
      now. The first fill after the first adjustment would compute a boost that is not in it and
      die in load_prio_level_of. Refuse the combination here, where the message can say why,
      instead of 2^20 instructions into the run with an assert about a float not being found. */
+  /* --instr_upfill's two classes add boosts the level table does not enumerate either -- but only
+     when their lambdas are nonzero. A demotion run with both at 0 (the usual standalone
+     measurement) contributes boost 0, which IS in the table, so it stays compatible. */
+  ASSERTM(0, !(INSTR_UPFILL && (INSTR_UPFILL_LAMBDA != 0.0 || INSTR_UPFILL_PROMOTE_LAMBDA != 0.0)),
+          "--load_prio_stats cannot be combined with a nonzero --instr_upfill_lambda or "
+          "--instr_upfill_promote_lambda: the priority level table for cache '%s' enumerates the "
+          "cost and boundness terms only. Run the demotion with both lambdas at 0 to plot levels.\n",
+          cache->name);
+
   /* --fdip_delta_place adds a third sticky term to the boost, which multiplies the reachable
      combinations past what prio_boost[] enumerates. Same failure as a moving lambda, same
      refusal. */
@@ -1172,6 +1242,7 @@ void init_cache(Cache* cache, const char* name, uns cache_size, uns assoc, uns l
       cache->entries[ii][jj].mlp_cost = 0.0;
       cache->entries[ii][jj].fill_was_prefetch = FALSE;
       cache->entries[ii][jj].delta_prio = DELTA_PRIO_NONE;
+      cache->entries[ii][jj].instr_line = FALSE;
       cache->entries[ii][jj].was_written = FALSE;
       cache->entries[ii][jj].offpath_unproven = FALSE;
       cache->entries[ii][jj].fe_bound_fill = FALSE;
@@ -1552,6 +1623,7 @@ void cache_invalidate(Cache* cache, Addr addr, Addr* line_addr) {
       line->mlp_cost = 0.0;
       line->fill_was_prefetch = FALSE;
       line->delta_prio = DELTA_PRIO_NONE;
+      line->instr_line = FALSE;
       line->was_written = FALSE;
       line->offpath_unproven = FALSE;
       line->fe_bound_fill = FALSE;
@@ -2620,6 +2692,7 @@ void general_action_init(Cache* cache, const char* name, uns cache_size, uns ass
       cache->entries[ii][jj].mlp_cost = 0.0;
       cache->entries[ii][jj].fill_was_prefetch = FALSE;
       cache->entries[ii][jj].delta_prio = DELTA_PRIO_NONE;
+      cache->entries[ii][jj].instr_line = FALSE;
       cache->entries[ii][jj].was_written = FALSE;
       cache->entries[ii][jj].offpath_unproven = FALSE;
       cache->entries[ii][jj].fe_bound_fill = FALSE;

@@ -320,6 +320,11 @@ uns num_offchip_stall_reqs(uns proc_id);
    every run with the arm off). See the classifier in memory.c. */
 uns8 instr_place_l1i_class(Mem_Req* req);
 
+/* --instr_upfill: demote a line the L1I has just evicted into the MLC (or the LLC when no MLC is
+   configured). No-ops when the knob is off, when the line is already resident there, or when
+   making room would need a writeback. */
+void instr_upfill_to_mlc(uns8 proc_id, Addr line_addr);
+
 Mem_Req* mem_search_reqbuf_wrapper(uns8 proc_id, Addr addr, Mem_Req_Type type, uns size, Flag* demand_hit_prefetch,
                                    Flag* demand_hit_writeback, uns queues_to_search, Mem_Queue_Entry** queue_entry,
                                    Flag* ramulator_match);

@@ -223,6 +223,7 @@ struct Mem_Req_struct {
 Flag mem_req_type_is_demand(Mem_Req_Type type);
 Flag mem_req_type_is_prefetch(Mem_Req_Type type);
 Flag mem_req_type_is_instr_prefetch(Mem_Req_Type type);
+Flag mem_req_type_is_instr(Mem_Req_Type type);
 Flag mem_req_type_is_stalling(Mem_Req_Type type);
 
 /* Returns whether this type either started or was ever coalesced into this mem_req. */
