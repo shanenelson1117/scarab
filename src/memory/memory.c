@@ -1179,6 +1179,22 @@ void mem_set_next_req_no_prefetch(Flag no_prefetch) {
   g_next_req_no_prefetch = no_prefetch;
 }
 
+/* --ifetch_xtion_stats: monotonic count of INSERTIONS INTO THE MLC, the unit the transition
+   matrix measures reuse distance in. Every insertion is counted, not just the MLC_FILL
+   population: MLC_FILL excludes writeback fills (they go to MLC_WB_FILL) and counts no
+   demotions, yet all three consume a way, and a distance meant to be compared against MLC
+   capacity has to count every allocation opportunity. Same reasoning as --load_prio_stats'
+   per-set miss clock.
+   NOT ROI-gated and not knob-gated: a distance that spans the warmup boundary must still be
+   measured, and one increment per MLC fill is not worth a branch. It therefore does NOT equal
+   MLC_FILL + MLC_WB_FILL in the stats, which are gated; the relationship holds within the
+   window only. */
+static Counter mlc_fill_clock = 0;
+
+Counter mem_mlc_fill_clock(void) {
+  return mlc_fill_clock;
+}
+
 static Counter order_num = 1;
 Counter mem_seq_num = 1;
 static Counter l1_seq_num = 1;
@@ -2004,6 +2020,8 @@ static inline void instr_upfill_insert(Cache* cache, uns8 proc_id, Addr line_add
      other silently put the two on different denominators and made that arithmetic wrong. */
   load_prio_snapshot_set(proc_id, cache, line_addr, is_mlc);
   L1_Data* data = (L1_Data*)cache_insert(cache, proc_id, line_addr, &ins_line_addr, &repl_line_addr);
+  if (is_mlc)
+    mlc_fill_clock++; /* --ifetch_xtion_stats: a demotion consumes an MLC way like any fill */
   cache_restore_fill_stage(&saved);
   /* FALSE: a demotion is not a demand fill. No access asked for this line -- the level below
      stopped wanting it. Counting it as one would put the whole demoted population into the
@@ -7362,6 +7380,7 @@ Flag mlc_fill_line(Mem_Req* req) {
                                            &repl_line_addr, mem->pref_replpos, TRUE);
   } else {
     data = (MLC_Data*)cache_insert(&MLC(req->proc_id)->cache, req->proc_id, req->addr, &line_addr, &repl_line_addr);
+    mlc_fill_clock++; /* --ifetch_xtion_stats: one allocation opportunity in the MLC */
   }
 
   /* --early_evict_stats: see the matching block in the L1 fill for why this reads immediately

@@ -110,6 +110,91 @@ DEF_PARAM(perfect_icache, PERFECT_ICACHE, Flag, Flag,
    (ICACHE_UNIQUE_FILL_LINES). Measurement only -- one hash lookup per fill,
    no effect on timing. */
 DEF_PARAM(icache_footprint, ICACHE_FOOTPRINT, Flag, Flag, TRUE, )
+
+/* --ifetch_xtion_stats: a TRANSITION MATRIX over per-line instruction-fetch outcomes.
+ *
+ * For every on-path instruction fetch, classify the outcome into one of five categories, look up
+ * what the PREVIOUS fetch of that same line was classified as, and charge the matrix square
+ * [previous][current]. The question it answers is not "how often does each outcome happen" --
+ * ICACHE_MISS_NOT_PREFETCHED and friends already say that -- but "what does a line's history
+ * predict about its next fetch": does a line that FDIP missed once keep being missed, or does the
+ * prefetcher pick it up next time round.
+ *
+ * PURELY DESCRIPTIVE. The five categories are a partition of fetch outcomes and the ordering
+ * below is declaration order, nothing else. No category is treated as better or worse than any
+ * other anywhere in the implementation, and the chain carries no weighting.
+ *
+ * THE FIVE CATEGORIES, and exactly what lands in each:
+ *   TIMELY  the line was resident in the L1I when the fetch arrived. Includes a --perfect_icache
+ *           synthesized hit, which has no line behind it, and includes a hit on a line a previous
+ *           DEMAND fetch installed -- residency is what is observed here, not provenance.
+ *   DMISS   the fetch missed the L1I and NO request for the line was in flight, so the fetch
+ *           itself had to go out. This is get_miss_reason returning IMISS_NOT_PREFETCHED (FDIP
+ *           never produced the line) or IMISS_TOO_EARLY_EVICTED_BY_{IFETCH,FDIP} (it did, and the
+ *           line was evicted before use). Both are "no request in flight", which is the defining
+ *           property; read the existing ICACHE_MISS_* chains to split them.
+ *   MSHORT  the fetch missed and merged into an in-flight prefetch whose in-flight time at the
+ *           merge was BELOW the edge.
+ *   MLONG   the same, with in-flight time AT OR ABOVE the edge.
+ *           The edge is --ifetch_xtion_merge_edge, defaulting to L1_CYCLES, and the measured
+ *           quantity is cycle_count - req->emitted_cycle. emitted_cycle rather than
+ *           fdip_emitted_cycle for the reason mem_req_match_reqbuf documents: the latter is set
+ *           only for the two FDIP types, while MRT_IPRF is an instruction prefetch a demand can
+ *           merge into just the same.
+ *   OTHER   a request for the line WAS in flight, but it is not attributable to a live prefetch --
+ *           get_miss_reason returned a non-MSHR-hit reason while a request existed. That happens
+ *           when the fetch merged into another DEMAND fetch's request, and when the prefetch that
+ *           covers the line was issued before FDIP's last recovery cycle (get_miss_reason treats
+ *           such a prefetch as not having happened). A real and bounded case, not a grab bag.
+ *
+ * ON-PATH ONLY. An off-path fetch is recorded nowhere and does not advance the clock below. A
+ * wrong-path fetch of a line says nothing about what the line's next on-path fetch will be, and
+ * letting it overwrite the stored category would make every square downstream of a mispredict
+ * describe speculation rather than the program.
+ *
+ * NOT CACHE-INDEXED. The previous category lives in its own open hash table keyed on line
+ * address, never in Cache_Entry, so a line that is evicted and refetched keeps its history -- the
+ * whole point is to follow a line ACROSS evictions. The table is unbounded, like
+ * icache_footprint_lines, and sized by --ifetch_xtion_buckets -- whose default is one bucket per
+ * line of the largest footprint these traces reach, so lookups stay O(1) in practice.
+ *
+ * REUSE DISTANCE PER SQUARE, IN MLC FILLS. Each square also accumulates the distance between the
+ * two fetches it connects, measured in INSERTIONS INTO THE MLC -- allocation opportunities at the
+ * L2, counting the ordinary fill path, writeback fills and --instr_upfill demotions alike, since
+ * all three consume a way. IFETCH_XTION_RD_<from>_<to> is the SUM and its ratio column is the
+ * mean distance for that square.
+ *
+ * WHY THAT UNIT: it makes a mean distance directly comparable against MLC CAPACITY
+ * (--mlc_cache_assoc x sets). A reuse inside capacity could have been served from the MLC if
+ * nothing displaced the line; one outside it could not have been, whatever the policy. A distance
+ * in fetches or cycles answers no such question. 0 is a real value -- no MLC fill intervened, so
+ * nothing could have displaced the line -- the same convention --load_prio_stats uses.
+ *
+ * The clock is NOT ROI-gated, so it does not equal MLC_FILL + MLC_WB_FILL in the stats (those
+ * are); the relationship holds inside the target window only. And because demotions advance it,
+ * the unit itself shifts between an --instr_upfill arm and a baseline: compare distances against
+ * capacity within an arm, and be careful comparing them across arms.
+ *
+ * Do NOT compare these against the --reuse_dist_stats or --load_prio_stats chains: those count
+ * per-SET accesses and per-SET misses, on different clocks with different populations.
+ *
+ * FIRST TOUCH. A line with no stored history has no predecessor and no distance, so it is charged
+ * to IFETCH_XTION_FIRST_<current> instead and contributes to no square. sum(squares) +
+ * sum(FIRST_*) is every recorded on-path fetch, which is the closure check.
+ *
+ * WINDOW: target-only, on the early_evict_in_roi() gate, like every other counter in this family.
+ * The per-line history and the clock are NOT gated -- a line first fetched during warmup must
+ * still carry a category into the target window, or every early transition reads as FIRST. */
+DEF_PARAM(ifetch_xtion_stats, IFETCH_XTION_STATS, Flag, Flag, FALSE, )
+/* 0 means "use L1_CYCLES", so the edge tracks the configured LLC latency unless pinned. */
+DEF_PARAM(ifetch_xtion_merge_edge, IFETCH_XTION_MERGE_EDGE, uns, uns, 0, )
+/* Sized for one entry per bucket at the largest instruction footprint these traces reach.
+   Measured with NORESET_ICACHE_UNIQUE_FILL_LINES on the google set: 43k (arizona) to 186,438
+   (sierra.a.3) distinct instruction lines per run, so 2^18 leaves the worst workload at 0.71
+   entries per bucket and costs 2MB of bucket array. Raise it for a larger footprint -- the table
+   never evicts, so a run that touches more lines than this just chains. A power of two is
+   expected: HASH_INDEX derives its fold width from the bucket count. */
+DEF_PARAM(ifetch_xtion_buckets, IFETCH_XTION_BUCKETS, uns, uns, 262144, )
 DEF_PARAM(icache_read_ports, ICACHE_READ_PORTS, uns, uns, 1, )
 DEF_PARAM(icache_write_ports, ICACHE_WRITE_PORTS, uns, uns, 1, )
 DEF_PARAM(icache_banks, ICACHE_BANKS, uns, uns, 8, )

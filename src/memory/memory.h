@@ -288,6 +288,10 @@ Flag membound_in_roi(void);
    *_EARLY_EVICT counters are target-only. Shared with dcache_stage.c and icache_stage.c so all
    four caches' counters sit on one window. See the definition in memory.c. */
 Flag early_evict_in_roi(void);
+/* --ifetch_xtion_stats: monotonic count of insertions into the MLC -- the unit the per-line
+   fetch-outcome transition matrix measures reuse distance in. See the definition in memory.c for
+   what is and is not counted. Always valid; no knob gates it. */
+Counter mem_mlc_fill_clock(void);
 /* --td_load_rrip_fixup: this load's membound window has closed and its fraction is final --
    rewrite the RRPV of the lines its fill installed, wherever they are still resident. Called
    from lsq.cc at the window-closing event (completion, retirement, or branch recovery, per

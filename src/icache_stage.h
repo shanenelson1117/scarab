@@ -142,6 +142,12 @@ typedef struct Icache_Stage_struct {
      growth is what NORESET_ICACHE_UNIQUE_FILL_LINES reports, over the whole run including
      warmup. Only allocated if ICACHE_FOOTPRINT. */
   Hash_Table icache_footprint_lines;
+  /* --ifetch_xtion_stats: per-line fetch-outcome history, keyed on line address. Deliberately
+     NOT in Cache_Entry: the matrix exists to follow a line ACROSS evictions, so the history has
+     to outlive residency. Unbounded, like icache_footprint_lines above; sized by
+     --ifetch_xtion_buckets. Holds one Ifetch_Xtion_Entry per line ever fetched on-path. */
+  Hash_Table ifetch_xtion_lines;
+
   char rand_wb_state[31]; /* State of random number generator for random writeback */
 } Icache_Stage;
 

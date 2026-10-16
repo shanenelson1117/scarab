@@ -102,6 +102,26 @@ static inline void icache_miss_events(void);
 static inline Flag mem_req_on_icache_miss(void);
 static inline Inst_Info** ic_pref_cache_access(void);
 static inline int32_t inst_lost_get_full_window_reason(void);
+/**************************************************************************************/
+/* --ifetch_xtion_stats: per-line fetch-outcome transition matrix.
+ *
+ * PURELY DESCRIPTIVE. The five categories partition on-path instruction fetch outcomes; the enum
+ * order is declaration order and nothing ranks them. See memory.param.def for each definition. */
+typedef enum Ifetch_Xtion_Cat_enum {
+  IFETCH_XTION_CAT_TIMELY = 0, /* resident in the L1I when the fetch arrived */
+  IFETCH_XTION_CAT_DMISS,      /* missed, and no request for the line was in flight */
+  IFETCH_XTION_CAT_MSHORT,     /* merged with an FDIP prefetch, in-flight time below the edge */
+  IFETCH_XTION_CAT_MLONG,      /* merged with an FDIP prefetch, in-flight time at/above the edge */
+  IFETCH_XTION_CAT_OTHER,      /* a request was in flight, but FDIP did not create it */
+  IFETCH_XTION_NUM_CATS,
+} Ifetch_Xtion_Cat;
+
+typedef struct Ifetch_Xtion_Entry_struct {
+  uns8    last_cat;   /* an Ifetch_Xtion_Cat; only meaningful once seen is TRUE */
+  Flag    seen;       /* FALSE on a fresh hash entry, so last_cat 0 is not read as TIMELY */
+  Counter last_clock; /* mem_mlc_fill_clock() at this line's previous recorded fetch */
+} Ifetch_Xtion_Entry;
+
 static inline void log_stats_ic_miss(void);
 static inline void log_stats_ic_hit(void);
 static inline void log_stats_mshr_hit(Addr line_addr);
@@ -286,6 +306,11 @@ void init_icache_stage(uns8 proc_id, const char* name) {
      clearing the set would lose it from the count rather than recount it. */
   if (ICACHE_FOOTPRINT)
     init_hash_table(&ic->icache_footprint_lines, "IC_FOOTPRINT", ICACHE_FOOTPRINT_BUCKETS, sizeof(uns8));
+  /* --ifetch_xtion_stats: outside the --icache_footprint arm above; its own knob owns it. The
+     distance clock is not here -- it is the MLC fill counter in memory.c, read through
+     mem_mlc_fill_clock(), because the unit is allocation opportunities at the L2. */
+  if (IFETCH_XTION_STATS)
+    init_hash_table(&ic->ifetch_xtion_lines, "IFETCH_XTION", IFETCH_XTION_BUCKETS, sizeof(Ifetch_Xtion_Entry));
 
   // moved the init code from here to reset
   reset_icache_stage();
@@ -1673,6 +1698,95 @@ static inline int32_t inst_lost_get_full_window_reason() {
   return 0;
 }
 
+/* The MSHORT/MLONG edge, in cycles of prefetch in-flight time at the merge. 0 means "track
+   L1_CYCLES", so the edge follows the configured LLC latency unless deliberately pinned. */
+static inline Counter ifetch_xtion_edge(void) {
+  return IFETCH_XTION_MERGE_EDGE ? (Counter)IFETCH_XTION_MERGE_EDGE : (Counter)L1_CYCLES;
+}
+
+/* Record one fetch outcome and charge the square it closes.
+ *
+ * ON-PATH ONLY, and the clock does not advance for an off-path fetch: a wrong-path fetch says
+ * nothing about what the line's next on-path fetch will be, and letting it overwrite last_cat
+ * would make every square downstream of a mispredict describe speculation.
+ *
+ * The per-line history and the clock are updated whether or not the ROI gate is open, so a line
+ * first fetched in warmup carries a category into the target window instead of reading as FIRST;
+ * only the STAT_EVENTs are gated. */
+static inline void ifetch_xtion_record(Addr line_addr, Ifetch_Xtion_Cat cat) {
+  if (!IFETCH_XTION_STATS || icache_off_path())
+    return;
+  ASSERT(ic->proc_id, cat < IFETCH_XTION_NUM_CATS);
+
+  /* KEYED ON THE CACHE LINE NUMBER, not the address. The mask makes the key independent of
+     whatever the caller passed -- ic->line_addr is already line-aligned (cache_index clears
+     offset_mask on any cache with tag_incl_offset FALSE, which the icache is), but a future
+     caller handing in a raw fetch VA must not create a second entry for the same line.
+     The shift then matters for DISTRIBUTION. HASH_INDEX XOR-folds the key in log2(buckets)-wide
+     chunks, so a byte address spends the bottom 6 bits of its first fold round on bits that are
+     always zero; shifting them off puts the full index width to work. */
+  const Addr line_num = (line_addr & ~((Addr)ICACHE_LINE_SIZE - 1)) >> LOG2(ICACHE_LINE_SIZE);
+
+  Flag new_entry = FALSE;
+  Ifetch_Xtion_Entry* e = (Ifetch_Xtion_Entry*)hash_table_access_create(&ic->ifetch_xtion_lines, (int64)line_num,
+                                                                        &new_entry);
+  /* DISTANCE IS IN MLC FILLS -- insertions into the L2, i.e. allocation opportunities there --
+     not in fetches, cycles or instructions. That makes a square's mean distance directly
+     comparable against MLC CAPACITY (assoc x num_sets): a reuse that falls inside capacity could
+     have been served from the MLC had nothing displaced the line, and one outside it could not.
+     A distance of 0 is a real measurement, not a sentinel: no MLC fill intervened between the two
+     fetches, so nothing could have displaced the line. Same convention as --load_prio_stats. */
+  const Counter now = mem_mlc_fill_clock();
+
+  if (early_evict_in_roi()) {
+    if (!new_entry && e->seen) {
+      const uns sq = (uns)e->last_cat * (uns)IFETCH_XTION_NUM_CATS + (uns)cat;
+      STAT_EVENT(ic->proc_id, IFETCH_XTION_TIMELY_TIMELY + sq);
+      /* now >= last_clock always: the clock is monotonic and was stamped at an earlier fetch.
+         Guarded anyway because Counter is unsigned and the alternative to a guard is a 2^64
+         outlier in the mean. */
+      INC_STAT_EVENT(ic->proc_id, IFETCH_XTION_RD_TIMELY_TIMELY + sq,
+                     (now > e->last_clock) ? now - e->last_clock : 0);
+    } else {
+      /* No predecessor, so no square and no distance. Counted here so that
+         sum(squares) + sum(FIRST_*) is every recorded on-path fetch. */
+      STAT_EVENT(ic->proc_id, IFETCH_XTION_FIRST_TIMELY + (uns)cat);
+    }
+  }
+
+  e->last_cat = (uns8)cat;
+  e->seen = TRUE;
+  e->last_clock = now;
+}
+
+/* Classify an L1I MISS. `req` is whatever mem_search_reqbuf found for this line, which matches on
+ * ADDRESS ALONE -- the type argument to that search only steers demand_hit_prefetch -- so a
+ * non-NULL req means "some request is in flight", not "a prefetch is in flight".
+ *
+ * A MERGE IS ONLY A MERGE WITH AN FDIP PREFETCH. The test is req->type, the type that CREATED
+ * the request, not the req->types bitmask: the bitmask would also be set when a demand created
+ * the request and an FDIP prefetch merged into it afterwards, which is the opposite situation --
+ * the prefetch arrived late and hid nothing. req->type is safe to read this way because it is
+ * never promoted for instruction traffic: the promotion in mem_req_match_reqbuf sits inside
+ * `if (op)` and an ifetch request carries op == NULL, and the priority promotion needs
+ * --promote_to_higher_priority_mem_req_type, which defaults FALSE.
+ *
+ * Everything else with a request in flight is OTHER: merged into another DEMAND fetch's request,
+ * or into an MRT_IPRF from a software instruction prefetcher. That can disagree with
+ * get_miss_reason, which keys on FDIP's own bookkeeping and discounts prefetches issued before
+ * the last recovery cycle; the disagreement is visible as (MSHORT + MLONG) against
+ * ICACHE_MISS_MSHR_HIT_PREFETCHED_{ON,OFF}PATH. */
+static inline Ifetch_Xtion_Cat ifetch_xtion_classify_miss(Mem_Req* req) {
+  if (!req)
+    return IFETCH_XTION_CAT_DMISS;
+  if (req->type != MRT_FDIPPRFON && req->type != MRT_FDIPPRFOFF)
+    return IFETCH_XTION_CAT_OTHER;
+  /* emitted_cycle, not fdip_emitted_cycle: see the note in mem_req_match_reqbuf. Guarded against
+     a clock that has not advanced, which makes the delta 0 and lands in MSHORT. */
+  const Counter delta = (cycle_count > req->emitted_cycle) ? cycle_count - req->emitted_cycle : 0;
+  return (delta >= ifetch_xtion_edge()) ? IFETCH_XTION_CAT_MLONG : IFETCH_XTION_CAT_MSHORT;
+}
+
 static inline void log_stats_ic_miss() {
   STAT_EVENT(ic->proc_id, ICACHE_MISS);
   STAT_EVENT(ic->proc_id, POWER_ICACHE_MISS);
@@ -1686,6 +1800,9 @@ static inline void log_stats_ic_hit() {
      class. Reads state published by that cache_access, so it has to stay on the hit path and
      ahead of any further access to ic->icache. */
   icache_delta_count_hit();
+  /* --ifetch_xtion_stats: the line was resident, which is the TIMELY category. ic->line_addr is
+     the line lookup_icache resolved for this fetch. */
+  ifetch_xtion_record(ic->line_addr, IFETCH_XTION_CAT_TIMELY);
 }
 
 void log_stats_mshr_hit(Addr line_addr) {
@@ -1769,6 +1886,10 @@ void log_stats_mshr_hit(Addr line_addr) {
     else
       STAT_EVENT(ic->proc_id, ICACHE_MISS_NOT_PREFETCHED);
   }
+  /* --ifetch_xtion_stats: same `req` the branches above classified on, so the matrix and the
+     ICACHE_MISS_* chains describe one population. Uses line_addr, the argument, which is the line
+     this miss is for. */
+  ifetch_xtion_record(line_addr, ifetch_xtion_classify_miss(req));
   DEBUG_FDIP(ic->proc_id, "set last miss reason %u for %llx\n", imiss_reason, ic->line_addr);
   set_last_miss_reason(imiss_reason);
 }

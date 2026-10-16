@@ -5094,3 +5094,106 @@ DEF_STAT(  L1_DELTA_OCCUP_UPFILL_HIT                   , COUNT , NO_RATIO       
 DEF_STAT(  L1_DELTA_OCCUP_NO_PREF                      , COUNT , NO_RATIO                   )
 DEF_STAT(  L1_DELTA_OCCUP_LATE_PREF                    , DIST  , NO_RATIO                   )
 
+
+
+/**************************************************************************************/
+/* --ifetch_xtion_stats: per-line instruction-fetch OUTCOME TRANSITION MATRIX.
+   See the --ifetch_xtion_stats comment in memory.param.def for the exact definition of each
+   category; in brief, for every on-path instruction fetch the outcome is classified as
+
+     TIMELY  resident in the L1I          MSHORT  merged, in-flight time below the edge
+     DMISS   missed, nothing in flight    MLONG   merged, in-flight time at or above the edge
+                                          OTHER   a request was in flight but was not a live prefetch
+
+   and the square [previous fetch of this line][this fetch] is charged.
+
+   PURELY DESCRIPTIVE. Declaration order is the Ifetch_Xtion_Cat enum order and carries no
+   ranking; no category is weighted or treated as preferable anywhere.
+
+   THE ORDER IS A CONTRACT. Squares are charged as <base> + from*5 + to, so the 25 entries below
+   must stay contiguous and in enum order, grouped by FROM. Adding a category means adding it last
+   in the enum and rebuilding all three chains.
+
+   IFETCH_XTION_RD_<from>_<to> is the SUMMED distance between the two fetches a square connects,
+   measured in MLC FILLS (insertions into the L2: ordinary fills, writeback fills and
+   --instr_upfill demotions). Its ratio column is the mean distance for that square, and the
+   number to compare it against is MLC CAPACITY -- assoc x sets -- since a reuse inside capacity
+   could have been served from the MLC and one outside it could not. 0 is a real value.
+   It is NOT comparable with the --reuse_dist_stats or --load_prio_stats distances, which are
+   per-SET accesses and per-SET misses on different clocks.
+
+   IFETCH_XTION_FIRST_<to> holds fetches of a line with no recorded history, which have no
+   predecessor and no distance. CLOSURE CHECK: sum(all 25 squares) + sum(FIRST_*) equals every
+   recorded on-path instruction fetch in the window.
+
+   WINDOW: target-only, on early_evict_in_roi(). Divide by Periodic_Instructions. */
+/**************************************************************************************/
+
+/* The 25 squares, grouped by FROM. */
+DEF_STAT(  IFETCH_XTION_TIMELY_TIMELY                  , DIST  , NO_RATIO                   )
+DEF_STAT(  IFETCH_XTION_TIMELY_DMISS                   , COUNT , NO_RATIO                   )
+DEF_STAT(  IFETCH_XTION_TIMELY_MSHORT                  , COUNT , NO_RATIO                   )
+DEF_STAT(  IFETCH_XTION_TIMELY_MLONG                   , COUNT , NO_RATIO                   )
+DEF_STAT(  IFETCH_XTION_TIMELY_OTHER                   , COUNT , NO_RATIO                   )
+
+DEF_STAT(  IFETCH_XTION_DMISS_TIMELY                   , COUNT , NO_RATIO                   )
+DEF_STAT(  IFETCH_XTION_DMISS_DMISS                    , COUNT , NO_RATIO                   )
+DEF_STAT(  IFETCH_XTION_DMISS_MSHORT                   , COUNT , NO_RATIO                   )
+DEF_STAT(  IFETCH_XTION_DMISS_MLONG                    , COUNT , NO_RATIO                   )
+DEF_STAT(  IFETCH_XTION_DMISS_OTHER                    , COUNT , NO_RATIO                   )
+
+DEF_STAT(  IFETCH_XTION_MSHORT_TIMELY                  , COUNT , NO_RATIO                   )
+DEF_STAT(  IFETCH_XTION_MSHORT_DMISS                   , COUNT , NO_RATIO                   )
+DEF_STAT(  IFETCH_XTION_MSHORT_MSHORT                  , COUNT , NO_RATIO                   )
+DEF_STAT(  IFETCH_XTION_MSHORT_MLONG                   , COUNT , NO_RATIO                   )
+DEF_STAT(  IFETCH_XTION_MSHORT_OTHER                   , COUNT , NO_RATIO                   )
+
+DEF_STAT(  IFETCH_XTION_MLONG_TIMELY                   , COUNT , NO_RATIO                   )
+DEF_STAT(  IFETCH_XTION_MLONG_DMISS                    , COUNT , NO_RATIO                   )
+DEF_STAT(  IFETCH_XTION_MLONG_MSHORT                   , COUNT , NO_RATIO                   )
+DEF_STAT(  IFETCH_XTION_MLONG_MLONG                    , COUNT , NO_RATIO                   )
+DEF_STAT(  IFETCH_XTION_MLONG_OTHER                    , COUNT , NO_RATIO                   )
+
+DEF_STAT(  IFETCH_XTION_OTHER_TIMELY                   , COUNT , NO_RATIO                   )
+DEF_STAT(  IFETCH_XTION_OTHER_DMISS                    , COUNT , NO_RATIO                   )
+DEF_STAT(  IFETCH_XTION_OTHER_MSHORT                   , COUNT , NO_RATIO                   )
+DEF_STAT(  IFETCH_XTION_OTHER_MLONG                    , COUNT , NO_RATIO                   )
+DEF_STAT(  IFETCH_XTION_OTHER_OTHER                    , DIST  , NO_RATIO                   )
+
+/* Summed inter-fetch distance per square; the ratio column is the mean. */
+DEF_STAT(  IFETCH_XTION_RD_TIMELY_TIMELY               , RATIO , IFETCH_XTION_TIMELY_TIMELY )
+DEF_STAT(  IFETCH_XTION_RD_TIMELY_DMISS                , RATIO , IFETCH_XTION_TIMELY_DMISS  )
+DEF_STAT(  IFETCH_XTION_RD_TIMELY_MSHORT               , RATIO , IFETCH_XTION_TIMELY_MSHORT )
+DEF_STAT(  IFETCH_XTION_RD_TIMELY_MLONG                , RATIO , IFETCH_XTION_TIMELY_MLONG  )
+DEF_STAT(  IFETCH_XTION_RD_TIMELY_OTHER                , RATIO , IFETCH_XTION_TIMELY_OTHER  )
+
+DEF_STAT(  IFETCH_XTION_RD_DMISS_TIMELY                , RATIO , IFETCH_XTION_DMISS_TIMELY  )
+DEF_STAT(  IFETCH_XTION_RD_DMISS_DMISS                 , RATIO , IFETCH_XTION_DMISS_DMISS   )
+DEF_STAT(  IFETCH_XTION_RD_DMISS_MSHORT                , RATIO , IFETCH_XTION_DMISS_MSHORT  )
+DEF_STAT(  IFETCH_XTION_RD_DMISS_MLONG                 , RATIO , IFETCH_XTION_DMISS_MLONG   )
+DEF_STAT(  IFETCH_XTION_RD_DMISS_OTHER                 , RATIO , IFETCH_XTION_DMISS_OTHER   )
+
+DEF_STAT(  IFETCH_XTION_RD_MSHORT_TIMELY               , RATIO , IFETCH_XTION_MSHORT_TIMELY )
+DEF_STAT(  IFETCH_XTION_RD_MSHORT_DMISS                , RATIO , IFETCH_XTION_MSHORT_DMISS  )
+DEF_STAT(  IFETCH_XTION_RD_MSHORT_MSHORT               , RATIO , IFETCH_XTION_MSHORT_MSHORT )
+DEF_STAT(  IFETCH_XTION_RD_MSHORT_MLONG                , RATIO , IFETCH_XTION_MSHORT_MLONG  )
+DEF_STAT(  IFETCH_XTION_RD_MSHORT_OTHER                , RATIO , IFETCH_XTION_MSHORT_OTHER  )
+
+DEF_STAT(  IFETCH_XTION_RD_MLONG_TIMELY                , RATIO , IFETCH_XTION_MLONG_TIMELY  )
+DEF_STAT(  IFETCH_XTION_RD_MLONG_DMISS                 , RATIO , IFETCH_XTION_MLONG_DMISS   )
+DEF_STAT(  IFETCH_XTION_RD_MLONG_MSHORT                , RATIO , IFETCH_XTION_MLONG_MSHORT  )
+DEF_STAT(  IFETCH_XTION_RD_MLONG_MLONG                 , RATIO , IFETCH_XTION_MLONG_MLONG   )
+DEF_STAT(  IFETCH_XTION_RD_MLONG_OTHER                 , RATIO , IFETCH_XTION_MLONG_OTHER   )
+
+DEF_STAT(  IFETCH_XTION_RD_OTHER_TIMELY                , RATIO , IFETCH_XTION_OTHER_TIMELY  )
+DEF_STAT(  IFETCH_XTION_RD_OTHER_DMISS                 , RATIO , IFETCH_XTION_OTHER_DMISS   )
+DEF_STAT(  IFETCH_XTION_RD_OTHER_MSHORT                , RATIO , IFETCH_XTION_OTHER_MSHORT  )
+DEF_STAT(  IFETCH_XTION_RD_OTHER_MLONG                 , RATIO , IFETCH_XTION_OTHER_MLONG   )
+DEF_STAT(  IFETCH_XTION_RD_OTHER_OTHER                 , RATIO , IFETCH_XTION_OTHER_OTHER   )
+
+/* Fetches of a line with no recorded history: no predecessor, no distance. */
+DEF_STAT(  IFETCH_XTION_FIRST_TIMELY                   , DIST  , NO_RATIO                   )
+DEF_STAT(  IFETCH_XTION_FIRST_DMISS                    , COUNT , NO_RATIO                   )
+DEF_STAT(  IFETCH_XTION_FIRST_MSHORT                   , COUNT , NO_RATIO                   )
+DEF_STAT(  IFETCH_XTION_FIRST_MLONG                    , COUNT , NO_RATIO                   )
+DEF_STAT(  IFETCH_XTION_FIRST_OTHER                    , DIST  , NO_RATIO                   )
