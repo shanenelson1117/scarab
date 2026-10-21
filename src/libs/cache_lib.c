@@ -3477,29 +3477,38 @@ static uns8 g_srrip_t_insert[SRRIP_T_NUM_FILL];
 static uns8 g_srrip_t_pv[SRRIP_T_NUM_HIT][SRRIP_T_NUM_RRPV];
 static Flag g_srrip_t_parsed = FALSE;
 
-/* Parse exactly `n` comma-separated RRPVs from `spec` into `out`. Fatal on a short list, a long
-   list, an unparseable token or a value outside 0..SRRIP_T_MAX_RRPV. The range check is a
-   correctness requirement, not tidiness: srrip_t_update_evict ages by +1 until some line reads
-   exactly the distant value, so a line installed above it would never become a victim and the
-   aging loop would not terminate. */
+/* Parse exactly `n` RRPVs from `spec`, one DECIMAL DIGIT each, into `out`.
+ *
+ * A DIGIT STRING, NOT A DELIMITED LIST: "66666" and "00000000". Every value is 0..7, so one digit
+ * is always enough and no separator is needed -- which is the point. scarab-infra passes a
+ * descriptor's "params" string through an UNQUOTED shell expansion ($SCARABPARAMS), so a value
+ * containing a quote arrives with the quote characters still in argv and fails to parse, while a
+ * value containing a space splits into two arguments. A separator-free token cannot hit either
+ * trap, and its fixed width doubles as the length check.
+ *
+ * Separators are nonetheless SKIPPED rather than rejected -- comma, space, tab, and both quote
+ * characters -- so "6,6,6,6,6" and even a stray '"6,6,6,6,6"' parse identically. That is
+ * deliberate leniency: the cost of accepting them is nothing, and the cost of rejecting them is a
+ * multi-hour sweep that dies at startup over punctuation.
+ *
+ * Fatal on a short list, a long list, an out-of-range digit or any other character. The range
+ * check is a correctness requirement, not tidiness: srrip_t_update_evict ages by +1 until some
+ * line reads the distant value, so a line installed above it would never become a victim. */
 static void srrip_t_parse(const char* name, const char* spec, uns8* out, int n) {
-  ASSERTM(0, spec && *spec, "--%s must be set to %d comma-separated RRPVs\n", name, n);
-  int         k = 0;
-  const char* p = spec;
-  while (*p) {
-    char*     end = NULL;
-    const long v = strtol(p, &end, 10);
-    if (end == p)
-      break;
+  ASSERTM(0, spec && *spec, "--%s must be %d digits, each 0..%d (e.g. \"%.*s\")\n", name, n, SRRIP_T_MAX_RRPV, n,
+          "00000000");
+  int k = 0;
+  for (const char* p = spec; *p; p++) {
+    if (*p == ',' || *p == ' ' || *p == '\t' || *p == '"' || *p == '\'')
+      continue;
+    ASSERTM(0, *p >= '0' && *p <= '9', "--%s contains '%c', which is not a digit ('%s')\n", name, *p, spec);
     ASSERTM(0, k < n, "--%s has more than %d values ('%s')\n", name, n, spec);
-    ASSERTM(0, v >= 0 && v <= SRRIP_T_MAX_RRPV, "--%s value %ld is outside 0..%d ('%s'); this policy has 3 bits\n",
-            name, v, SRRIP_T_MAX_RRPV, spec);
+    const int v = *p - '0';
+    ASSERTM(0, v <= SRRIP_T_MAX_RRPV, "--%s digit %d is above %d ('%s'); this policy has 3 bits of RRPV\n", name, v,
+            SRRIP_T_MAX_RRPV, spec);
     out[k++] = (uns8)v;
-    p = end;
-    while (*p == ',' || *p == ' ')
-      p++;
   }
-  ASSERTM(0, k == n, "--%s needs exactly %d comma-separated values, parsed %d from '%s'\n", name, n, k, spec);
+  ASSERTM(0, k == n, "--%s needs exactly %d digits, parsed %d from '%s'\n", name, n, k, spec);
 }
 
 static void srrip_t_init_tables(void) {
