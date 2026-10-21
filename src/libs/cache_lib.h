@@ -106,8 +106,57 @@ typedef enum Repl_Policy_enum {
                        on disagreement). Knobs are --mlp_paper_* in memory.param.def. Distinct
                        from REPL_MLP, which is the extended version. */
 
+  /* SRRIP with a PER-ACCESS-TYPE insertion value and promotion vector, 3 bits of RRPV (0..7).
+     Added LAST so every existing policy index is unchanged -- the descriptors name policies by
+     number (REPL_MLP is "9"), so inserting in the middle would silently repoint every run.
+     Knobs are --srrip_t_* in memory.param.def. */
+  REPL_SRRIP_T,
+
   NUM_REPL
 } Repl_Policy;
+
+/* REPL_SRRIP_T: how a FILL is classified, which selects its insertion RRPV.
+   Instruction prefetches split three ways on whether a demand caught the prefetch in flight and,
+   if so, how long it had been in flight -- the same quantity (Mem_Req.instr_merge_delta) and the
+   same edge the --ifetch_xtion_stats matrix uses. */
+typedef enum Srrip_T_Fill_enum {
+  SRRIP_T_FILL_PREF_NOMERGE = 0, /* instruction prefetch, no demand merged into it */
+  SRRIP_T_FILL_PREF_MLONG,       /* instruction prefetch, demand merged, lead >= edge */
+  SRRIP_T_FILL_PREF_MSHORT,      /* instruction prefetch, demand merged, lead < edge */
+  SRRIP_T_FILL_DEMAND_INSTR,     /* MRT_IFETCH: a demand instruction fetch created this request */
+  SRRIP_T_FILL_OTHER,            /* loads, stores, data prefetch, writebacks */
+  SRRIP_T_NUM_FILL,
+} Srrip_T_Fill;
+
+/* REPL_SRRIP_T: how a HIT is classified, which selects the promotion vector applied.
+ *
+ * A DIFFERENT TAXONOMY FROM THE FILL SIDE, and deliberately so. Two of the fill classes cannot
+ * occur on a hit at all: SRRIP_T_FILL_DEMAND_INSTR is a miss by definition, and the MLONG/MSHORT
+ * lead-time split describes the moment a demand caught a prefetch in flight, which is not a
+ * property of an access that found the line resident. What the hit side needs instead, and the
+ * fill side has no equivalent of, is the demand instruction HIT -- a fetch that found its line
+ * already in the MLC.
+ *
+ * So the merged-prefetch hit carries no lead-time distinction: SRRIP_T_HIT_PREF_MERGED covers
+ * every prefetch access with a demand already coalesced into it, whatever the lead. In practice
+ * such a hit is nearly always short-lead -- an MLC-served prefetch lives only
+ * bank-arbitration + MLC_CYCLES before its access -- but under queue congestion a long lead is
+ * reachable, so the class is named for what it is rather than for what it usually measures.
+ * SRRIP_T_LONG_LEAD_HITS counts the long-lead subset so the assumption stays auditable. */
+typedef enum Srrip_T_Hit_enum {
+  SRRIP_T_HIT_PREF_UNMERGED = 0, /* instruction prefetch, nothing waiting on it */
+  SRRIP_T_HIT_PREF_MERGED,       /* instruction prefetch with a demand coalesced in */
+  SRRIP_T_HIT_DEMAND_INSTR,      /* MRT_IFETCH found the line resident */
+  SRRIP_T_HIT_OTHER,             /* loads, stores, data prefetch, writebacks */
+  SRRIP_T_NUM_HIT,
+} Srrip_T_Hit;
+
+/* REPL_SRRIP_T: 3 bits of metadata, so an RRPV is 0..7 and 7 is the distant value the victim
+   scan looks for. Every insertion value and every promotion-vector entry is validated into this
+   range at init -- a value above it would make the aging loop in the victim scan unable to find
+   a victim. */
+#define SRRIP_T_MAX_RRPV 7
+#define SRRIP_T_NUM_RRPV (SRRIP_T_MAX_RRPV + 1)
 
 typedef enum Cache_Repl_Signiture_enum {
   CACHE_REPL_SIGH_PC,
@@ -692,6 +741,18 @@ void cache_put_fill_stage(Flag membound, Flag fe_bound, double bound_frac, doubl
 /* --mlp_lin_pref_lambda: stage / read the prefetch flag for the next fill. */
 void cache_set_next_fill_prefetch(Flag is_prefetch);
 void cache_set_next_fill_delta_prio(uns8 delta_prio);
+
+/* REPL_SRRIP_T: stage the access classification for the next operation on a cache running this
+ * policy. Two one-shots because a fill and a hit are classified on different taxonomies and the
+ * caller knows which it is about to perform -- an access stages the hit class, a fill stages the
+ * fill class. Same staging idiom as cache_set_marked_next_insert and mockingjay_stage_access:
+ * the policy functions take a void* arg that the strategy dispatcher always passes as NULL, so a
+ * one-shot is the only channel available.
+ *
+ * An unstaged operation falls back to the OTHER class, which is the right default: every caller
+ * that does not know about instruction traffic is data traffic. */
+void cache_set_next_srrip_t_fill(uns8 fill_class);
+void cache_set_next_srrip_t_hit(uns8 hit_class);
 /* --instr_upfill: tag the next fill as an instruction line. */
 void cache_set_next_fill_instr(Flag is_instr);
 

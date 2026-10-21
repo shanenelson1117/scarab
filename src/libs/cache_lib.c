@@ -106,6 +106,11 @@ static double g_next_fill_bound_frac = 0.0;
 static double g_next_fill_mlp_cost = 0.0;
 static Flag   g_next_fill_prefetch = FALSE;
 static uns8   g_next_fill_delta_prio = DELTA_PRIO_NONE;
+/* REPL_SRRIP_T one-shots. Default to the OTHER class in each taxonomy so an unstaged operation
+   -- any caller that does not know about instruction traffic -- lands on data-traffic behaviour
+   rather than on class 0, which is a prefetch class. Consumed and reset by the policy. */
+static uns8   g_next_srrip_t_fill = SRRIP_T_FILL_OTHER;
+static uns8   g_next_srrip_t_hit = SRRIP_T_HIT_OTHER;
 static Flag   g_next_fill_instr = FALSE;
 static Flag   g_next_fill_store = FALSE;
 static Flag   g_next_fill_offpath = FALSE;
@@ -156,6 +161,14 @@ void cache_set_next_fill_prefetch(Flag is_prefetch) {
 /* --fdip_delta_place: the placement class the next fill carries in this cache. */
 void cache_set_next_fill_delta_prio(uns8 delta_prio) {
   g_next_fill_delta_prio = delta_prio;
+}
+
+void cache_set_next_srrip_t_fill(uns8 fill_class) {
+  g_next_srrip_t_fill = (fill_class < SRRIP_T_NUM_FILL) ? fill_class : (uns8)SRRIP_T_FILL_OTHER;
+}
+
+void cache_set_next_srrip_t_hit(uns8 hit_class) {
+  g_next_srrip_t_hit = (hit_class < SRRIP_T_NUM_HIT) ? hit_class : (uns8)SRRIP_T_HIT_OTHER;
 }
 
 void cache_set_next_fill_instr(Flag is_instr) {
@@ -3451,6 +3464,117 @@ Cache_Entry* srrip_update_evict(Cache* cache, uns8 proc_id, uns set, uns* way, v
 }
 
 /**************************************************************************************/
+/* REPL_SRRIP_T: SRRIP with a per-access-type insertion value and promotion vector.
+ *
+ * 3 bits of metadata, so an RRPV is 0..7 and SRRIP_T_MAX_RRPV is the distant value. Deliberately
+ * its own constant rather than RRIP_DISTANT_VAL (4): widening that would change SRRIP, BRRIP,
+ * DRRIP, SHIP and marked-RRIP all at once, and every one of those has measurements behind it.
+ *
+ * See the --srrip_t_* block in memory.param.def for the knob semantics and the reason the fill
+ * and hit taxonomies differ. */
+
+static uns8 g_srrip_t_insert[SRRIP_T_NUM_FILL];
+static uns8 g_srrip_t_pv[SRRIP_T_NUM_HIT][SRRIP_T_NUM_RRPV];
+static Flag g_srrip_t_parsed = FALSE;
+
+/* Parse exactly `n` comma-separated RRPVs from `spec` into `out`. Fatal on a short list, a long
+   list, an unparseable token or a value outside 0..SRRIP_T_MAX_RRPV. The range check is a
+   correctness requirement, not tidiness: srrip_t_update_evict ages by +1 until some line reads
+   exactly the distant value, so a line installed above it would never become a victim and the
+   aging loop would not terminate. */
+static void srrip_t_parse(const char* name, const char* spec, uns8* out, int n) {
+  ASSERTM(0, spec && *spec, "--%s must be set to %d comma-separated RRPVs\n", name, n);
+  int         k = 0;
+  const char* p = spec;
+  while (*p) {
+    char*     end = NULL;
+    const long v = strtol(p, &end, 10);
+    if (end == p)
+      break;
+    ASSERTM(0, k < n, "--%s has more than %d values ('%s')\n", name, n, spec);
+    ASSERTM(0, v >= 0 && v <= SRRIP_T_MAX_RRPV, "--%s value %ld is outside 0..%d ('%s'); this policy has 3 bits\n",
+            name, v, SRRIP_T_MAX_RRPV, spec);
+    out[k++] = (uns8)v;
+    p = end;
+    while (*p == ',' || *p == ' ')
+      p++;
+  }
+  ASSERTM(0, k == n, "--%s needs exactly %d comma-separated values, parsed %d from '%s'\n", name, n, k, spec);
+}
+
+static void srrip_t_init_tables(void) {
+  if (g_srrip_t_parsed)
+    return;
+  g_srrip_t_parsed = TRUE;
+  srrip_t_parse("srrip_t_insert", SRRIP_T_INSERT, g_srrip_t_insert, SRRIP_T_NUM_FILL);
+  srrip_t_parse("srrip_t_pv_pref_unmerged", SRRIP_T_PV_PREF_UNMERGED, g_srrip_t_pv[SRRIP_T_HIT_PREF_UNMERGED],
+                SRRIP_T_NUM_RRPV);
+  srrip_t_parse("srrip_t_pv_pref_merged", SRRIP_T_PV_PREF_MERGED, g_srrip_t_pv[SRRIP_T_HIT_PREF_MERGED],
+                SRRIP_T_NUM_RRPV);
+  srrip_t_parse("srrip_t_pv_demand_instr", SRRIP_T_PV_DEMAND_INSTR, g_srrip_t_pv[SRRIP_T_HIT_DEMAND_INSTR],
+                SRRIP_T_NUM_RRPV);
+  srrip_t_parse("srrip_t_pv_other", SRRIP_T_PV_OTHER, g_srrip_t_pv[SRRIP_T_HIT_OTHER], SRRIP_T_NUM_RRPV);
+}
+
+void srrip_t_action_init(Cache* cache, const char* name, uns cache_size, uns assoc, uns line_size, uns data_size,
+                         Repl_Policy repl_policy);
+void srrip_t_update_hit(Cache* cache, uns set, uns way, void* arg);
+void srrip_t_update_insert(Cache* cache, uns8 proc_id, uns set, uns way, void* arg);
+Cache_Entry* srrip_t_update_evict(Cache* cache, uns8 proc_id, uns set, uns* way, void* arg, Flag if_external);
+
+void srrip_t_action_init(Cache* cache, const char* name, uns cache_size, uns assoc, uns line_size, uns data_size,
+                         Repl_Policy repl_policy) {
+  general_action_init(cache, name, cache_size, assoc, line_size, data_size, repl_policy);
+  srrip_t_init_tables();
+}
+
+void srrip_t_update_insert(Cache* cache, uns8 proc_id, uns set, uns way, void* arg) {
+  const uns8 c = (g_next_srrip_t_fill < SRRIP_T_NUM_FILL) ? g_next_srrip_t_fill : (uns8)SRRIP_T_FILL_OTHER;
+  cache->entries[set][way].reference_val = (int)g_srrip_t_insert[c];
+  g_next_srrip_t_fill = (uns8)SRRIP_T_FILL_OTHER; /* one-shot */
+  cache_debug_print_set(cache, set, way, CACHE_EVENT_INSERT);
+}
+
+void srrip_t_update_hit(Cache* cache, uns set, uns way, void* arg) {
+  const uns8 c = (g_next_srrip_t_hit < SRRIP_T_NUM_HIT) ? g_next_srrip_t_hit : (uns8)SRRIP_T_HIT_OTHER;
+  int        rrpv = cache->entries[set][way].reference_val;
+  /* Clamped, not asserted. The aging loop in the victim scan can only reach the distant value, and
+     every table entry is range-checked at init, so an out-of-range RRPV here would mean some other
+     policy's code touched this line -- survivable, and clamping keeps the table lookup in bounds. */
+  if (rrpv < 0)
+    rrpv = 0;
+  if (rrpv > SRRIP_T_MAX_RRPV)
+    rrpv = SRRIP_T_MAX_RRPV;
+  cache->entries[set][way].reference_val = (int)g_srrip_t_pv[c][rrpv];
+  g_next_srrip_t_hit = (uns8)SRRIP_T_HIT_OTHER; /* one-shot */
+  cache_debug_print_set(cache, set, way, CACHE_EVENT_HIT);
+}
+
+/* Victim scan: the SRRIP rule at 3 bits. An invalid way is taken first and ages nothing; failing
+   that, the first line at the distant value wins; failing that, every line in the set ages by 1
+   and the scan repeats. The distant test is >= rather than == so that a line somehow carrying an
+   out-of-range RRPV terminates the loop instead of hanging it. */
+Cache_Entry* srrip_t_update_evict(Cache* cache, uns8 proc_id, uns set, uns* way, void* arg, Flag if_external) {
+  Flag found = FALSE;
+  while (!found) {
+    for (int ii = 0; ii < cache->assoc; ii++) {
+      Cache_Entry* entry = &cache->entries[set][ii];
+      if (!entry->valid || entry->reference_val >= SRRIP_T_MAX_RRPV) {
+        *way = ii;
+        found = TRUE;
+        break;
+      }
+    }
+    if (found)
+      break;
+    for (int ii = 0; ii < cache->assoc; ii++)
+      cache->entries[set][ii].reference_val++;
+  }
+  cache_debug_print_set(cache, set, *way, CACHE_EVENT_EVICT);
+  return &cache->entries[set][*way];
+}
+
+/**************************************************************************************/
 /* BRRIP */
 const static uns BRRIP_BIMODAL_PARA = 32;
 const static uns BRRIP_BIMODAL_SRAND_NUM = 0;
@@ -4266,6 +4390,7 @@ struct repl_policy_func repl_policy_func_table[NUM_REPL] = {
   { REPL_LRU_REF, general_action_init,  general_action_repl,  lru_update_hit,     lru_update_insert,    lru_update_evict    },
   { REPL_NRU,     general_action_init,  general_action_repl,  nru_update_hit,     nru_update_insert,    nru_update_evict    },
   { REPL_SRRIP,   general_action_init,  general_action_repl,  nru_update_hit,     srrip_update_insert,  srrip_update_evict  },
+  { REPL_SRRIP_T, srrip_t_action_init,  general_action_repl,  srrip_t_update_hit, srrip_t_update_insert, srrip_t_update_evict },
   { REPL_BRRIP,   brrip_action_init,    general_action_repl,  nru_update_hit,     brrip_update_insert,  srrip_update_evict  },
   { REPL_DRRIP,   drrip_action_init,    general_action_repl,  nru_update_hit,     drrip_update_insert,  drrip_update_evict  },
   { REPL_SHIP,    ship_action_init,     general_action_repl,  ship_update_hit,    ship_update_insert,   ship_update_evict   },

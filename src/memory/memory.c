@@ -662,6 +662,65 @@ static inline void delta_prio_count_hit(uns8 proc_id, Cache* cache, Flag is_mlc)
    per-class demand hit rate HIT/(HIT+DFILL) is a ratio of like to like. A merged instruction
    prefetch reads as a PREFETCH here, because req->type stays MRT_FDIPPRFON across the merge --
    op is NULL for ifetch, so the type promotion in mem_req_match_reqbuf never runs for it. */
+/* REPL_SRRIP_T: the edge separating MLONG from MSHORT, in cycles of prefetch in-flight time at
+   the merge. 0 tracks L1_CYCLES, the same default --ifetch_xtion_stats uses, so the policy and
+   that matrix bucket identically. */
+static inline Counter srrip_t_edge(void) {
+  return SRRIP_T_MERGE_EDGE ? (Counter)SRRIP_T_MERGE_EDGE : (Counter)L1_CYCLES;
+}
+
+/* REPL_SRRIP_T: classify a FILL. instr_merge_delta is maintained unconditionally by
+   mem_req_match_reqbuf, so this needs no other arm enabled. The MRT_IFETCH bit in req->types --
+   not req->type -- is what says a demand caught the prefetch in flight; req->type stays the
+   prefetch type across such a merge, which is what makes the distinction expressible at all. */
+static inline uns8 srrip_t_fill_class(Mem_Req* req) {
+  if (mem_req_type_is_instr_prefetch(req->type)) {
+    if (!mem_req_is_type(req, MRT_IFETCH))
+      return (uns8)SRRIP_T_FILL_PREF_NOMERGE;
+    return (req->instr_merge_delta >= srrip_t_edge()) ? (uns8)SRRIP_T_FILL_PREF_MLONG
+                                                      : (uns8)SRRIP_T_FILL_PREF_MSHORT;
+  }
+  if (req->type == MRT_IFETCH)
+    return (uns8)SRRIP_T_FILL_DEMAND_INSTR;
+  return (uns8)SRRIP_T_FILL_OTHER;
+}
+
+/* REPL_SRRIP_T: classify a HIT. No lead-time split here -- see the Srrip_T_Hit comment in
+   cache_lib.h for why -- but the long-lead subset is counted so that omission stays auditable. */
+static inline uns8 srrip_t_hit_class(Mem_Req* req) {
+  if (mem_req_type_is_instr_prefetch(req->type)) {
+    if (!mem_req_is_type(req, MRT_IFETCH))
+      return (uns8)SRRIP_T_HIT_PREF_UNMERGED;
+    return (uns8)SRRIP_T_HIT_PREF_MERGED;
+  }
+  if (req->type == MRT_IFETCH)
+    return (uns8)SRRIP_T_HIT_DEMAND_INSTR;
+  return (uns8)SRRIP_T_HIT_OTHER;
+}
+
+/* Stage both one-shots for `cache` if it runs REPL_SRRIP_T. Gated on the policy so a run on any
+   other policy pays one comparison. Called before the access and before the fill; whichever
+   operation follows consumes its own class and resets it. */
+static inline void srrip_t_stage(Cache* cache, Mem_Req* req) {
+  if (cache->repl_policy != REPL_SRRIP_T)
+    return;
+  cache_set_next_srrip_t_fill(srrip_t_fill_class(req));
+  cache_set_next_srrip_t_hit(srrip_t_hit_class(req));
+}
+
+/* REPL_SRRIP_T: count a merged-prefetch hit whose lead time was at or above the edge -- the case
+   the hit taxonomy deliberately does not give its own promotion vector.
+   Charged HERE and not in srrip_t_hit_class, because that classifier runs BEFORE the access (it
+   stages a one-shot) and would therefore count staged accesses rather than hits. Charged here and
+   not in cache_lib either: that layer keeps no stats by design, since only this one knows which
+   cache it is holding and therefore which chain to charge. */
+static inline void srrip_t_note_hit(Cache* cache, Mem_Req* req, Flag hit) {
+  if (!hit || cache->repl_policy != REPL_SRRIP_T)
+    return;
+  if (srrip_t_hit_class(req) == (uns8)SRRIP_T_HIT_PREF_MERGED && req->instr_merge_delta >= srrip_t_edge())
+    STAT_EVENT(req->proc_id, SRRIP_T_LONG_LEAD_HITS);
+}
+
 static inline Flag delta_prio_is_demand(Mem_Req* req) {
   return req->type == MRT_IFETCH || req->type == MRT_DFETCH || req->type == MRT_DSTORE;
 }
@@ -4023,6 +4082,7 @@ static Flag mem_complete_mlc_access(Mem_Req* req, Mem_Queue_Entry* mlc_queue_ent
   if (td_mlc_pred_staged)
     cache_set_hit_promote_frac(FALSE, 0.0);  // clear one-shot (consumed on hit; drop on miss)
   req->mlc_hit = data ? TRUE : FALSE;
+  srrip_t_note_hit(&MLC(req->proc_id)->cache, req, req->mlc_hit); /* REPL_SRRIP_T audit */
   /* --mlp_lin_offpath_lambda: an ON-PATH DEMAND hit vindicates a wrong-path fill -- a real
      access needed the line, so the speculative-garbage assumption is falsified and the penalty
      is dropped. Demand only: a prefetch hitting it is itself speculative and proves nothing.
@@ -6749,6 +6809,7 @@ Flag l1_fill_line(Mem_Req* req) {
 
   // REPL_MOCKINGJAY: hand the fill its PC / traffic class (consumed by the insert below).
   mockingjay_stage_access(&L1(req->proc_id)->cache, req);
+  srrip_t_stage(&L1(req->proc_id)->cache, req); /* REPL_SRRIP_T */
 
   /* --load_prio_stats: snapshot the set BEFORE the insert below -- afterwards the arriving line
      has displaced its victim and the set no longer describes what this fill found. Also the one
@@ -6803,6 +6864,7 @@ Flag l1_fill_line(Mem_Req* req) {
     if (repl_line_addr && (!data->prefetch || (data->prefetch && data->seen_prefetch)))  // Prefetch kicks out demand
       pref_ul1evictOnPF(req->proc_id, repl_line_addr, data->proc_id);
   } else {
+    srrip_t_stage(&L1(req->proc_id)->cache, req); /* REPL_SRRIP_T */
     data = (L1_Data*)cache_insert(&L1(req->proc_id)->cache, req->proc_id, req->addr, &line_addr, &repl_line_addr);
   }
 
@@ -7342,6 +7404,7 @@ Flag mlc_fill_line(Mem_Req* req) {
 
   // REPL_MOCKINGJAY: hand the fill its PC / traffic class (consumed by the insert below).
   mockingjay_stage_access(&MLC(req->proc_id)->cache, req);
+  srrip_t_stage(&MLC(req->proc_id)->cache, req); /* REPL_SRRIP_T */
 
   /* --load_prio_stats: see the matching calls in l1_fill_line -- the set must be snapshotted
      before the insert below displaces anything. */
@@ -7379,6 +7442,7 @@ Flag mlc_fill_line(Mem_Req* req) {
     data = (MLC_Data*)cache_insert_replpos(&MLC(req->proc_id)->cache, req->proc_id, req->addr, &line_addr,
                                            &repl_line_addr, mem->pref_replpos, TRUE);
   } else {
+    srrip_t_stage(&MLC(req->proc_id)->cache, req); /* REPL_SRRIP_T */
     data = (MLC_Data*)cache_insert(&MLC(req->proc_id)->cache, req->proc_id, req->addr, &line_addr, &repl_line_addr);
     mlc_fill_clock++; /* --ifetch_xtion_stats: one allocation opportunity in the MLC */
   }

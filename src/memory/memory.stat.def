@@ -905,6 +905,13 @@ DEF_STAT(  INSTR_UPFILL_LLC_PRESENT              , COUNT , NO_RATIO  )
 DEF_STAT(  INSTR_UPFILL_LLC_SKIP_DIRTY           , COUNT , NO_RATIO  )
 DEF_STAT(  INSTR_UPFILL_LLC_WB                   , COUNT , NO_RATIO  )
 
+/* REPL_SRRIP_T: hits classified SRRIP_T_HIT_PREF_MERGED whose lead time was at or above the
+   merge edge. The hit taxonomy has no MLONG class, on the grounds that an MLC-served prefetch
+   lives only bank-arbitration + MLC_CYCLES before its access and so is nearly always short-lead.
+   This counts the exceptions. If it is a material fraction of MLC_HIT the hit side needs a
+   lead-time split after all. */
+DEF_STAT(  SRRIP_T_LONG_LEAD_HITS                , COUNT , NO_RATIO  )
+
 DEF_STAT(  MLC_INSTR_PLACE_DECLINE               , COUNT , NO_RATIO  )
 DEF_STAT(  L1_INSTR_PLACE_DECLINE                , COUNT , NO_RATIO  )
 

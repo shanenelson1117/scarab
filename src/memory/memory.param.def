@@ -195,6 +195,50 @@ DEF_PARAM(ifetch_xtion_merge_edge, IFETCH_XTION_MERGE_EDGE, uns, uns, 0, )
    never evicts, so a run that touches more lines than this just chains. A power of two is
    expected: HASH_INDEX derives its fold width from the bucket count. */
 DEF_PARAM(ifetch_xtion_buckets, IFETCH_XTION_BUCKETS, uns, uns, 262144, )
+
+/* REPL_SRRIP_T (--mlc_cache_repl_policy 24): SRRIP with a per-access-type insertion value and a
+ * per-access-type PROMOTION VECTOR, over 3 bits of metadata (RRPV 0..7, 7 distant).
+ *
+ * Standard SRRIP has one insertion RRPV and promotes every hit to 0. This generalises both ends:
+ *
+ *   INSERTION. --srrip_t_insert is five comma-separated RRPVs, one per FILL class, in enum order:
+ *       pref-no-merge, pref-MLONG, pref-MSHORT, demand-instruction, other
+ *     A fill of class c installs at that RRPV. 7 means "evict me first", 0 means "most protected".
+ *
+ *   PROMOTION. --srrip_t_pv_<class> is eight comma-separated RRPVs, one per CURRENT RRPV, for
+ *     each HIT class. An access of class t that hits a line whose RRPV is i sets that line's RRPV
+ *     to T_t[i]. The vector is chosen by the type of the ACCESS DOING THE HITTING, not by what
+ *     filled the line -- a line filled by a prefetch and later hit by a demand fetch is promoted
+ *     by the demand's vector. Plain SRRIP is the all-zeros vector; the identity vector
+ *     "0,1,2,3,4,5,6,7" is "this access does not change the line's position at all".
+ *
+ * THE TWO TAXONOMIES DIFFER, which is not an oversight. See Srrip_T_Fill and Srrip_T_Hit in
+ * cache_lib.h: a demand-instruction MISS cannot be a hit, and the MLONG/MSHORT lead-time split
+ * describes the instant a demand caught a prefetch in flight, which says nothing about an access
+ * that found the line resident. The hit side instead needs the demand-instruction HIT, which the
+ * fill side has no equivalent of. So there are five insertion values and four promotion vectors.
+ *
+ * THE MLONG/MSHORT EDGE is --srrip_t_merge_edge, 0 meaning L1_CYCLES. The measured quantity is
+ * Mem_Req.instr_merge_delta -- cycles the prefetch had been in flight when the first demand
+ * ifetch merged into it -- which is maintained unconditionally, so this policy does not require
+ * --fdip_delta_place or any other arm. Same quantity and same default edge as
+ * --ifetch_xtion_stats, so the policy and that matrix bucket identically.
+ *
+ * DEFAULTS REPRODUCE PLAIN SRRIP at 3 bits: every insertion 6 (one below distant) and every
+ * promotion vector all-zeros. A run that selects policy 24 and sets nothing is therefore a clean
+ * 3-bit SRRIP baseline, which is the control this policy should be read against -- NOT against
+ * --mlc_cache_repl_policy 16, whose RRPV is 2-bit and whose distant value is 4.
+ *
+ * VALIDATED AT INIT. Every value must parse and lie in 0..7, and each list must have exactly its
+ * expected length; anything else is fatal at startup rather than silently truncated. A value
+ * above 7 would leave the victim scan's aging loop unable to ever find a distant line. */
+DEF_PARAM(srrip_t_insert, SRRIP_T_INSERT, char*, string, "6,6,6,6,6", )
+DEF_PARAM(srrip_t_pv_pref_unmerged, SRRIP_T_PV_PREF_UNMERGED, char*, string, "0,0,0,0,0,0,0,0", )
+DEF_PARAM(srrip_t_pv_pref_merged, SRRIP_T_PV_PREF_MERGED, char*, string, "0,0,0,0,0,0,0,0", )
+DEF_PARAM(srrip_t_pv_demand_instr, SRRIP_T_PV_DEMAND_INSTR, char*, string, "0,0,0,0,0,0,0,0", )
+DEF_PARAM(srrip_t_pv_other, SRRIP_T_PV_OTHER, char*, string, "0,0,0,0,0,0,0,0", )
+DEF_PARAM(srrip_t_merge_edge, SRRIP_T_MERGE_EDGE, uns, uns, 0, )
+
 DEF_PARAM(icache_read_ports, ICACHE_READ_PORTS, uns, uns, 1, )
 DEF_PARAM(icache_write_ports, ICACHE_WRITE_PORTS, uns, uns, 1, )
 DEF_PARAM(icache_banks, ICACHE_BANKS, uns, uns, 8, )
