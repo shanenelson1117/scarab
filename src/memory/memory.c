@@ -704,6 +704,44 @@ static inline uns8 srrip_t_hit_class(Mem_Req* req) {
   return (uns8)SRRIP_T_HIT_OTHER;
 }
 
+/* REPL_SRRIP_FE: classify a HIT. Request type only -- a hit carries no FE-bound mark, because
+   that classification is produced at a FILL. mem_req_type_is_instr covers a demand ifetch and
+   every instruction prefetch, merged or not, which is exactly "instruction accesses". */
+static inline uns8 srrip_fe_hit_class(Mem_Req* req) {
+  return mem_req_type_is_instr(req->type) ? (uns8)SRRIP_FE_HIT_INSTR : (uns8)SRRIP_FE_HIT_OTHER;
+}
+
+/* REPL_SRRIP_FE: classify a FILL from the FE-bound classification result.
+   `fe_bound` is membound_classify_fill's is_fe_bound -- the same mark --mlp_lin_instr_lambda
+   consumes, already threshold-tested and already subject to --mlp_lin_instr_include_pref_merge
+   and the lead-time gate. An UNMARKED instruction fill lands in OTHER, which is the intent: it
+   is not a marked line. The demand/merge split is then just req->type, since by construction a
+   marked fill is either MRT_IFETCH or a prefetch a demand merged into. */
+static inline uns8 srrip_fe_fill_class(Mem_Req* req, Flag fe_bound) {
+  if (fe_bound)
+    return (req->type == MRT_IFETCH) ? (uns8)SRRIP_FE_FILL_MARKED_DEMAND : (uns8)SRRIP_FE_FILL_MARKED_MERGE;
+  /* Unmarked but still instruction traffic. mem_req_type_is_instr, not the classifier's
+     instr_fill: that one means "eligible for the FE window", which an UNMERGED prefetch never is,
+     so keying on it would put the largest part of the instruction stream into OTHER alongside
+     the data. */
+  if (mem_req_type_is_instr(req->type))
+    return (uns8)SRRIP_FE_FILL_INSTR_UNMARKED;
+  return (uns8)SRRIP_FE_FILL_OTHER;
+}
+
+/* Both stagers write the global one-shot UNCONDITIONALLY, unlike srrip_t_stage which first checks
+   the cache's policy. Two reasons: the fill class is staged from the fill paths, where the same
+   source line serves the MLC and the LLC and a per-cache test could not be written once; and the
+   one-shot is only ever READ by srrip_fe_update_insert / _update_hit, which run solely on a cache
+   that is running this policy, so a store on any other run is dead and costs two compares. */
+static inline void srrip_fe_stage_hit(Mem_Req* req) {
+  cache_set_next_srrip_fe_hit(srrip_fe_hit_class(req));
+}
+
+static inline void srrip_fe_stage_fill(Mem_Req* req, Flag fe_bound) {
+  cache_set_next_srrip_fe_fill(srrip_fe_fill_class(req, fe_bound));
+}
+
 /* Stage both one-shots for `cache` if it runs REPL_SRRIP_T. Gated on the policy so a run on any
    other policy pays one comparison. Called before the access and before the fill; whichever
    operation follows consumes its own class and resets it. */
@@ -863,8 +901,14 @@ static inline void membound_classify_fill(Mem_Req* req, Flag* is_membound, Flag*
      inputs: a run that looks like the policy did nothing rather than like a knob never set.
      EITHER toggle opens it, because this one early return serves both the instruction branch
      and the data branch below. */
+  /* REPL_SRRIP_FE joins this list for the same reason the lambdas are in it, and more sharply:
+     its insertion vector is keyed DIRECTLY on is_fe_bound, with no lambda in between. Returning
+     here would leave that flag permanently FALSE, collapse two of its three fill classes into
+     nothing, and present as a policy that does exactly what plain SRRIP does. Selecting the
+     policy is therefore enough to open the classification; no stats knob is required. */
   if (!MEMBOUND_STATS && !REUSE_DIST_STATS && !MLP_LIN_DYN_INSTR && !MLP_LIN_DYN_DATA &&
-      MLP_LIN_DATA_LAMBDA == 0.0 && MLP_LIN_INSTR_LAMBDA == 0.0)
+      MLP_LIN_DATA_LAMBDA == 0.0 && MLP_LIN_INSTR_LAMBDA == 0.0 &&
+      MLC_CACHE_REPL_POLICY != REPL_SRRIP_FE && L1_CACHE_REPL_POLICY != REPL_SRRIP_FE)
     return;
   /* IS THIS FILL AN INSTRUCTION FILL? A demand fetch says so by its type. --mlp_lin_instr_
      include_pref_merge adds the other way a line the front end is stalled on arrives: an
@@ -6796,6 +6840,8 @@ Flag l1_fill_line(Mem_Req* req) {
        must still be recognisable as membound, or the hit counter would miss it. Only the
        counting below is scoped to the ROI. */
     cache_set_next_fill_bound(mb_fill, fe_fill);
+    /* REPL_SRRIP_FE: the insertion class, now that the mark exists. */
+    srrip_fe_stage_fill(req, fe_fill);
     /* Graded companion, staged unconditionally for the same reason as the bits above. The
        cost is the MLP cost of THIS request's MLC miss, so an LLC line carries an MLC-
        denominated cost -- correct as "what the miss that fetched me cost", but not an
@@ -6843,6 +6889,7 @@ Flag l1_fill_line(Mem_Req* req) {
   // REPL_MOCKINGJAY: hand the fill its PC / traffic class (consumed by the insert below).
   mockingjay_stage_access(&L1(req->proc_id)->cache, req);
   srrip_t_stage(&L1(req->proc_id)->cache, req); /* REPL_SRRIP_T */
+  srrip_fe_stage_hit(req);                      /* REPL_SRRIP_FE */
 
   /* --load_prio_stats: snapshot the set BEFORE the insert below -- afterwards the arriving line
      has displaced its victim and the set no longer describes what this fill found. Also the one
@@ -7353,6 +7400,8 @@ Flag mlc_fill_line(Mem_Req* req) {
        must still be recognisable as membound, or the hit counter would miss it. Only the
        counting below is scoped to the ROI. */
     cache_set_next_fill_bound(mb_fill, fe_fill);
+    /* REPL_SRRIP_FE: the insertion class, now that the mark exists. */
+    srrip_fe_stage_fill(req, fe_fill);
     /* Graded companion, staged unconditionally for the same reason as the bits above. The
        cost is the MLP cost of THIS request's MLC miss, so an LLC line carries an MLC-
        denominated cost -- correct as "what the miss that fetched me cost", but not an
@@ -7467,6 +7516,7 @@ Flag mlc_fill_line(Mem_Req* req) {
   // REPL_MOCKINGJAY: hand the fill its PC / traffic class (consumed by the insert below).
   mockingjay_stage_access(&MLC(req->proc_id)->cache, req);
   srrip_t_stage(&MLC(req->proc_id)->cache, req); /* REPL_SRRIP_T */
+  srrip_fe_stage_hit(req);                       /* REPL_SRRIP_FE */
 
   /* --load_prio_stats: see the matching calls in l1_fill_line -- the set must be snapshotted
      before the insert below displaces anything. */

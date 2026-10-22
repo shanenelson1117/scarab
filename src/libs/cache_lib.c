@@ -111,6 +111,10 @@ static uns8   g_next_fill_delta_prio = DELTA_PRIO_NONE;
    rather than on class 0, which is a prefetch class. Consumed and reset by the policy. */
 static uns8   g_next_srrip_t_fill = SRRIP_T_FILL_OTHER;
 static uns8   g_next_srrip_t_hit = SRRIP_T_HIT_OTHER;
+/* REPL_SRRIP_FE one-shots, same defaulting rule: an unstaged operation is OTHER in both
+   taxonomies, which is data-traffic behaviour. */
+static uns8   g_next_srrip_fe_fill = SRRIP_FE_FILL_OTHER;
+static uns8   g_next_srrip_fe_hit = SRRIP_FE_HIT_OTHER;
 static Flag   g_next_fill_instr = FALSE;
 static Flag   g_next_fill_store = FALSE;
 static Flag   g_next_fill_offpath = FALSE;
@@ -169,6 +173,14 @@ void cache_set_next_srrip_t_fill(uns8 fill_class) {
 
 void cache_set_next_srrip_t_hit(uns8 hit_class) {
   g_next_srrip_t_hit = (hit_class < SRRIP_T_NUM_HIT) ? hit_class : (uns8)SRRIP_T_HIT_OTHER;
+}
+
+void cache_set_next_srrip_fe_fill(uns8 fill_class) {
+  g_next_srrip_fe_fill = (fill_class < SRRIP_FE_NUM_FILL) ? fill_class : (uns8)SRRIP_FE_FILL_OTHER;
+}
+
+void cache_set_next_srrip_fe_hit(uns8 hit_class) {
+  g_next_srrip_fe_hit = (hit_class < SRRIP_FE_NUM_HIT) ? hit_class : (uns8)SRRIP_FE_HIT_OTHER;
 }
 
 void cache_set_next_fill_instr(Flag is_instr) {
@@ -3584,6 +3596,60 @@ Cache_Entry* srrip_t_update_evict(Cache* cache, uns8 proc_id, uns set, uns* way,
 }
 
 /**************************************************************************************/
+/* REPL_SRRIP_FE: SRRIP keyed on the FE-bound mark.
+ *
+ * Shares SRRIP_T_MAX_RRPV (3 bits), srrip_t_parse and srrip_t_update_evict -- the victim rule is
+ * identical and there is no reason to keep a second copy of it. Only the insertion and promotion
+ * tables differ, and they differ in SHAPE (3 fill classes, 2 hit classes), which is why this is a
+ * separate policy rather than another knob on REPL_SRRIP_T. */
+
+static uns8 g_srrip_fe_insert[SRRIP_FE_NUM_FILL];
+static uns8 g_srrip_fe_pv[SRRIP_FE_NUM_HIT][SRRIP_T_NUM_RRPV];
+static Flag g_srrip_fe_parsed = FALSE;
+
+static void srrip_fe_init_tables(void) {
+  if (g_srrip_fe_parsed)
+    return;
+  g_srrip_fe_parsed = TRUE;
+  srrip_t_parse("srrip_fe_insert", SRRIP_FE_INSERT, g_srrip_fe_insert, SRRIP_FE_NUM_FILL);
+  srrip_t_parse("srrip_fe_pv_instr", SRRIP_FE_PV_INSTR, g_srrip_fe_pv[SRRIP_FE_HIT_INSTR], SRRIP_T_NUM_RRPV);
+  srrip_t_parse("srrip_fe_pv_other", SRRIP_FE_PV_OTHER, g_srrip_fe_pv[SRRIP_FE_HIT_OTHER], SRRIP_T_NUM_RRPV);
+}
+
+void srrip_fe_action_init(Cache* cache, const char* name, uns cache_size, uns assoc, uns line_size, uns data_size,
+                          Repl_Policy repl_policy);
+void srrip_fe_update_hit(Cache* cache, uns set, uns way, void* arg);
+void srrip_fe_update_insert(Cache* cache, uns8 proc_id, uns set, uns way, void* arg);
+
+void srrip_fe_action_init(Cache* cache, const char* name, uns cache_size, uns assoc, uns line_size, uns data_size,
+                          Repl_Policy repl_policy) {
+  general_action_init(cache, name, cache_size, assoc, line_size, data_size, repl_policy);
+  srrip_fe_init_tables();
+}
+
+void srrip_fe_update_insert(Cache* cache, uns8 proc_id, uns set, uns way, void* arg) {
+  const uns8 c = (g_next_srrip_fe_fill < SRRIP_FE_NUM_FILL) ? g_next_srrip_fe_fill : (uns8)SRRIP_FE_FILL_OTHER;
+  cache->entries[set][way].reference_val = (int)g_srrip_fe_insert[c];
+  g_next_srrip_fe_fill = (uns8)SRRIP_FE_FILL_OTHER; /* one-shot */
+  cache_debug_print_set(cache, set, way, CACHE_EVENT_INSERT);
+}
+
+void srrip_fe_update_hit(Cache* cache, uns set, uns way, void* arg) {
+  const uns8 c = (g_next_srrip_fe_hit < SRRIP_FE_NUM_HIT) ? g_next_srrip_fe_hit : (uns8)SRRIP_FE_HIT_OTHER;
+  int        rrpv = cache->entries[set][way].reference_val;
+  /* Clamped for the same reason srrip_t_update_hit clamps: every table entry is range-checked at
+     init and the aging loop only reaches the distant value, so an out-of-range RRPV here would
+     mean another policy touched this line. Survivable; keep the lookup in bounds. */
+  if (rrpv < 0)
+    rrpv = 0;
+  if (rrpv > SRRIP_T_MAX_RRPV)
+    rrpv = SRRIP_T_MAX_RRPV;
+  cache->entries[set][way].reference_val = (int)g_srrip_fe_pv[c][rrpv];
+  g_next_srrip_fe_hit = (uns8)SRRIP_FE_HIT_OTHER; /* one-shot */
+  cache_debug_print_set(cache, set, way, CACHE_EVENT_HIT);
+}
+
+/**************************************************************************************/
 /* BRRIP */
 const static uns BRRIP_BIMODAL_PARA = 32;
 const static uns BRRIP_BIMODAL_SRAND_NUM = 0;
@@ -4400,6 +4466,7 @@ struct repl_policy_func repl_policy_func_table[NUM_REPL] = {
   { REPL_NRU,     general_action_init,  general_action_repl,  nru_update_hit,     nru_update_insert,    nru_update_evict    },
   { REPL_SRRIP,   general_action_init,  general_action_repl,  nru_update_hit,     srrip_update_insert,  srrip_update_evict  },
   { REPL_SRRIP_T, srrip_t_action_init,  general_action_repl,  srrip_t_update_hit, srrip_t_update_insert, srrip_t_update_evict },
+  { REPL_SRRIP_FE, srrip_fe_action_init, general_action_repl,  srrip_fe_update_hit, srrip_fe_update_insert, srrip_t_update_evict },
   { REPL_BRRIP,   brrip_action_init,    general_action_repl,  nru_update_hit,     brrip_update_insert,  srrip_update_evict  },
   { REPL_DRRIP,   drrip_action_init,    general_action_repl,  nru_update_hit,     drrip_update_insert,  drrip_update_evict  },
   { REPL_SHIP,    ship_action_init,     general_action_repl,  ship_update_hit,    ship_update_insert,   ship_update_evict   },

@@ -112,6 +112,13 @@ typedef enum Repl_Policy_enum {
      Knobs are --srrip_t_* in memory.param.def. */
   REPL_SRRIP_T,
 
+  /* SRRIP keyed on the FE-BOUND MARK rather than on merge structure: a three-entry insertion
+     vector (marked demand / marked merge / everything else) and two promotion vectors
+     (instruction accesses / everything else), over the same 3 bits of RRPV as REPL_SRRIP_T.
+     Added LAST, after REPL_SRRIP_T, so every existing policy index is unchanged.
+     Knobs are --srrip_fe_* in memory.param.def. */
+  REPL_SRRIP_FE,
+
   NUM_REPL
 } Repl_Policy;
 
@@ -150,6 +157,48 @@ typedef enum Srrip_T_Hit_enum {
   SRRIP_T_HIT_OTHER,             /* loads, stores, data prefetch, writebacks */
   SRRIP_T_NUM_HIT,
 } Srrip_T_Hit;
+
+/* REPL_SRRIP_FE: how a FILL is classified, which selects its insertion RRPV.
+ *
+ * Keyed on the FE-BOUND CLASSIFICATION, not on the request type: classes 0 and 1 are exactly the
+ * fills membound_classify_fill marks (is_fe_bound TRUE), i.e. an instruction fill whose
+ * front-end-bound fraction cleared --mlp_lin_instr_thresh. An instruction fill that FAILED the
+ * threshold is class 2 along with all data traffic -- it is not a marked line, and the point of
+ * this policy is to act on the mark.
+ *
+ * Which means the mark has to be live for classes 0 and 1 to exist at all. membound_classify_fill
+ * self-opens on this policy (see the guard in memory.c) so selecting it is enough; but the
+ * THRESHOLD still applies, so --mlp_lin_instr_thresh and --td_fe_rrip_thresh govern the
+ * population, and --mlp_lin_instr_include_pref_merge governs whether class 1 is ever non-empty. */
+typedef enum Srrip_Fe_Fill_enum {
+  SRRIP_FE_FILL_MARKED_DEMAND = 0, /* marked, and a demand instruction fetch created it */
+  SRRIP_FE_FILL_MARKED_MERGE,      /* marked, and it is a prefetch a demand fetch merged into */
+  /* Any other INSTRUCTION fill: mem_req_type_is_instr but not marked. That is an unmerged FDIP
+     prefetch (the bulk of instruction traffic), an instruction fill whose FE-bound fraction
+     failed the threshold, and a merge the lead-time gate rejected. Note the test here is the
+     REQUEST TYPE, not the classifier's `instr_fill`: the latter means "eligible for the FE
+     window", which an unmerged prefetch never is, so keying on it would drop exactly the largest
+     part of this class into OTHER. */
+  SRRIP_FE_FILL_INSTR_UNMARKED,
+  SRRIP_FE_FILL_OTHER, /* data traffic: loads, stores, data prefetch, writebacks */
+  SRRIP_FE_NUM_FILL,
+} Srrip_Fe_Fill;
+
+/* REPL_SRRIP_FE: how a HIT is classified, which selects the promotion vector applied.
+ *
+ * Only two classes, and on REQUEST TYPE rather than on any mark: instruction traffic of every
+ * kind (a demand fetch or an FDIP/IPRF prefetch, merged or not) against everything else. The
+ * mark cannot be used here -- it is produced by membound_classify_fill, which runs at a FILL, so
+ * an access that hits has no classification of its own. The line's fill-time mark is not a
+ * substitute: the promotion vector is chosen by the access doing the hitting, by design. */
+/* The three instruction fill classes above together are exactly mem_req_type_is_instr, which is
+   also exactly SRRIP_FE_HIT_INSTR below -- so insertion and promotion partition traffic on the
+   same instruction/data boundary, and the vectors can be reasoned about together. */
+typedef enum Srrip_Fe_Hit_enum {
+  SRRIP_FE_HIT_INSTR = 0, /* mem_req_type_is_instr: demand ifetch or any instruction prefetch */
+  SRRIP_FE_HIT_OTHER,     /* loads, stores, data prefetch, writebacks */
+  SRRIP_FE_NUM_HIT,
+} Srrip_Fe_Hit;
 
 /* REPL_SRRIP_T: 3 bits of metadata, so an RRPV is 0..7 and 7 is the distant value the victim
    scan looks for. Every insertion value and every promotion-vector entry is validated into this
@@ -753,6 +802,12 @@ void cache_set_next_fill_delta_prio(uns8 delta_prio);
  * that does not know about instruction traffic is data traffic. */
 void cache_set_next_srrip_t_fill(uns8 fill_class);
 void cache_set_next_srrip_t_hit(uns8 hit_class);
+
+/* REPL_SRRIP_FE: same staging contract as the two above. The fill class is staged at the FILL
+ * rather than at the access, because it depends on the FE-bound classification, which does not
+ * exist until membound_classify_fill has run on the arriving request. */
+void cache_set_next_srrip_fe_fill(uns8 fill_class);
+void cache_set_next_srrip_fe_hit(uns8 hit_class);
 /* --instr_upfill: tag the next fill as an instruction line. */
 void cache_set_next_fill_instr(Flag is_instr);
 

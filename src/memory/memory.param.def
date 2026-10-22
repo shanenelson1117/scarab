@@ -247,6 +247,57 @@ DEF_PARAM(srrip_t_pv_demand_instr, SRRIP_T_PV_DEMAND_INSTR, char*, string, "0000
 DEF_PARAM(srrip_t_pv_other, SRRIP_T_PV_OTHER, char*, string, "00000000", )
 DEF_PARAM(srrip_t_merge_edge, SRRIP_T_MERGE_EDGE, uns, uns, 0, )
 
+/* REPL_SRRIP_FE (--mlc_cache_repl_policy 25): SRRIP keyed on the FE-BOUND MARK, over 3 bits of
+ * RRPV (0..7, 7 distant).
+ *
+ * Where REPL_SRRIP_T classifies a fill by its merge structure, this one classifies it by whether
+ * the existing front-end-bound policy MARKED it -- the same is_fe_bound that --mlp_lin_instr_lambda
+ * consumes, i.e. an instruction fill whose FE-bound fraction cleared the threshold.
+ *
+ *   INSERTION. --srrip_fe_insert is four DIGITS, one per fill class, in enum order:
+ *       marked-demand, marked-merge, other-instruction, other
+ *     "marked-demand" is a demand instruction fetch (MRT_IFETCH) that was marked. "marked-merge"
+ *     is an instruction prefetch a demand merged into that was marked, which requires
+ *     --mlp_lin_instr_include_pref_merge or the class is always empty.
+ *     "other-instruction" is every REMAINING instruction fill -- unmerged FDIP prefetches (the
+ *     bulk of the instruction stream), fills whose FE-bound fraction missed the threshold, and
+ *     merges the lead-time gate rejected. Keyed on mem_req_type_is_instr, deliberately NOT on
+ *     the classifier's `instr_fill`: that flag means "eligible for the FE window", which an
+ *     unmerged prefetch never is, so keying on it would hide ~21.75M instruction fills per the
+ *     measured MLC mix inside the data class.
+ *     "other" is then data traffic only: loads, stores, data prefetch, writebacks.
+ *
+ *     The first three classes together are exactly mem_req_type_is_instr, which is also exactly
+ *     the population --srrip_fe_pv_instr promotes -- so the insertion and promotion vectors cut
+ *     traffic on the same instruction/data boundary.
+ *
+ *   PROMOTION. --srrip_fe_pv_instr and --srrip_fe_pv_other are eight DIGITS each, one per CURRENT
+ *     RRPV. An access of class t hitting a line at RRPV i sets it to T_t[i]. The vector is chosen
+ *     by the ACCESS doing the hitting: instruction traffic of any kind (demand ifetch or an
+ *     FDIP/IPRF prefetch, merged or not) takes _instr, everything else takes _other.
+ *     Only two vectors because a hit has no mark of its own -- the FE-bound classification happens
+ *     at a FILL, so there is nothing to key a finer split on without reading the line's fill-time
+ *     mark, which would contradict "chosen by the access".
+ *     All-zeros is plain SRRIP; the identity vector 01234567 leaves the line where it is.
+ *
+ * THE MARK MUST BE LIVE. membound_classify_fill returns early when no stats knob and no lambda
+ * asks for a classification, which would leave is_fe_bound permanently FALSE and silently collapse
+ * classes 0 and 1 into nothing. Selecting this policy self-opens it, so no extra knob is needed --
+ * but --mlp_lin_instr_thresh / --td_fe_rrip_thresh still set the threshold the population is cut
+ * at, and on these traces that population is ~1% of MLC fills. Read MLC_FEBOUND_FILL before
+ * concluding anything from an insertion sweep.
+ *
+ * WRITE THEM AS BARE DIGIT STRINGS WITH NO QUOTES, for the reason the --srrip_t_* block gives.
+ * Commas, spaces and stray quotes are skipped by the parser; the bare form cannot go wrong.
+ *
+ * DEFAULTS REPRODUCE PLAIN SRRIP at 3 bits: every insertion 6 (hence four 6s), every promotion
+ * vector all-zeros.
+ * Read this policy against policy 25 with its defaults, not against policy 16, whose RRPV is
+ * 2-bit with distant 4. */
+DEF_PARAM(srrip_fe_insert, SRRIP_FE_INSERT, char*, string, "6666", )
+DEF_PARAM(srrip_fe_pv_instr, SRRIP_FE_PV_INSTR, char*, string, "00000000", )
+DEF_PARAM(srrip_fe_pv_other, SRRIP_FE_PV_OTHER, char*, string, "00000000", )
+
 DEF_PARAM(icache_read_ports, ICACHE_READ_PORTS, uns, uns, 1, )
 DEF_PARAM(icache_write_ports, ICACHE_WRITE_PORTS, uns, uns, 1, )
 DEF_PARAM(icache_banks, ICACHE_BANKS, uns, uns, 8, )
