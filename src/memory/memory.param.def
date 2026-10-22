@@ -607,6 +607,39 @@ DEF_PARAM(mlp_lin_instr_include_offpath, MLP_LIN_INSTR_INCLUDE_OFFPATH, Flag, Fl
  * measured with and those results stay reproducible from the same flags. Turn it on to get the
  * narrowed rule. MLC_FEBOUND_MERGE_LONG_LEAD counts what the gate rejects, so its effect is
  * visible without a second run. */
+/* --mlp_lin_merge_lambda: a SEPARATE boundness weight for marked MERGES, distinct from the one
+ * marked demand instruction fills get.
+ *
+ * REPL_MLP's instruction term is one lambda applied to every FE-bound-marked line. But the two
+ * populations it marks are different events: a demand instruction fetch that missed and stalled
+ * the front end for the full service latency, and an instruction prefetch a demand caught in
+ * flight, which hid some of that latency before the stall began. Weighting them identically
+ * asserts they are worth the same, which is an assumption rather than a measurement -- and on
+ * these traces the merge half is ~77% of the marked population, so it is the assumption that
+ * actually sets the policy's behaviour.
+ *
+ * WHICH LINES IT APPLIES TO: a marked line whose fill came from a prefetch. No new per-line bit
+ * is needed, because fe_bound_fill can only be set two ways -- req->type == MRT_IFETCH, which is
+ * never a prefetch, or a merged instruction prefetch, which always is -- so the existing
+ * Cache_Entry.fill_was_prefetch separates them exactly. The same discriminator REPL_SRRIP_FE
+ * uses for its marked-demand / marked-merge split.
+ *
+ * THE THRESHOLD IS UNCHANGED. A merge still has to clear --mlp_lin_instr_thresh to be marked at
+ * all; this only changes what a marked merge is WORTH.
+ *
+ * -1 MEANS INHERIT --mlp_lin_instr_lambda, which is the default and reproduces the single-lambda
+ * behaviour every earlier run was measured with, so those results stay reproducible from the same
+ * flags. Any value >= 0 takes effect. 0 is meaningful and distinct from the default: it marks
+ * merges (they still count in MLC_FEBOUND_FILL) while giving them no protection at all, which is
+ * the clean way to ask whether the demand half alone carries the policy.
+ *
+ * DISABLES THE --load_prio_stats LEVEL HALF when it differs from the instruction lambda, exactly
+ * as a placement lambda does: the level table enumerates the boost over a THREE-valued boundness
+ * term (none / data / instruction), and a fourth value takes the 8x3 grid to 8x4 = 32 reachable
+ * boosts against a 24-entry table and 24-wide stat chains. Composition and the per-class chains
+ * are unaffected; a WARNINGU at init says so. */
+DEF_PARAM(mlp_lin_merge_lambda, MLP_LIN_MERGE_LAMBDA, float, float, -1.0, )
+
 DEF_PARAM(mlp_lin_instr_merge_lead_gate, MLP_LIN_INSTR_MERGE_LEAD_GATE, Flag, Flag, FALSE, )
 /* The edge, in cycles. 0 means "track L1_CYCLES", i.e. the LLC access latency -- the same
    convention and the same default as --ifetch_xtion_merge_edge and --srrip_t_merge_edge, so all

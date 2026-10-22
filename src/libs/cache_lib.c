@@ -553,6 +553,24 @@ static inline double lin_lam_instr(const Cache* c) {
   return MLP_LIN_DYN_INSTR ? cache_mlp_dyn_instr_lambda() : (double)MLP_LIN_INSTR_LAMBDA;
 }
 
+/* --mlp_lin_merge_lambda: the weight a marked MERGE carries. Negative means inherit the
+ * instruction lambda, which is the default and the single-lambda behaviour.
+ *
+ * Deliberately NOT routed through the SBAR override or the adaptive arm: both of those tune the
+ * instruction/data pair, and a merge weight that silently tracked them would make a sweep over
+ * this knob unreadable. Inheriting lin_lam_instr when unset keeps it consistent with whichever
+ * of those is in force; setting it pins it. */
+static inline double lin_lam_merge(const Cache* c) {
+  return (MLP_LIN_MERGE_LAMBDA < 0.0) ? lin_lam_instr(c) : (double)MLP_LIN_MERGE_LAMBDA;
+}
+
+/* Is the merge weight actually distinct from the instruction weight? Used both by the boost and
+ * by the level-table guard, so the two cannot disagree about whether a fourth boundness value
+ * exists. */
+static inline Flag lin_lam_merge_distinct(const Cache* c) {
+  return (MLP_LIN_MERGE_LAMBDA >= 0.0 && (double)MLP_LIN_MERGE_LAMBDA != lin_lam_instr(c)) ? TRUE : FALSE;
+}
+
 /* REPL_MLP_PAPER: the lambda in force. SBAR pins it per-cache via cache_set_lin_lambdas (the
  * ATDs get their candidate, the real cache gets the selection); otherwise the static param. */
 static inline double mlp_paper_lambda_now(const Cache* c) {
@@ -562,8 +580,15 @@ static inline double mlp_paper_lambda_now(const Cache* c) {
 static inline double mlp_lin_bound_term(const Cache* cache, const Cache_Entry* entry) {
   if (entry->membound_fill)
     return entry->bound_frac > (double)MLP_LIN_DATA_THRESH ? lin_lam_data(cache) : 0.0;
-  if (entry->fe_bound_fill)
-    return entry->bound_frac > (double)MLP_LIN_INSTR_THRESH ? lin_lam_instr(cache) : 0.0;
+  if (entry->fe_bound_fill) {
+    if (entry->bound_frac <= (double)MLP_LIN_INSTR_THRESH)
+      return 0.0;
+    /* --mlp_lin_merge_lambda: fill_was_prefetch separates the two marked populations exactly.
+       fe_bound_fill is only ever set for req->type == MRT_IFETCH (never a prefetch) or for a
+       merged instruction prefetch (always one), so there is no third case to worry about and no
+       extra per-line bit to maintain. */
+    return entry->fill_was_prefetch ? lin_lam_merge(cache) : lin_lam_instr(cache);
+  }
   return 0.0;
 }
 
@@ -642,18 +667,24 @@ static void load_prio_levels_init(Cache* cache) {
      knob that did it. Each is self-gating at 0, so a demotion run with all the lambdas at 0 --
      the usual standalone measurement -- contributes boost 0, which IS in the table, and keeps the
      level axis. */
+  /* --mlp_lin_merge_lambda joins this list, though it is a boundness value rather than a delta
+     term: it takes the boundness term from three reachable values to four, so the 8x3 grid the
+     table enumerates below becomes 8x4 = 32 against a 24-entry table. Same failure, same
+     refusal. */
   const Flag delta_term_live = (INSTR_UPFILL && (INSTR_UPFILL_LAMBDA != 0.0 || INSTR_UPFILL_PROMOTE_LAMBDA != 0.0)) ||
-                               FDIP_DELTA_PLACE || INSTR_NOPREF_LAMBDA != 0.0 || INSTR_LATEPREF_LAMBDA != 0.0;
+                               FDIP_DELTA_PLACE || INSTR_NOPREF_LAMBDA != 0.0 || INSTR_LATEPREF_LAMBDA != 0.0 ||
+                               lin_lam_merge_distinct(cache);
   if (delta_term_live) {
     WARNINGU(0,
              "--load_prio_stats: cache '%s' has a live placement-class lambda "
              "(--fdip_delta_place %d, --instr_upfill_lambda %f, --instr_upfill_promote_lambda %f, "
-             "--instr_nopref_lambda %f, --instr_latepref_lambda %f), whose boosts the priority "
+             "--instr_nopref_lambda %f, --instr_latepref_lambda %f, --mlp_lin_merge_lambda %f), "
+             "whose boosts the priority "
              "level table cannot enumerate. The LEVEL half is disabled: every *_PRIO_* chain will "
              "be empty. The COMPOSITION half (*_COMP_*) is unaffected and still valid, which is "
              "what --delta_prio_stats needs to be combined with.\n",
              cache->name, (int)FDIP_DELTA_PLACE, INSTR_UPFILL_LAMBDA, INSTR_UPFILL_PROMOTE_LAMBDA,
-             INSTR_NOPREF_LAMBDA, INSTR_LATEPREF_LAMBDA);
+             INSTR_NOPREF_LAMBDA, INSTR_LATEPREF_LAMBDA, (double)MLP_LIN_MERGE_LAMBDA);
     return; /* prio_num_levels stays 0; set_miss_ctr stays allocated but publishes nothing */
   }
 
