@@ -665,6 +665,12 @@ static inline void delta_prio_count_hit(uns8 proc_id, Cache* cache, Flag is_mlc)
 /* REPL_SRRIP_T: the edge separating MLONG from MSHORT, in cycles of prefetch in-flight time at
    the merge. 0 tracks L1_CYCLES, the same default --ifetch_xtion_stats uses, so the policy and
    that matrix bucket identically. */
+/* --mlp_lin_instr_merge_lead_gate: the lead-time edge for the FE-bound mark, in cycles. 0 tracks
+   L1_CYCLES, matching --ifetch_xtion_merge_edge and --srrip_t_merge_edge. */
+static inline Counter mlp_lin_instr_merge_edge(void) {
+  return MLP_LIN_INSTR_MERGE_EDGE ? (Counter)MLP_LIN_INSTR_MERGE_EDGE : (Counter)L1_CYCLES;
+}
+
 static inline Counter srrip_t_edge(void) {
   return SRRIP_T_MERGE_EDGE ? (Counter)SRRIP_T_MERGE_EDGE : (Counter)L1_CYCLES;
 }
@@ -803,7 +809,8 @@ static inline void delta_prio_count_release(uns8 proc_id, Cache* cache, Addr add
 static inline void membound_classify_fill(Mem_Req* req, Flag* is_membound, Flag* is_fe_bound,
                                           double* bound_frac, Flag* have_frac, Counter* out_window,
                                           double* out_fu0_frac, double* out_fu_wait_frac,
-                                          double* out_policy_frac) {
+                                          double* out_policy_frac, Flag* out_instr_fill,
+                                          Flag* out_merge_lead_rejected) {
   *is_membound = FALSE;
   *is_fe_bound = FALSE;
   *bound_frac = 0.0;
@@ -822,6 +829,17 @@ static inline void membound_classify_fill(Mem_Req* req, Flag* is_membound, Flag*
   /* The sharpened form: dependence-stall cycles only (nothing ready to schedule). */
   if (out_fu_wait_frac)
     *out_fu_wait_frac = 0.0;
+  /* WHICH WINDOW the fraction came from, exported because the callers' histograms need it and
+     cannot re-derive it: is_fe_bound is FALSE for an instruction fill that failed the threshold,
+     so it cannot distinguish "instruction fill below the gate" from "data fill below the gate",
+     and the histograms deliberately count both sides of the gate. */
+  if (out_instr_fill)
+    *out_instr_fill = FALSE;
+  /* --mlp_lin_instr_merge_lead_gate: set when a merge was eligible and the gate rejected it on
+     lead time. Exported rather than counted here because this helper serves both the MLC and the
+     LLC fill, and a STAT_EVENT inside it would charge the MLC-named chain twice per line. */
+  if (out_merge_lead_rejected)
+    *out_merge_lead_rejected = FALSE;
   /* --mlp_lin_bound_signal: the one the POLICY consumes, selected below. Kept separate from
      *bound_frac so the measurement chains keep reporting the membound signal whatever the knob
      says, and a sweep over it stays comparable against a fixed set of histograms. */
@@ -877,8 +895,21 @@ static inline void membound_classify_fill(Mem_Req* req, Flag* is_membound, Flag*
      line was already resident. */
   Flag instr_fill = (req->type == MRT_IFETCH);
   if (!instr_fill && MLP_LIN_INSTR_INCLUDE_PREF_MERGE && mem_req_type_is_prefetch(req->type) &&
-      mem_req_is_type(req, MRT_IFETCH))
-    instr_fill = TRUE;
+      mem_req_is_type(req, MRT_IFETCH)) {
+    /* --mlp_lin_instr_merge_lead_gate: a LONG lead means the prefetch was nearly done when the
+       demand caught it, so the stall actually paid was short and the line's miss cost was mostly
+       hidden already. Reject those and keep only the merges where the prefetch bought little.
+       Strictly less than the edge, so a delta of 0 -- the shortest possible lead -- is included.
+       Demand fills never reach here: they have no prefetch and no lead time to test. */
+    if (MLP_LIN_INSTR_MERGE_LEAD_GATE && req->instr_merge_delta >= mlp_lin_instr_merge_edge()) {
+      if (out_merge_lead_rejected)
+        *out_merge_lead_rejected = TRUE;
+    } else {
+      instr_fill = TRUE;
+    }
+  }
+  if (out_instr_fill)
+    *out_instr_fill = instr_fill;
 
   if (instr_fill) {
     /* Instruction fills have no load window, so --mlp_lin_bound_signal does not apply here. The
@@ -6757,8 +6788,10 @@ Flag l1_fill_line(Mem_Req* req) {
     Flag   mb_have_frac = FALSE;
     Counter mb_window = 0;
     double mb_fu0_frac = 0.0, mb_fu_wait_frac = 0.0, mb_policy_frac = 0.0;
+    Flag   mb_instr_fill = FALSE, mb_merge_lead_rejected = FALSE;
     membound_classify_fill(req, &mb_fill, &fe_fill, &bound_frac, &mb_have_frac, &mb_window,
-                           &mb_fu0_frac, &mb_fu_wait_frac, &mb_policy_frac);
+                           &mb_fu0_frac, &mb_fu_wait_frac, &mb_policy_frac, &mb_instr_fill,
+                           &mb_merge_lead_rejected);
     /* Stage the bit even during warmup: a line filled before the ROI that is REUSED inside it
        must still be recognisable as membound, or the hit counter would miss it. Only the
        counting below is scoped to the ROI. */
@@ -7312,8 +7345,10 @@ Flag mlc_fill_line(Mem_Req* req) {
     Flag   mb_have_frac = FALSE;
     Counter mb_window = 0;
     double mb_fu0_frac = 0.0, mb_fu_wait_frac = 0.0, mb_policy_frac = 0.0;
+    Flag   mb_instr_fill = FALSE, mb_merge_lead_rejected = FALSE;
     membound_classify_fill(req, &mb_fill, &fe_fill, &bound_frac, &mb_have_frac, &mb_window,
-                           &mb_fu0_frac, &mb_fu_wait_frac, &mb_policy_frac);
+                           &mb_fu0_frac, &mb_fu_wait_frac, &mb_policy_frac, &mb_instr_fill,
+                           &mb_merge_lead_rejected);
     /* Stage the bit even during warmup: a line filled before the ROI that is REUSED inside it
        must still be recognisable as membound, or the hit counter would miss it. Only the
        counting below is scoped to the ROI. */
@@ -7356,16 +7391,33 @@ Flag mlc_fill_line(Mem_Req* req) {
          Counted above AND below the gate: the point is the shape of the distribution the gate
          is cutting, which the FILL counters above cannot show. */
       if (mb_have_frac) {
-        STAT_EVENT(req->proc_id,
-                   (req->type == MRT_IFETCH ? MLC_FEBOUND_FRAC_0 : MLC_MEMBOUND_FRAC_0) +
-                       (uns)MIN2((uns64)(bound_frac * 20.0), (uns64)19));
+        /* SELECTED ON mb_instr_fill, NOT req->type. Under --mlp_lin_instr_include_pref_merge the
+           marked population includes instruction PREFETCHES a demand merged into, and those keep
+           req->type == MRT_FDIPPRFON to the fill (see the long note in membound_classify_fill).
+           Testing req->type here therefore routed every such fill -- 77% of what the policy
+           marks on these traces -- into the MEMBOUND chain, where its FE-bound fraction was
+           pooled with 30.9M data fills and could not be recovered. */
+        const uns frac_bucket = (uns)MIN2((uns64)(bound_frac * 20.0), (uns64)19);
+        STAT_EVENT(req->proc_id, (mb_instr_fill ? MLC_FEBOUND_FRAC_0 : MLC_MEMBOUND_FRAC_0) + frac_bucket);
+        /* The two halves of the instruction population, split by HOW THE LINE ARRIVED. Kept as
+           explicit subchains rather than left to be differenced out of the total, because there
+           is no reason to expect them to share a shape: a demand fetch that missed cold has been
+           stalling since its own miss, while a merge inherits however long the prefetch had
+           already been in flight before the demand caught it. Their sum is the total chain. */
+        if (mb_instr_fill)
+          STAT_EVENT(req->proc_id, (req->type == MRT_IFETCH ? MLC_FEBOUND_FRAC_DEMAND_0 : MLC_FEBOUND_FRAC_MERGE_0) +
+                                       frac_bucket);
         /* The SAME load's FU-proxy fraction, bucketed identically and emitted on the identical
            population -- same gate, same mb_have_frac test, same fill. That is what makes
            MLC_FU0_FRAC_k and MLC_MEMBOUND_FRAC_k comparable bucket for bucket: any difference in
            shape is the two proxies disagreeing, not two different sets of loads. Data side only;
            the instruction side has no load window, and it shares MLC_MEMBOUND_FRAC_NONE rather
            than carrying a duplicate _NONE counter of its own. */
-        if (req->type != MRT_IFETCH) {
+        /* !mb_instr_fill, not req->type != MRT_IFETCH. These two chains are the DATA side: they
+           bucket a load's FU-proxy fractions, which membound_classify_fill leaves at 0.0 for an
+           instruction fill because there is no load window. The old test was TRUE for a merged
+           prefetch, so every such fill added a spurious bucket-0 entry to both chains. */
+        if (!mb_instr_fill) {
           STAT_EVENT(req->proc_id,
                      MLC_FU0_FRAC_0 + (uns)MIN2((uns64)(mb_fu0_frac * 20.0), (uns64)19));
           /* Sharpened: dependence-stall cycles only. Same buckets, same denominator, same
@@ -7375,8 +7427,13 @@ Flag mlc_fill_line(Mem_Req* req) {
                      MLC_FU_WAIT_FRAC_0 + (uns)MIN2((uns64)(mb_fu_wait_frac * 20.0), (uns64)19));
         }
       } else {
-        STAT_EVENT(req->proc_id,
-                   req->type == MRT_IFETCH ? MLC_FEBOUND_FRAC_NONE : MLC_MEMBOUND_FRAC_NONE);
+        /* No fraction to report. Same selector as above, for the same reason: the eligibility
+           denominator for the instruction side has to include the merged prefetches that were
+           eligible in principle and had no window in practice. */
+        STAT_EVENT(req->proc_id, mb_instr_fill ? MLC_FEBOUND_FRAC_NONE : MLC_MEMBOUND_FRAC_NONE);
+        if (mb_instr_fill)
+          STAT_EVENT(req->proc_id,
+                     req->type == MRT_IFETCH ? MLC_FEBOUND_FRAC_DEMAND_NONE : MLC_FEBOUND_FRAC_MERGE_NONE);
       }
 
       /* --td_load_window_stats: the window THIS fraction was divided by. Emitted beside the
@@ -7399,6 +7456,11 @@ Flag mlc_fill_line(Mem_Req* req) {
           INC_STAT_EVENT(req->proc_id, MLC_FEBOUND_MERGE_REQS, req->demand_merge_count);
         }
       }
+      /* --mlp_lin_instr_merge_lead_gate: outside the fe_fill arm above, because a rejected merge
+         is by definition NOT fe_fill -- it fell through to the data branch. Counted so the gate's
+         effect is visible against MLC_FEBOUND_MERGE without a second run. */
+      if (mb_merge_lead_rejected)
+        STAT_EVENT(req->proc_id, MLC_FEBOUND_MERGE_LONG_LEAD);
     }
   }
 

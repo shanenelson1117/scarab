@@ -971,6 +971,13 @@ DEF_STAT(  MLC_MEMBOUND_MERGE            ,  COUNT,  NO_RATIO  )
 DEF_STAT(  MLC_MEMBOUND_MERGE_REQS       ,  COUNT,  NO_RATIO  )
 DEF_STAT(  MLC_FEBOUND_FILL              ,  COUNT,  NO_RATIO  )
 DEF_STAT(  MLC_FEBOUND_HIT               ,  COUNT,  NO_RATIO  )
+/* --mlp_lin_instr_merge_lead_gate: merged instruction prefetches the lead-time gate REJECTED --
+   eligible under --mlp_lin_instr_include_pref_merge, but their prefetch had already been in
+   flight for at least --mlp_lin_instr_merge_edge cycles when the demand caught it. These fills
+   reach the data branch of membound_classify_fill and score nothing, exactly as they did before
+   --mlp_lin_instr_include_pref_merge existed. Read against MLC_FEBOUND_MERGE to see how much of
+   the merge population the gate removes; it is 0 whenever the gate is off. */
+DEF_STAT(  MLC_FEBOUND_MERGE_LONG_LEAD   ,  COUNT,  NO_RATIO  )
 DEF_STAT(  MLC_FEBOUND_MERGE             ,  COUNT,  NO_RATIO  )
 DEF_STAT(  MLC_FEBOUND_MERGE_REQS        ,  COUNT,  NO_RATIO  )
 
@@ -2778,6 +2785,67 @@ DEF_STAT(  MLC_FEBOUND_FRAC_80                , COUNT  , NO_RATIO  )
 DEF_STAT(  MLC_FEBOUND_FRAC_85                , COUNT  , NO_RATIO  )
 DEF_STAT(  MLC_FEBOUND_FRAC_90                , COUNT  , NO_RATIO  )
 DEF_STAT(  MLC_FEBOUND_FRAC_95                , DIST   , NO_RATIO  )
+
+/* The two halves of MLC_FEBOUND_FRAC_* above, split by how the marked line ARRIVED.
+   DEMAND is a demand instruction fetch (req->type == MRT_IFETCH) that missed the MLC.
+   MERGE is an instruction PREFETCH that a demand fetch merged into, which only enters the
+   marked population under --mlp_lin_instr_include_pref_merge and which keeps its prefetch
+   req->type all the way to the fill.
+
+   WHY SPLIT: the two have no reason to share a shape. A demand fill has been stalling the front
+   end since its own miss; a merge inherits whatever in-flight time the prefetch had already
+   accumulated before the demand caught it. On the google traces the merge half is ~77% of the
+   marked population, so pooling them describes mostly the merges while being named for neither.
+
+   DEMAND_k + MERGE_k == MLC_FEBOUND_FRAC_k for every k, and likewise for _NONE. Use that as the
+   validity check on these chains.
+
+   WINDOW: target-only, same MEMBOUND_STATS && membound_in_roi() gate as the parent chain. */
+DEF_STAT(  MLC_FEBOUND_FRAC_DEMAND_0     , DIST   , NO_RATIO  )
+DEF_STAT(  MLC_FEBOUND_FRAC_DEMAND_5     , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_FEBOUND_FRAC_DEMAND_10    , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_FEBOUND_FRAC_DEMAND_15    , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_FEBOUND_FRAC_DEMAND_20    , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_FEBOUND_FRAC_DEMAND_25    , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_FEBOUND_FRAC_DEMAND_30    , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_FEBOUND_FRAC_DEMAND_35    , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_FEBOUND_FRAC_DEMAND_40    , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_FEBOUND_FRAC_DEMAND_45    , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_FEBOUND_FRAC_DEMAND_50    , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_FEBOUND_FRAC_DEMAND_55    , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_FEBOUND_FRAC_DEMAND_60    , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_FEBOUND_FRAC_DEMAND_65    , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_FEBOUND_FRAC_DEMAND_70    , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_FEBOUND_FRAC_DEMAND_75    , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_FEBOUND_FRAC_DEMAND_80    , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_FEBOUND_FRAC_DEMAND_85    , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_FEBOUND_FRAC_DEMAND_90    , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_FEBOUND_FRAC_DEMAND_95    , DIST   , NO_RATIO  )
+
+DEF_STAT(  MLC_FEBOUND_FRAC_MERGE_0      , DIST   , NO_RATIO  )
+DEF_STAT(  MLC_FEBOUND_FRAC_MERGE_5      , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_FEBOUND_FRAC_MERGE_10     , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_FEBOUND_FRAC_MERGE_15     , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_FEBOUND_FRAC_MERGE_20     , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_FEBOUND_FRAC_MERGE_25     , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_FEBOUND_FRAC_MERGE_30     , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_FEBOUND_FRAC_MERGE_35     , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_FEBOUND_FRAC_MERGE_40     , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_FEBOUND_FRAC_MERGE_45     , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_FEBOUND_FRAC_MERGE_50     , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_FEBOUND_FRAC_MERGE_55     , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_FEBOUND_FRAC_MERGE_60     , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_FEBOUND_FRAC_MERGE_65     , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_FEBOUND_FRAC_MERGE_70     , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_FEBOUND_FRAC_MERGE_75     , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_FEBOUND_FRAC_MERGE_80     , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_FEBOUND_FRAC_MERGE_85     , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_FEBOUND_FRAC_MERGE_90     , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_FEBOUND_FRAC_MERGE_95     , DIST   , NO_RATIO  )
+
+/* Eligible-but-no-window counterparts of MLC_FEBOUND_FRAC_NONE, same split. */
+DEF_STAT(  MLC_FEBOUND_FRAC_DEMAND_NONE  , COUNT  , NO_RATIO  )
+DEF_STAT(  MLC_FEBOUND_FRAC_MERGE_NONE   , COUNT  , NO_RATIO  )
 
 /* Fills with NO fraction to report, so they can never be marked and are not in the chains
    above. This is the eligibility denominator: a store fill has no demanding load, and a

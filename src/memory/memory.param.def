@@ -534,6 +534,35 @@ DEF_PARAM(mlp_lin_instr_no_commit, MLP_LIN_INSTR_NO_COMMIT, Flag, Flag, FALSE, )
    the reason above: it inserts the line the awaited miss returned, as hardware does.) */
 DEF_PARAM(mlp_lin_instr_include_offpath, MLP_LIN_INSTR_INCLUDE_OFFPATH, Flag, Flag, FALSE, )
 
+/* --mlp_lin_instr_merge_lead_gate: restrict --mlp_lin_instr_include_pref_merge to merges whose
+ * prefetch had a SHORT lead time.
+ *
+ * Without this, every instruction prefetch a demand merged into is eligible for the FE-bound
+ * mark, whatever the prefetch's head start. The argument for narrowing it: the lead time is how
+ * long the prefetch had already been in flight when the demand caught it, so a LONG lead means
+ * the prefetch was nearly done and the stall the demand actually paid was short. Marking those
+ * spends protection on lines whose miss cost was already mostly hidden. A short lead is the case
+ * where the prefetch bought little and the front end paid close to a full service latency.
+ *
+ * The measured quantity is Mem_Req.instr_merge_delta, captured at the FIRST demand ifetch merge
+ * and maintained unconditionally by mem_req_match_reqbuf, so this needs no other arm enabled.
+ * The test is STRICTLY LESS THAN --mlp_lin_instr_merge_edge; a delta of 0 (demand arrived in the
+ * same cycle the prefetch was emitted) is the shortest possible lead and is always included.
+ *
+ * DEMAND fills are untouched. req->type == MRT_IFETCH has no lead time -- no prefetch ran ahead
+ * of it -- and gating it on one would silently drop the entire demand-instruction population.
+ *
+ * DEFAULTS OFF, so --mlp_lin_instr_include_pref_merge keeps the behaviour every earlier run was
+ * measured with and those results stay reproducible from the same flags. Turn it on to get the
+ * narrowed rule. MLC_FEBOUND_MERGE_LONG_LEAD counts what the gate rejects, so its effect is
+ * visible without a second run. */
+DEF_PARAM(mlp_lin_instr_merge_lead_gate, MLP_LIN_INSTR_MERGE_LEAD_GATE, Flag, Flag, FALSE, )
+/* The edge, in cycles. 0 means "track L1_CYCLES", i.e. the LLC access latency -- the same
+   convention and the same default as --ifetch_xtion_merge_edge and --srrip_t_merge_edge, so all
+   three bucket a merge identically unless deliberately pinned apart. Inert unless the gate
+   above is on. */
+DEF_PARAM(mlp_lin_instr_merge_edge, MLP_LIN_INSTR_MERGE_EDGE, uns, uns, 0, )
+
 /* --mlp_lin_instr_include_pref_merge: let a LATE instruction prefetch earn REPL_MLP's
    instruction-side priority -- an FDIP prefetch still in flight when the demand fetch for the
    same line arrives and merges into it.
