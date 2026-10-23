@@ -289,6 +289,18 @@ typedef struct Cache_Entry_struct {
      every line of a cache that neither owns nor backs up the line. */
   uns8 delta_prio;
 
+  /* --mlp_lin_unref_lambda: has this line been REFERENCED since its fill?
+     FALSE from the fill until the first hit, then TRUE for the rest of the line's residency.
+     A bit of its own rather than a reuse of reuse_seen or delta_hits: reuse_seen is gated on
+     --reuse_dist_stats and delta_hits on --delta_prio_stats, and a REPLACEMENT POLICY cannot
+     depend on a stats knob being on -- it would change the policy's behaviour when a counter is
+     enabled. Maintained unconditionally for that reason.
+
+     NOTE THIS MAKES THE BOOST NON-STICKY when --mlp_lin_unref_lambda is live: mlp_lin_prio_boost
+     is otherwise fully determined at fill, which is what lets --load_prio_stats stamp a level
+     once and trust it. See the guard in load_prio_levels_init. */
+  Flag referenced_since_fill;
+
   /* --delta_prio_stats: hits this line has taken since its fill, for the per-class reuse
      accounting. A counter of its own rather than a reuse of reuse_seen / reuse_count because
      those two are gated on --reuse_dist_stats and --load_prio_stats respectively, and the latter

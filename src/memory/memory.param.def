@@ -640,6 +640,43 @@ DEF_PARAM(mlp_lin_instr_include_offpath, MLP_LIN_INSTR_INCLUDE_OFFPATH, Flag, Fl
  * are unaffected; a WARNINGU at init says so. */
 DEF_PARAM(mlp_lin_merge_lambda, MLP_LIN_MERGE_LAMBDA, float, float, -1.0, )
 
+/* --mlp_lin_unref_lambda: a SEPARATE weight a marked line carries until it is first referenced,
+ * after which it takes its ordinary lambda.
+ *
+ * Two-phase protection. A mark made at fill is a PREDICTION -- this line will be wanted again --
+ * and until the line is actually hit that prediction is unverified. This knob lets the unverified
+ * phase be weighted differently from the confirmed one:
+ *
+ *   unreferenced  -> --mlp_lin_unref_lambda
+ *   referenced    -> the ordinary lambda (data / instruction / merge, per the usual rules)
+ *
+ * Set it BELOW the ordinary lambda to make a mark a probationary claim the line has to earn, and
+ * ABOVE it to give a line one protected window to prove itself and then let it compete normally.
+ * Both are coherent policies and the sign is the experiment.
+ *
+ * THE BIT: Cache_Entry.referenced_since_fill, FALSE from the fill to the first hit. Maintained
+ * unconditionally -- not borrowed from reuse_seen or delta_hits, which are gated on
+ * --reuse_dist_stats and --delta_prio_stats respectively, and a replacement policy must not
+ * change behaviour because a counter was switched on. A PREFETCH hit counts as a reference:
+ * something asked for the line.
+ *
+ * ONLY THE BOUNDNESS MARK. This reweights the membound / FE-bound term, i.e. exactly the lines
+ * MLC_MEMBOUND_FILL and MLC_FEBOUND_FILL count. It does NOT touch the placement classes
+ * (--fdip_delta_place, --instr_upfill_lambda, --instr_nopref_lambda, --instr_latepref_lambda),
+ * which have their own per-class lambdas and their own promotion rule in cache_promote_upfill.
+ * An UNMARKED line is unaffected in either phase: its boundness term is 0 throughout.
+ *
+ * -1 MEANS DISABLED, the default, so a marked line takes its ordinary lambda from the moment it
+ * is filled and every earlier run reproduces from the same flags. Any value >= 0 takes effect,
+ * and 0 is meaningful: it marks the line but gives it nothing until it is referenced.
+ *
+ * MAKES THE BOOST NON-STICKY, which is why it disables the --load_prio_stats level half. The
+ * level model stamps prio_level ONCE at fill from mlp_lin_prio_boost and assumes it never
+ * changes; a boost that moves on first reference would leave every stamped level stale. Same
+ * self-disable and the same WARNINGU as a placement lambda. Composition and the per-class chains
+ * are unaffected. */
+DEF_PARAM(mlp_lin_unref_lambda, MLP_LIN_UNREF_LAMBDA, float, float, -1.0, )
+
 DEF_PARAM(mlp_lin_instr_merge_lead_gate, MLP_LIN_INSTR_MERGE_LEAD_GATE, Flag, Flag, FALSE, )
 /* The edge, in cycles. 0 means "track L1_CYCLES", i.e. the LLC access latency -- the same
    convention and the same default as --ifetch_xtion_merge_edge and --srrip_t_merge_edge, so all

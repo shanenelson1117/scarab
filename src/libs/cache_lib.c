@@ -427,6 +427,9 @@ static inline void consume_fill_bound(Cache* cache, Cache_Entry* line) {
      place either is written at a fill, so they cannot come apart -- a line can never report hits
      a previous occupant of the way earned. */
   line->delta_hits = 0;
+  /* --mlp_lin_unref_lambda: a fresh line has not been referenced. Cleared here so the bit and
+     the classification it is read with share one lifetime. */
+  line->referenced_since_fill = FALSE;
   cache->last_fill_delta_prio = line->delta_prio;
   cache->last_fill_delta_valid = TRUE;
   g_next_fill_membound = FALSE;
@@ -567,6 +570,11 @@ static inline double lin_lam_merge(const Cache* c) {
 /* Is the merge weight actually distinct from the instruction weight? Used both by the boost and
  * by the level-table guard, so the two cannot disagree about whether a fourth boundness value
  * exists. */
+/* --mlp_lin_unref_lambda: is the two-phase weight in force? */
+static inline Flag lin_lam_unref_live(void) {
+  return (MLP_LIN_UNREF_LAMBDA >= 0.0) ? TRUE : FALSE;
+}
+
 static inline Flag lin_lam_merge_distinct(const Cache* c) {
   return (MLP_LIN_MERGE_LAMBDA >= 0.0 && (double)MLP_LIN_MERGE_LAMBDA != lin_lam_instr(c)) ? TRUE : FALSE;
 }
@@ -578,6 +586,17 @@ static inline double mlp_paper_lambda_now(const Cache* c) {
 }
 
 static inline double mlp_lin_bound_term(const Cache* cache, const Cache_Entry* entry) {
+  /* --mlp_lin_unref_lambda: the UNVERIFIED phase of a mark. Applied to a marked line of either
+     kind -- membound or FE-bound -- that has not yet been referenced, in place of whichever
+     ordinary lambda it would otherwise take. The threshold tests below still decide whether the
+     line is marked AT ALL; this only changes what a marked-but-unproven line is worth. */
+  if (lin_lam_unref_live() && !entry->referenced_since_fill) {
+    if (entry->membound_fill)
+      return entry->bound_frac > (double)MLP_LIN_DATA_THRESH ? (double)MLP_LIN_UNREF_LAMBDA : 0.0;
+    if (entry->fe_bound_fill)
+      return entry->bound_frac > (double)MLP_LIN_INSTR_THRESH ? (double)MLP_LIN_UNREF_LAMBDA : 0.0;
+    return 0.0;
+  }
   if (entry->membound_fill)
     return entry->bound_frac > (double)MLP_LIN_DATA_THRESH ? lin_lam_data(cache) : 0.0;
   if (entry->fe_bound_fill) {
@@ -673,18 +692,20 @@ static void load_prio_levels_init(Cache* cache) {
      refusal. */
   const Flag delta_term_live = (INSTR_UPFILL && (INSTR_UPFILL_LAMBDA != 0.0 || INSTR_UPFILL_PROMOTE_LAMBDA != 0.0)) ||
                                FDIP_DELTA_PLACE || INSTR_NOPREF_LAMBDA != 0.0 || INSTR_LATEPREF_LAMBDA != 0.0 ||
-                               lin_lam_merge_distinct(cache);
+                               lin_lam_merge_distinct(cache) || lin_lam_unref_live();
   if (delta_term_live) {
     WARNINGU(0,
              "--load_prio_stats: cache '%s' has a live placement-class lambda "
              "(--fdip_delta_place %d, --instr_upfill_lambda %f, --instr_upfill_promote_lambda %f, "
-             "--instr_nopref_lambda %f, --instr_latepref_lambda %f, --mlp_lin_merge_lambda %f), "
+             "--instr_nopref_lambda %f, --instr_latepref_lambda %f, --mlp_lin_merge_lambda %f, "
+             "--mlp_lin_unref_lambda %f -- the last of which also makes the boost non-sticky), "
              "whose boosts the priority "
              "level table cannot enumerate. The LEVEL half is disabled: every *_PRIO_* chain will "
              "be empty. The COMPOSITION half (*_COMP_*) is unaffected and still valid, which is "
              "what --delta_prio_stats needs to be combined with.\n",
              cache->name, (int)FDIP_DELTA_PLACE, INSTR_UPFILL_LAMBDA, INSTR_UPFILL_PROMOTE_LAMBDA,
-             INSTR_NOPREF_LAMBDA, INSTR_LATEPREF_LAMBDA, (double)MLP_LIN_MERGE_LAMBDA);
+             INSTR_NOPREF_LAMBDA, INSTR_LATEPREF_LAMBDA, (double)MLP_LIN_MERGE_LAMBDA,
+             (double)MLP_LIN_UNREF_LAMBDA);
     return; /* prio_num_levels stays 0; set_miss_ctr stays allocated but publishes nothing */
   }
 
@@ -1434,6 +1455,7 @@ void init_cache(Cache* cache, const char* name, uns cache_size, uns assoc, uns l
       cache->entries[ii][jj].fill_was_prefetch = FALSE;
       cache->entries[ii][jj].delta_prio = DELTA_PRIO_NONE;
       cache->entries[ii][jj].delta_hits = 0;  // --delta_prio_stats
+      cache->entries[ii][jj].referenced_since_fill = FALSE;  // --mlp_lin_unref_lambda
       cache->entries[ii][jj].instr_line = FALSE;
       cache->entries[ii][jj].was_written = FALSE;
       cache->entries[ii][jj].offpath_unproven = FALSE;
@@ -1600,6 +1622,10 @@ void* cache_access(Cache* cache, Addr addr, Addr* line_addr, Flag update_repl) {
            icache with update_repl TRUE but delivers nothing to the pipeline. Only the HANDLE is
            published here; the reference itself is charged by cache_note_delta_hit at the counting
            site, which is past the retry point. */
+        /* --mlp_lin_unref_lambda: set HERE, not deferred like delta_hits, because a boolean is
+           idempotent -- a retried access setting it twice is harmless. A PREFETCH hit counts as
+           a reference: something asked for the line. */
+        line->referenced_since_fill = TRUE;
         cache->last_hit_delta_prio = line->delta_prio;
         cache->last_hit_delta_valid = TRUE;
         cache->last_hit_entry = line;
@@ -1833,6 +1859,7 @@ void cache_invalidate(Cache* cache, Addr addr, Addr* line_addr) {
          --instr_upfill_hit_invalidate path too -- there the invalidate is how a promoted line
          leaves, and a stale count would be charged to whatever fills the way next. */
       line->delta_hits = 0;
+      line->referenced_since_fill = FALSE;
       line->instr_line = FALSE;
       line->was_written = FALSE;
       line->offpath_unproven = FALSE;
@@ -2828,6 +2855,7 @@ void* cache_access_strategy(Cache* cache, Addr addr, Addr* line_addr, Flag updat
            below REPL_VOID and so never reaches this function, while a placement class is stamped
            by every policy's insert path -- including SRRIP, Mockingjay and marked-RRIP, which
            only ever take THIS path. */
+        line->referenced_since_fill = TRUE; /* --mlp_lin_unref_lambda; see cache_access */
         cache->last_hit_delta_prio = line->delta_prio;
         cache->last_hit_delta_valid = TRUE;
         cache->last_hit_entry = line;
@@ -2914,6 +2942,7 @@ void general_action_init(Cache* cache, const char* name, uns cache_size, uns ass
       cache->entries[ii][jj].fill_was_prefetch = FALSE;
       cache->entries[ii][jj].delta_prio = DELTA_PRIO_NONE;
       cache->entries[ii][jj].delta_hits = 0;  // --delta_prio_stats
+      cache->entries[ii][jj].referenced_since_fill = FALSE;  // --mlp_lin_unref_lambda
       cache->entries[ii][jj].instr_line = FALSE;
       cache->entries[ii][jj].was_written = FALSE;
       cache->entries[ii][jj].offpath_unproven = FALSE;
