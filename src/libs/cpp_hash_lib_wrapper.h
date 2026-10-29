@@ -10,7 +10,7 @@ extern "C" {
 // class cpp_hash_lib_wrapper {
 
 Inst_Info *cpp_hash_table_access_create(int core, uint64_t addr, uint64_t lsb_bytes, uint64_t msb_bytes, uint8_t op_idx,
-                                        unsigned char *new_entry);
+                                        uint8_t cf_type, unsigned char *new_entry);
 
 #ifdef __cplusplus
 }

@@ -13,13 +13,15 @@ struct key {
   uint64_t lsb_bytes;
   uint64_t msb_bytes;
   uint8_t op_idx;
+  uint8_t cf_type;
 
-  key() : addr(0), lsb_bytes(0), msb_bytes(0), op_idx(0){};
-  key(uint64_t _addr, uint64_t _lsb_bytes, uint64_t _msb_bytes, uint8_t _op_idx)
-      : addr(_addr), lsb_bytes(_lsb_bytes), msb_bytes(_msb_bytes), op_idx(_op_idx){};
+  key() : addr(0), lsb_bytes(0), msb_bytes(0), op_idx(0), cf_type(0){};
+  key(uint64_t _addr, uint64_t _lsb_bytes, uint64_t _msb_bytes, uint8_t _op_idx, uint8_t _cf_type)
+      : addr(_addr), lsb_bytes(_lsb_bytes), msb_bytes(_msb_bytes), op_idx(_op_idx), cf_type(_cf_type){};
 
   bool operator==(const key &p) const {
-    return addr == p.addr && lsb_bytes == p.lsb_bytes && msb_bytes == p.msb_bytes && op_idx == p.op_idx;
+    return addr == p.addr && lsb_bytes == p.lsb_bytes && msb_bytes == p.msb_bytes && op_idx == p.op_idx &&
+           cf_type == p.cf_type;
   }
 };
 
@@ -38,6 +40,8 @@ struct hash_fn {
     h += key.msb_bytes;
     h *= KNUTH64;
     h += static_cast<uint64_t>(key.op_idx);
+    h *= KNUTH64;
+    h += static_cast<uint64_t>(key.cf_type);
 
     // Mix down to size_t in a platform-agnostic way.
     return static_cast<std::size_t>(h ^ (h >> 32));
@@ -48,9 +52,9 @@ struct hash_fn {
 std::unordered_map<key, Inst_Info, hash_fn> per_core_hash_map[MAX_NUM_PROCS];
 
 Inst_Info *cpp_hash_table_access_create(int core, uint64_t addr, uint64_t lsb_bytes, uint64_t msb_bytes, uint8_t op_idx,
-                                        unsigned char *new_entry) {
+                                        uint8_t cf_type, unsigned char *new_entry) {
   *new_entry = false;
-  key _key(addr, lsb_bytes, msb_bytes, op_idx);
+  key _key(addr, lsb_bytes, msb_bytes, op_idx, cf_type);
   auto &hash_map = per_core_hash_map[core];
   auto lookup = hash_map.find(_key);
   if (lookup != hash_map.end()) {

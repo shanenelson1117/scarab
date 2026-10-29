@@ -677,6 +677,31 @@ DEF_PARAM(mlp_lin_merge_lambda, MLP_LIN_MERGE_LAMBDA, float, float, -1.0, )
  * are unaffected. */
 DEF_PARAM(mlp_lin_unref_lambda, MLP_LIN_UNREF_LAMBDA, float, float, -1.0, )
 
+/* --mlp_lin_unref_decay_accesses: REPL_MLP only. Every N accesses to this cache (hit or miss,
+ * update_repl TRUE -- a probe does not count, same gate as reuse_dist_tick), every valid line's
+ * referenced_since_fill bit is cleared in one sweep. This is a GLOBAL clock: every line in the
+ * cache loses its referenced credit together, regardless of how recently within the window it
+ * was individually set. Counted in MLC ACCESSES rather than cycles, the same unit
+ * --mlp_lin_unref_lambda's own mark already moves in.
+ *
+ * 0 MEANS DISABLED, the default: referenced_since_fill stays sticky for the rest of a line's
+ * residency once set, exactly as before this knob existed. Only takes effect when
+ * --mlp_lin_unref_lambda is itself live -- the bit is read nowhere otherwise, so sweeping it
+ * would be unobservable and is skipped outright. */
+DEF_PARAM(mlp_lin_unref_decay_accesses, MLP_LIN_UNREF_DECAY_ACCESSES, uns, uns, 0, )
+
+/* --mlp_lin_unref_set_prob_n: REPL_MLP only. On a hit that would otherwise set
+ * referenced_since_fill unconditionally TRUE, instead set it with probability 1/N -- a fresh
+ * rand() draw per hit, not a counter, so two lines hit equally often can still diverge. A hit
+ * that loses the draw leaves the bit exactly as it was; this can only delay a line's first
+ * reference, never erase one it already earned.
+ *
+ * 0 or 1 MEANS DISABLED, the default: every hit sets the bit, exactly as before this knob
+ * existed. N >= 2 is the first value that gates anything (1/2 odds). Only takes effect when
+ * --mlp_lin_unref_lambda is itself live, same reasoning as --mlp_lin_unref_decay_accesses
+ * above. */
+DEF_PARAM(mlp_lin_unref_set_prob_n, MLP_LIN_UNREF_SET_PROB_N, uns, uns, 0, )
+
 DEF_PARAM(mlp_lin_instr_merge_lead_gate, MLP_LIN_INSTR_MERGE_LEAD_GATE, Flag, Flag, FALSE, )
 /* The edge, in cycles. 0 means "track L1_CYCLES", i.e. the LLC access latency -- the same
    convention and the same default as --ifetch_xtion_merge_edge and --srrip_t_merge_edge, so all

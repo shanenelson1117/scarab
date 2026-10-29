@@ -575,6 +575,39 @@ static inline Flag lin_lam_unref_live(void) {
   return (MLP_LIN_UNREF_LAMBDA >= 0.0) ? TRUE : FALSE;
 }
 
+/* --mlp_lin_unref_decay_accesses: tick the per-cache access clock and, every N accesses, clear
+ * referenced_since_fill on every valid line in the cache in one sweep. Called once per real
+ * access (hit or miss, update_repl TRUE) from the top of cache_access, so the two unref knobs
+ * share exactly the access definition --mlp_lin_unref_lambda itself is denominated in.
+ *
+ * Self-gated: a no-op whenever the decay knob is 0 (disabled) or the two-phase mark is not
+ * live, so callers do not need to repeat either check. */
+static inline void mlp_unref_decay_tick(Cache* cache) {
+  if (!lin_lam_unref_live() || MLP_LIN_UNREF_DECAY_ACCESSES == 0)
+    return;
+  cache->mlp_unref_access_ctr++;
+  if (cache->mlp_unref_access_ctr < (Counter)MLP_LIN_UNREF_DECAY_ACCESSES)
+    return;
+  cache->mlp_unref_access_ctr = 0;
+  for (uns set = 0; set < cache->num_sets; set++) {
+    for (uns way = 0; way < cache->assoc; way++) {
+      Cache_Entry* entry = &cache->entries[set][way];
+      if (entry->valid)
+        entry->referenced_since_fill = FALSE;
+    }
+  }
+}
+
+/* --mlp_lin_unref_set_prob_n: should THIS hit set referenced_since_fill? TRUE unconditionally
+ * when the knob is disabled (0 or 1), preserving the pre-existing unconditional-set behaviour.
+ * Otherwise a fresh 1/N draw per call -- a losing draw returns FALSE, which leaves the bit
+ * exactly as it already was (never clears a reference a prior hit earned). */
+static inline Flag mlp_unref_set_wins_draw(void) {
+  if (MLP_LIN_UNREF_SET_PROB_N <= 1)
+    return TRUE;
+  return (rand() % (int)MLP_LIN_UNREF_SET_PROB_N == 0) ? TRUE : FALSE;
+}
+
 static inline Flag lin_lam_merge_distinct(const Cache* c) {
   return (MLP_LIN_MERGE_LAMBDA >= 0.0 && (double)MLP_LIN_MERGE_LAMBDA != lin_lam_instr(c)) ? TRUE : FALSE;
 }
@@ -1490,6 +1523,7 @@ void init_cache(Cache* cache, const char* name, uns cache_size, uns assoc, uns l
   }
   cache->num_demand_access = 0;
   cache->last_update = 0;
+  cache->mlp_unref_access_ctr = 0;
 
   /* For cache partitioning */
   if (cache->repl_policy == REPL_PARTITION) {
@@ -1567,6 +1601,11 @@ void* cache_access(Cache* cache, Addr addr, Addr* line_addr, Flag update_repl) {
   if (update_repl)
     reuse_dist_tick(cache, set);
 
+  /* --mlp_lin_unref_decay_accesses: REPL_MLP only -- see mlp_unref_decay_tick for why this sits
+     beside reuse_dist_tick rather than on the hit or miss path alone. */
+  if (update_repl && cache->repl_policy == REPL_MLP)
+    mlp_unref_decay_tick(cache);
+
   /* --load_prio_stats does NOT tick here. Its clock counts misses, which is not known until the
      lookup below has failed, so the tick sits on the miss path at the bottom of this function.
      That also means the miss clock, unlike the access clock, is NOT advanced past a hit before
@@ -1624,8 +1663,11 @@ void* cache_access(Cache* cache, Addr addr, Addr* line_addr, Flag update_repl) {
            site, which is past the retry point. */
         /* --mlp_lin_unref_lambda: set HERE, not deferred like delta_hits, because a boolean is
            idempotent -- a retried access setting it twice is harmless. A PREFETCH hit counts as
-           a reference: something asked for the line. */
-        line->referenced_since_fill = TRUE;
+           a reference: something asked for the line.
+           --mlp_lin_unref_set_prob_n (REPL_MLP only): a losing draw does NOT clear the bit, it
+           just skips this hit's chance to set it -- see mlp_unref_set_wins_draw. */
+        if (cache->repl_policy != REPL_MLP || mlp_unref_set_wins_draw())
+          line->referenced_since_fill = TRUE;
         cache->last_hit_delta_prio = line->delta_prio;
         cache->last_hit_delta_valid = TRUE;
         cache->last_hit_entry = line;

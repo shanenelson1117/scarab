@@ -622,6 +622,7 @@ PATCH_REP:
       // icache/fetch-boundary logic works in real instruction bytes.
       ctx_switch_barrier_.size = prior_isize;
       ctx_switch_barrier_.fake_inst = 0;
+      ctx_switch_barrier_.is_trace_patch = 1;
       ctx_switch_barrier_.cf_type = CF_SYS;
       ctx_switch_barrier_.is_ifetch_barrier = 1;
       ctx_switch_barrier_.true_op_type = XED_ICLASS_SYSCALL;
@@ -668,6 +669,7 @@ PATCH_REP:
                (!is_rep || (_prior->pc != _info->pc && (_prior->pc + prior_isize) != _info->pc))) {
       gap_patch_jmp_ = create_dummy_jump(_prior->pc, _info->pc);
       gap_patch_jmp_.fake_inst = 0;
+      gap_patch_jmp_.is_trace_patch = 1;
       gap_patch_jmp_.true_op_type = XED_ICLASS_JMP;
       _prior->info = &gap_patch_jmp_;
       _prior->target = _info->pc;

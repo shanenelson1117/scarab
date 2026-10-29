@@ -512,6 +512,11 @@ typedef struct Cache_struct {
   Counter num_demand_access;
   Counter last_update; /* last update cycle */
 
+  /* --mlp_lin_unref_decay_accesses: REPL_MLP only. Accesses (hit or miss, update_repl TRUE)
+     since the last sweep that cleared every line's referenced_since_fill bit. Rolls over to 0
+     at the sweep; see the tick call at the top of cache_access. */
+  Counter mlp_unref_access_ctr;
+
   uns* num_ways_allocted_core; /* For cache partitioning */
   uns* num_ways_occupied_core; /* For cache partitioning */
   uns* lru_index_core;         /* For cache partitioning */
